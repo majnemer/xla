@@ -1,0 +1,29 @@
+/* Copyright 2026 The OpenXLA Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+syntax = "proto3";
+
+package stream_executor;
+
+message MetalComputeCapabilityProto {
+  // The N in MTLGPUFamilyApple<N>. M1 = 7, M2 = 8, M3 = 9, M4 = 10, etc.
+  // 0 indicates unknown / not yet populated.
+  int32 family_generation = 1;
+
+  // Whether [device supportsFamily:MTLGPUFamilyMetal3] returns true.
+  // Metal 3 fast paths (richer simdgroup_matrix, mesh shaders, function
+  // pointers, dynamic libraries) are gated on this.
+  bool metal_3_supported = 2;
+}

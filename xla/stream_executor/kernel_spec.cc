@@ -77,6 +77,20 @@ KernelLoaderSpec KernelLoaderSpec::CreateOwningCudaPtxInMemorySpec(
                           std::move(kernel_name), arity, kernel_args_packing};
 }
 
+KernelLoaderSpec KernelLoaderSpec::CreateMslSourceInMemorySpec(
+    absl::string_view source, std::string kernel_name, size_t arity,
+    KernelArgsPacking kernel_args_packing) {
+  return KernelLoaderSpec{MslSourceInMemory{source}, std::move(kernel_name),
+                          arity, kernel_args_packing};
+}
+
+KernelLoaderSpec KernelLoaderSpec::CreateOwningMslSourceInMemorySpec(
+    std::string source, std::string kernel_name, size_t arity,
+    KernelArgsPacking kernel_args_packing) {
+  return KernelLoaderSpec{OwningMslSourceInMemory{std::move(source)},
+                          std::move(kernel_name), arity, kernel_args_packing};
+}
+
 absl::StatusOr<KernelLoaderSpecProto> KernelLoaderSpec::ToProto() const {
   if (std::holds_alternative<KernelArgsPackingFunc>(kernel_args_packing_) &&
       std::get<KernelArgsPackingFunc>(kernel_args_packing_) != nullptr) {
@@ -108,8 +122,13 @@ absl::StatusOr<KernelLoaderSpecProto> KernelLoaderSpec::ToProto() const {
         in_process_symbol()->persistent_name);
   }
 
+  if (has_msl_source_in_memory()) {
+    proto.mutable_msl_source()->set_source(
+        std::string(msl_source_in_memory()->source));
+  }
+
   CHECK(has_cuda_cubin_in_memory() || has_cuda_ptx_in_memory() ||
-        has_in_process_symbol());
+        has_in_process_symbol() || has_msl_source_in_memory());
 
   if (std::holds_alternative<KernelArgsPackingSpec>(kernel_args_packing_)) {
     TF_ASSIGN_OR_RETURN(
@@ -164,11 +183,15 @@ absl::StatusOr<KernelLoaderSpec> KernelLoaderSpec::FromProto(
           proto.kernel_name(), proto.arity(), kernel_args_packing);
     }
 
+    case KernelLoaderSpecProto::kMslSource: {
+      return KernelLoaderSpec::CreateOwningMslSourceInMemorySpec(
+          proto.msl_source().source(), proto.kernel_name(), proto.arity(),
+          std::move(kernel_args_packing));
+    }
+
     default:
       return absl::InvalidArgumentError(
-          "Invalid KernelLoaderSpecProto. Neither PTX nor CUBIN payload has "
-          "been "
-          "found.");
+          "Invalid KernelLoaderSpecProto: no recognized payload found.");
   }
 }
 
