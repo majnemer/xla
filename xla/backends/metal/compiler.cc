@@ -36,6 +36,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/thunk_executor.h"
 #include "xla/backends/metal/codegen/msl_kernel_emitter.h"
 #include "xla/backends/metal/codegen/msl_kernel_source.h"
+#include "xla/backends/metal/codegen/transforms/passes.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/codegen/emitters/transforms/passes.h"
 #include "xla/codegen/mlir_kernel_source.h"
@@ -46,11 +47,14 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/pass/hlo_pass_pipeline.h"
+#include "xla/hlo/transforms/simplifiers/float_normalization.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/buffer_value.h"
 #include "xla/service/call_graph.h"
 #include "xla/service/compiler.h"
 #include "xla/service/computation_placer.h"
+#include "xla/service/float_support.h"
 #include "xla/service/gpu/alias_info.h"
 #include "xla/service/gpu/gpu_constants.h"
 #include "xla/service/gpu/gpu_executable.h"
@@ -73,6 +77,50 @@ MetalCompiler::MetalCompiler()
     : xla::gpu::GpuCompiler(stream_executor::metal::kMetalPlatformId,
                             /*pointer_size=*/8) {}
 
+absl::Status MetalCompiler::OptimizeHloPostLayoutAssignment(
+    HloModule* hlo_module, se::StreamExecutor* stream_exec,
+    const CompileOptions& options,
+    const xla::gpu::GpuTargetConfig& gpu_target_config,
+    const xla::gpu::GpuAliasInfo* alias_info,
+    tsl::thread::ThreadPool* thread_pool, CompilationStats* compilation_stats) {
+  // Widen low-precision types the MSL emitter cannot lower. The base
+  // GpuCompiler's float_normalization sub-pipeline keys its decisions off
+  // CUDA/ROCm compute capabilities and would otherwise leave many of these
+  // types (BF16 data movement, F8 data movement, BF16 dot) in HLO when run
+  // against a MetalComputeCapability. Mirrors AMDGPUCompiler's pattern of
+  // running a target-specific FloatNormalization pre-pipeline before
+  // delegating to the base.
+  HloPassPipeline pre("metal_pre_normalization", compilation_stats);
+  FloatSupport bf16(BF16);
+  FloatSupport f8e5m2(F8E5M2, F16);
+  FloatSupport f8e4m3(F8E4M3, F16);
+  FloatSupport f8e3m4(F8E3M4, F16);
+  FloatSupport f8e4m3fn(F8E4M3FN, F16);
+  FloatSupport f8e4m3fnuz(F8E4M3FNUZ, F16);
+  FloatSupport f8e5m2fnuz(F8E5M2FNUZ, F16);
+  FloatSupport f8e4m3b11fnuz(F8E4M3B11FNUZ, F16);
+  FloatSupport f4e2m1fn(F4E2M1FN, F16);
+  FloatSupport f8e8m0fnu(F8E8M0FNU, F16);
+  pre.AddPass<FloatNormalization>(&bf16);
+  pre.AddPass<FloatNormalization>(&f8e5m2);
+  pre.AddPass<FloatNormalization>(&f8e4m3);
+  pre.AddPass<FloatNormalization>(&f8e3m4);
+  pre.AddPass<FloatNormalization>(&f8e4m3fn);
+  pre.AddPass<FloatNormalization>(&f8e4m3fnuz);
+  pre.AddPass<FloatNormalization>(&f8e5m2fnuz);
+  pre.AddPass<FloatNormalization>(&f8e4m3b11fnuz);
+  pre.AddPass<FloatNormalization>(&f4e2m1fn);
+  pre.AddPass<FloatNormalization>(&f8e8m0fnu);
+  TF_RETURN_IF_ERROR(
+      pre.Run(hlo_module,
+              /*execution_threads=*/{HloInstruction::kMainExecutionThread})
+          .status());
+
+  return xla::gpu::GpuCompiler::OptimizeHloPostLayoutAssignment(
+      hlo_module, stream_exec, options, gpu_target_config, alias_info,
+      thread_pool, compilation_stats);
+}
+
 void MetalCompiler::AddGemmRewriteCustomCallPasses(
     HloPassPipeline&, const DebugOptions&, se::GpuComputeCapability,
     const se::SemanticVersion&) {
@@ -83,7 +131,8 @@ void MetalCompiler::AddGemmRewriteCustomCallPasses(
 absl::StatusOr<std::unique_ptr<xla::gpu::GpuExecutable>>
 MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
                                       const GpuTopology& gpu_topology,
-    const CompileOptions& /*options*/, se::StreamExecutor* stream_exec) {
+                                      const CompileOptions& /*options*/,
+                                      se::StreamExecutor* stream_exec) {
   VLOG(1) << "MetalCompiler::CompileToBackendResult on " << hlo_module->name();
   if (stream_exec == nullptr) {
     return absl::InvalidArgumentError(
@@ -137,9 +186,6 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
   gpu::ThunkSequence thunks;
   std::vector<gpu::GpuExecutable::ConstantInfo> constants;
   std::string msl_blob;
-  // Tracks file-scope helpers emitted into msl_blob so each per-fusion
-  // TranslateToMSL doesn't redefine them (MSL is single-TU per program).
-  metal::MslTranslationState msl_state;
   for (const HloInstruction* instr :
        hlo_module->schedule().sequence(entry).instructions()) {
     switch (instr->opcode()) {
@@ -157,9 +203,8 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
         // land in params.constants, and GpuExecutable copies them into the
         // allocation at initialize time.
         const auto* constant_instr = Cast<HloConstantInstruction>(instr);
-        TF_ASSIGN_OR_RETURN(
-            gpu::DenseDataIntermediate content,
-            gpu::LiteralToXlaFormat(constant_instr->literal()));
+        TF_ASSIGN_OR_RETURN(gpu::DenseDataIntermediate content,
+                            gpu::LiteralToXlaFormat(constant_instr->literal()));
         TF_ASSIGN_OR_RETURN(
             BufferAllocation::Slice slice,
             buffer_assignment->GetUniqueSlice(constant_instr, /*index=*/{}));
@@ -172,9 +217,9 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
       }
 
       case HloOpcode::kCopy: {
-        TF_ASSIGN_OR_RETURN(BufferAllocation::Slice src,
-                            buffer_assignment->GetUniqueSlice(
-                                instr->operand(0), /*index=*/{}));
+        TF_ASSIGN_OR_RETURN(
+            BufferAllocation::Slice src,
+            buffer_assignment->GetUniqueSlice(instr->operand(0), /*index=*/{}));
         TF_ASSIGN_OR_RETURN(
             BufferAllocation::Slice dst,
             buffer_assignment->GetUniqueSlice(instr, /*index=*/{}));
@@ -194,8 +239,7 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
                                        buffer_assignment.get(), *call_graph);
         std::unique_ptr<gpu::FusionInterface> emitter =
             gpu::GetFusionEmitter(fusion_info, mlir_context());
-        auto* mlir_fusion =
-            dynamic_cast<gpu::MlirKernelFusion*>(emitter.get());
+        auto* mlir_fusion = dynamic_cast<gpu::MlirKernelFusion*>(emitter.get());
         if (mlir_fusion == nullptr) {
           return Unimplemented(
               "MetalCompiler::CompileToBackendResult: fusion '%s' uses a "
@@ -203,17 +247,17 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
               "kernel fusions are supported on Metal.",
               fusion_instr->name());
         }
-        TF_ASSIGN_OR_RETURN(emitters::KernelArguments kernel_args,
-                            emitters::KernelArguments::Create(
-                                *buffer_assignment,
-                                gpu::GetDefaultBufferAlignment(), fusion_instr));
+        TF_ASSIGN_OR_RETURN(
+            emitters::KernelArguments kernel_args,
+            emitters::KernelArguments::Create(*buffer_assignment,
+                                              gpu::GetDefaultBufferAlignment(),
+                                              fusion_instr));
         std::string entry_name =
             llvm_ir::SanitizeFunctionName(std::string(fusion_instr->name()));
-        TF_ASSIGN_OR_RETURN(
-            MlirKernelSource mlir_source,
-            mlir_fusion->mlir_kernel_emitter()->Emit(
-                mlir_context(), *fusion_instr, entry_name,
-                buffer_assignment.get()));
+        TF_ASSIGN_OR_RETURN(MlirKernelSource mlir_source,
+                            mlir_fusion->mlir_kernel_emitter()->Emit(
+                                mlir_context(), *fusion_instr, entry_name,
+                                buffer_assignment.get()));
         // Lower xla_gpu IR down to SCF + arith + tensor + gpu for the MSL
         // translator. We stop before memref/LLVM lowering — Metal keeps
         // tensors as `device T*`-addressed SSA values.
@@ -235,7 +279,11 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
           pm.addPass(mlir::createLoopInvariantCodeMotionPass());
           pm.addPass(mlir::createSymbolDCEPass());
           pm.addPass(mlir::createCSEPass());
+          pm.addPass(CreateConvertComplexToArithMathPass());
           pm.addPass(emitters::CreateExpandFloatOpsPass());
+          pm.addPass(CreateExpandFloatOpsPass());
+          pm.addPass(CreateLowerSubByteStoragePass());
+          pm.addPass(CreateLowerFloatStoragePass());
           pm.addPass(mlir::createLowerAffinePass());
           if (mlir::failed(pm.run(mlir_source.module()))) {
             return absl::InternalError(absl::StrCat(
@@ -245,8 +293,7 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
           }
         }
         TF_ASSIGN_OR_RETURN(metal::MslKernelSource msl_source,
-                            metal::EmitMslKernel(mlir_source.module(),
-                                                 &msl_state));
+                            metal::EmitMslKernel(mlir_source.module()));
         const gpu::LaunchDimensions launch_dims =
             mlir_fusion->launch_dimensions();
         if (!msl_blob.empty()) {
@@ -277,8 +324,7 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
   std::string module_name(hlo_module->name());
 
   gpu::GpuExecutable::Params params;
-  params.executable =
-      std::make_unique<gpu::ThunkExecutor>(std::move(thunks));
+  params.executable = std::make_unique<gpu::ThunkExecutor>(std::move(thunks));
   params.asm_text = std::move(msl_blob);
   params.constants = std::move(constants);
   params.buffer_assignment = std::move(buffer_assignment);

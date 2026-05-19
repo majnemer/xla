@@ -21,7 +21,6 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -39,7 +38,6 @@ limitations under the License.
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
-#include "xla/backends/gpu/codegen/emitters/ir/xla_gpu_ops.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -48,7 +46,9 @@ limitations under the License.
 #include "mlir/IR/Value.h"
 #include "mlir/Support/DebugStringHelper.h"
 #include "mlir/Support/IndentedOstream.h"
+#include "xla/backends/gpu/codegen/emitters/ir/xla_gpu_ops.h"
 #include "xla/backends/metal/codegen/msl_kernel_source.h"
+#include "xla/codegen/emitters/ir/xla_ops.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
 
@@ -90,8 +90,7 @@ absl::StatusOr<std::string> EmitElementType(mlir::Type type) {
         "Apple Silicon GPUs have no fp64 hardware; f64 is not supported.");
   }
   if (mlir::isa<mlir::BFloat16Type>(type)) {
-    return absl::InvalidArgumentError(
-        "bf16 requires Metal 3 (macOS 13+).");
+    return absl::InvalidArgumentError("bf16 requires Metal 3 (macOS 13+).");
   }
   return absl::InvalidArgumentError(absl::StrCat(
       "Unsupported element type for MSL: ", mlir::debugString(type)));
@@ -108,8 +107,8 @@ absl::StatusOr<std::string> TypeToMSL(mlir::Type type) {
     }
     const int64_t n = vec.getDimSize(0);
     if (n != 2 && n != 3 && n != 4) {
-      return absl::UnimplementedError(absl::StrCat(
-          "MSL vector width must be 2, 3, or 4; got ", n));
+      return absl::UnimplementedError(
+          absl::StrCat("MSL vector width must be 2, 3, or 4; got ", n));
     }
     TF_ASSIGN_OR_RETURN(std::string elem,
                         EmitElementType(vec.getElementType()));
@@ -135,48 +134,6 @@ absl::StatusOr<std::string> UnsignedMslType(mlir::Type type) {
       type.getContext(), int_ty.getWidth(), mlir::IntegerType::Unsigned));
 }
 
-// Emits an MSL device function __xla_log1p_<ty> implementing the XLA Log1p
-// algorithm at the given MSL float type (`float` or `half`). For |x| below
-// sqrt(2)-1 it evaluates a Cephes-style rational approximation via Horner;
-// otherwise it falls back to metal::log(x + 1). Ported from xla::Log1p.
-void EmitLog1pHelper(mlir::raw_indented_ostream& os, absl::string_view ty) {
-  // Match the literal width to the type so the MSL compiler doesn't emit
-  // implicit-double-narrowing warnings on Apple Silicon (which has no fp64).
-  absl::string_view s = (ty == "half") ? "h" : "f";
-  os << ty << " __xla_log1p_" << ty << "(" << ty << " x) {\n";
-  os << "  const " << ty << " kD[7] = {\n";
-  os << "    1.0" << s << ",\n";
-  os << "    1.5062909083469192043167e1" << s << ",\n";
-  os << "    8.3047565967967209469434e1" << s << ",\n";
-  os << "    2.2176239823732856465394e2" << s << ",\n";
-  os << "    3.0909872225312059774938e2" << s << ",\n";
-  os << "    2.1642788614495947685003e2" << s << ",\n";
-  os << "    6.0118660497603843919306e1" << s << ",\n";
-  os << "  };\n";
-  os << "  const " << ty << " kN[7] = {\n";
-  os << "    4.5270000862445199635215e-5" << s << ",\n";
-  os << "    4.9854102823193375972212e-1" << s << ",\n";
-  os << "    6.5787325942061044846969e0" << s << ",\n";
-  os << "    2.9911919328553073277375e1" << s << ",\n";
-  os << "    6.0949667980987787057556e1" << s << ",\n";
-  os << "    5.7112963590585538103336e1" << s << ",\n";
-  os << "    2.0039553499201281259648e1" << s << ",\n";
-  os << "  };\n";
-  os << "  " << ty << " d = 0.0" << s << "; " << ty << " n = 0.0" << s
-     << ";\n";
-  os << "  for (int i = 0; i < 7; ++i) {\n";
-  os << "    d = d * x + kD[i];\n";
-  os << "    n = n * x + kN[i];\n";
-  os << "  }\n";
-  os << "  " << ty << " xsq = x * x;\n";
-  os << "  " << ty << " for_small = x + (-0.5" << s << " * xsq)\n";
-  os << "                     + (x * xsq) * (n / d);\n";
-  os << "  " << ty << " for_large = metal::log(x + 1.0" << s << ");\n";
-  os << "  return metal::fabs(x) < 0.41421356237309504880" << s
-     << " ? for_small : for_large;\n";
-  os << "}\n";
-}
-
 absl::StatusOr<int64_t> SliceIndexOf(mlir::func::FuncOp func, unsigned idx) {
   auto attr = func.getArgAttrOfType<mlir::IntegerAttr>(
       idx, std::string(kSliceIndexAttrName));
@@ -191,7 +148,7 @@ absl::StatusOr<int64_t> SliceIndexOf(mlir::func::FuncOp func, unsigned idx) {
 
 // Formats an `arith.constant`'s value as an MSL literal of the given type.
 absl::StatusOr<std::string> FormatConstantLiteral(mlir::Type type,
-                                                   mlir::Attribute value) {
+                                                  mlir::Attribute value) {
   if (mlir::isa<mlir::IndexType>(type)) {
     auto attr = mlir::dyn_cast<mlir::IntegerAttr>(value);
     if (!attr) {
@@ -213,7 +170,7 @@ absl::StatusOr<std::string> FormatConstantLiteral(mlir::Type type,
     // diagnostics on edge values like INT_MIN.
     TF_ASSIGN_OR_RETURN(std::string elem_msl, EmitElementType(type));
     std::string digits = int_ty.isUnsigned() ? std::to_string(attr.getUInt())
-                                              : std::to_string(attr.getInt());
+                                             : std::to_string(attr.getInt());
     return absl::StrCat("static_cast<", elem_msl, ">(", digits, ")");
   }
   if (mlir::isa<mlir::FloatType>(type)) {
@@ -231,24 +188,23 @@ absl::StatusOr<std::string> FormatConstantLiteral(mlir::Type type,
       suffix = "f";
       precision = 9;  // round-trips IEEE single.
     } else {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "arith.constant of unsupported float type: ",
-          mlir::debugString(type)));
+      return absl::InvalidArgumentError(
+          absl::StrCat("arith.constant of unsupported float type: ",
+                       mlir::debugString(type)));
     }
 
     // Widen to double for absl::StrFormat. Lossless for f16 and f32.
     llvm::APFloat val = attr.getValue();
     bool loses_info = false;
-    val.convert(llvm::APFloat::IEEEdouble(),
-                llvm::APFloat::rmNearestTiesToEven, &loses_info);
+    val.convert(llvm::APFloat::IEEEdouble(), llvm::APFloat::rmNearestTiesToEven,
+                &loses_info);
     const double d = val.convertToDouble();
 
     if (std::isnan(d) || std::isinf(d)) {
       TF_ASSIGN_OR_RETURN(std::string elem_msl, EmitElementType(type));
-      absl::string_view method =
-          std::isnan(d) ? "quiet_NaN()" : "infinity()";
-      std::string base = absl::StrCat("metal::numeric_limits<", elem_msl,
-                                       ">::", method);
+      absl::string_view method = std::isnan(d) ? "quiet_NaN()" : "infinity()";
+      std::string base =
+          absl::StrCat("metal::numeric_limits<", elem_msl, ">::", method);
       if (std::isinf(d) && std::signbit(d)) {
         return absl::StrCat("(-", base, ")");
       }
@@ -349,7 +305,7 @@ class MslEmitter {
     }
     if (op.getNumResults() == 1) {
       TF_ASSIGN_OR_RETURN(std::string ty, TypeToMSL(op.getResult(0).getType()));
-      std::string name = CreateName(op.getResult(0));
+      std::string name = BindValueName(op.getResult(0));
       os_ << ty << " " << name << " = " << call << ";\n";
       return absl::OkStatus();
     }
@@ -419,8 +375,8 @@ class MslEmitter {
       std::string arg_name = absl::StrCat("arg", i);
       names_[arg] = arg_name;
       addr_spaces_[arg] = "device";
-      emit_param(absl::StrCat("device ", elem_msl, "* ", arg_name,
-                              " [[buffer(", i, ")]]"));
+      emit_param(absl::StrCat("device ", elem_msl, "* ", arg_name, " [[buffer(",
+                              i, ")]]"));
     }
     if (attrs.thread_id) {
       emit_param("uint3 tid [[thread_position_in_threadgroup]]");
@@ -571,16 +527,8 @@ class MslEmitter {
     if (mlir::isa<mlir::math::LogOp>(op)) {
       return EmitMathCall(op, "metal::log");
     }
-    if (mlir::isa<mlir::math::Log1pOp>(op)) {
-      // MSL has no log1p intrinsic; route to the helper emitted at module
-      // scope by TranslateToMSL (Cephes-style rational approximation).
-      auto fty = mlir::dyn_cast<mlir::FloatType>(op->getOperand(0).getType());
-      if (!fty) {
-        return absl::UnimplementedError(
-            "math.log1p: only scalar float operands are supported.");
-      }
-      TF_ASSIGN_OR_RETURN(std::string ty, EmitElementType(fty));
-      return EmitMathCall(op, absl::StrCat("__xla_log1p_", ty));
+    if (mlir::isa<mlir::math::SqrtOp>(op)) {
+      return EmitMathCall(op, "metal::sqrt");
     }
     if (mlir::isa<mlir::math::PowFOp>(op)) {
       return EmitMathCall(op, "metal::pow");
@@ -588,11 +536,14 @@ class MslEmitter {
     if (mlir::isa<mlir::math::RsqrtOp>(op)) {
       return EmitMathCall(op, "metal::rsqrt");
     }
+    if (auto clz = mlir::dyn_cast<mlir::math::CountLeadingZerosOp>(op)) {
+      return EmitMathCtlz(clz);
+    }
     if (auto ic = mlir::dyn_cast<mlir::arith::IndexCastOp>(op)) {
       return EmitArithCast(ic.getOperation());
     }
     if (auto ic = mlir::dyn_cast<mlir::arith::IndexCastUIOp>(op)) {
-      return EmitArithCast(ic.getOperation());
+      return EmitArithIndexCastUI(ic);
     }
     if (auto sf = mlir::dyn_cast<mlir::arith::SIToFPOp>(op)) {
       return EmitArithCast(sf.getOperation());
@@ -628,6 +579,9 @@ class MslEmitter {
     }
     if (auto in = mlir::dyn_cast<mlir::tensor::InsertOp>(op)) {
       return EmitTensorInsert(in);
+    }
+    if (auto atomic = mlir::dyn_cast<::xla::AtomicRMWOp>(op)) {
+      return EmitXlaAtomicRMW(atomic);
     }
     if (auto fo = mlir::dyn_cast<mlir::scf::ForOp>(op)) {
       return EmitScfFor(fo);
@@ -692,9 +646,9 @@ class MslEmitter {
     if (auto ret = mlir::dyn_cast<mlir::func::ReturnOp>(op)) {
       return EmitFuncReturn(ret);
     }
-    return absl::UnimplementedError(absl::StrCat(
-        "MSL emitter does not yet handle op: ",
-        op->getName().getStringRef().str()));
+    return absl::UnimplementedError(
+        absl::StrCat("MSL emitter does not yet handle op: ",
+                     op->getName().getStringRef().str()));
   }
 
   absl::Status EmitArithConstant(mlir::arith::ConstantOp op) {
@@ -702,7 +656,7 @@ class MslEmitter {
     TF_ASSIGN_OR_RETURN(std::string ty_msl, TypeToMSL(ty));
     TF_ASSIGN_OR_RETURN(std::string literal,
                         FormatConstantLiteral(ty, op.getValueAttr()));
-    std::string name = CreateName(op.getResult());
+    std::string name = BindValueName(op.getResult());
     os_ << ty_msl << " " << name << " = " << literal << ";\n";
     return absl::OkStatus();
   }
@@ -712,12 +666,12 @@ class MslEmitter {
     // expected to overwrite before reading.
     mlir::Type ty = op.getResult().getType();
     if (!mlir::isa<mlir::IntegerType, mlir::FloatType, mlir::IndexType>(ty)) {
-      return absl::UnimplementedError(absl::StrCat(
-          "ub.poison of non-scalar type is not supported: ",
-          mlir::debugString(ty)));
+      return absl::UnimplementedError(
+          absl::StrCat("ub.poison of non-scalar type is not supported: ",
+                       mlir::debugString(ty)));
     }
     TF_ASSIGN_OR_RETURN(std::string ty_msl, TypeToMSL(ty));
-    std::string name = CreateName(op.getResult());
+    std::string name = BindValueName(op.getResult());
     os_ << ty_msl << " " << name << " = " << ty_msl << "(0);\n";
     return absl::OkStatus();
   }
@@ -726,13 +680,13 @@ class MslEmitter {
   // takes the op's operands in order (abs, exp, fma, ...).
   absl::Status EmitMathCall(mlir::Operation* op, absl::string_view fn) {
     if (op->getNumResults() != 1) {
-      return absl::InternalError(absl::StrCat(
-          op->getName().getStringRef().str(), " has ", op->getNumResults(),
-          " results; expected 1."));
+      return absl::InternalError(
+          absl::StrCat(op->getName().getStringRef().str(), " has ",
+                       op->getNumResults(), " results; expected 1."));
     }
     TF_ASSIGN_OR_RETURN(std::string ty_msl,
                         TypeToMSL(op->getResult(0).getType()));
-    std::string name = CreateName(op->getResult(0));
+    std::string name = BindValueName(op->getResult(0));
     os_ << ty_msl << " " << name << " = " << fn << "(";
     for (unsigned i = 0; i < op->getNumOperands(); ++i) {
       if (i > 0) os_ << ", ";
@@ -751,7 +705,7 @@ class MslEmitter {
     }
     TF_ASSIGN_OR_RETURN(std::string src, GetName(op->getOperand(0)));
     TF_ASSIGN_OR_RETURN(std::string ty, TypeToMSL(op->getResult(0).getType()));
-    std::string name = CreateName(op->getResult(0));
+    std::string name = BindValueName(op->getResult(0));
     os_ << ty << " " << name << " = " << op_str << src << ";\n";
     return absl::OkStatus();
   }
@@ -765,16 +719,16 @@ class MslEmitter {
     TF_ASSIGN_OR_RETURN(std::string a, GetName(op->getOperand(0)));
     TF_ASSIGN_OR_RETURN(std::string b, GetName(op->getOperand(1)));
     TF_ASSIGN_OR_RETURN(std::string ty, TypeToMSL(op->getResult(0).getType()));
-    std::string name = CreateName(op->getResult(0));
+    std::string name = BindValueName(op->getResult(0));
     os_ << ty << " " << name << " = " << fn << "(static_cast<" << u_ty << ">("
         << a << "), static_cast<" << u_ty << ">(" << b << "));\n";
     return absl::OkStatus();
   }
 
-  // arith.divui / arith.remui: the MLIR i-types are signless and EmitElementType
-  // maps them to signed MSL (int/short/...), so a bare '/' or '%' would be
-  // signed. Cast both operands to the unsigned MSL type to get the right
-  // semantics; the implicit conversion back to the (signless) result type
+  // arith.divui / arith.remui: the MLIR i-types are signless and
+  // EmitElementType maps them to signed MSL (int/short/...), so a bare '/' or
+  // '%' would be signed. Cast both operands to the unsigned MSL type to get the
+  // right semantics; the implicit conversion back to the (signless) result type
   // preserves the bit pattern.
   absl::Status EmitArithUnsignedBinary(mlir::Operation* op,
                                        absl::string_view op_str) {
@@ -783,9 +737,9 @@ class MslEmitter {
     TF_ASSIGN_OR_RETURN(std::string a, GetName(op->getOperand(0)));
     TF_ASSIGN_OR_RETURN(std::string b, GetName(op->getOperand(1)));
     TF_ASSIGN_OR_RETURN(std::string ty, TypeToMSL(op->getResult(0).getType()));
-    std::string name = CreateName(op->getResult(0));
-    os_ << ty << " " << name << " = (static_cast<" << u_ty << ">(" << a
-        << ") " << op_str << " static_cast<" << u_ty << ">(" << b << "));\n";
+    std::string name = BindValueName(op->getResult(0));
+    os_ << ty << " " << name << " = (static_cast<" << u_ty << ">(" << a << ") "
+        << op_str << " static_cast<" << u_ty << ">(" << b << "));\n";
     return absl::OkStatus();
   }
 
@@ -797,21 +751,45 @@ class MslEmitter {
     TF_ASSIGN_OR_RETURN(std::string a, GetName(op->getOperand(0)));
     TF_ASSIGN_OR_RETURN(std::string b, GetName(op->getOperand(1)));
     TF_ASSIGN_OR_RETURN(std::string ty, TypeToMSL(op->getResult(0).getType()));
-    std::string name = CreateName(op->getResult(0));
+    std::string name = BindValueName(op->getResult(0));
     os_ << ty << " " << name << " = (static_cast<" << u_ty << ">(" << a
         << ") >> " << b << ");\n";
+    return absl::OkStatus();
+  }
+
+  absl::Status EmitMathCtlz(mlir::math::CountLeadingZerosOp op) {
+    TF_ASSIGN_OR_RETURN(std::string src_ty,
+                        UnsignedMslType(op.getOperand().getType()));
+    TF_ASSIGN_OR_RETURN(std::string dst_ty, TypeToMSL(op.getType()));
+    TF_ASSIGN_OR_RETURN(std::string src, GetName(op.getOperand()));
+    std::string name = BindValueName(op.getResult());
+    os_ << dst_ty << " " << name << " = static_cast<" << dst_ty
+        << ">(metal::clz(static_cast<" << src_ty << ">(" << src << ")));\n";
     return absl::OkStatus();
   }
 
   // arith.extui zero-extends: reinterpret the source as unsigned (so the
   // widening doesn't sign-extend), then widen to the result type.
   absl::Status EmitArithExtUI(mlir::arith::ExtUIOp op) {
-    TF_ASSIGN_OR_RETURN(std::string u_src, UnsignedMslType(op.getIn().getType()));
+    TF_ASSIGN_OR_RETURN(std::string u_src,
+                        UnsignedMslType(op.getIn().getType()));
     TF_ASSIGN_OR_RETURN(std::string dst, TypeToMSL(op.getType()));
     TF_ASSIGN_OR_RETURN(std::string src, GetName(op.getIn()));
-    std::string name = CreateName(op.getResult());
-    os_ << dst << " " << name << " = static_cast<" << dst
-        << ">(static_cast<" << u_src << ">(" << src << "));\n";
+    std::string name = BindValueName(op.getResult());
+    os_ << dst << " " << name << " = static_cast<" << dst << ">(static_cast<"
+        << u_src << ">(" << src << "));\n";
+    return absl::OkStatus();
+  }
+
+  // arith.index_castui zero-extends integer inputs before converting to index.
+  absl::Status EmitArithIndexCastUI(mlir::arith::IndexCastUIOp op) {
+    TF_ASSIGN_OR_RETURN(std::string u_src,
+                        UnsignedMslType(op.getIn().getType()));
+    TF_ASSIGN_OR_RETURN(std::string dst, TypeToMSL(op.getType()));
+    TF_ASSIGN_OR_RETURN(std::string src, GetName(op.getIn()));
+    std::string name = BindValueName(op.getResult());
+    os_ << dst << " " << name << " = static_cast<" << dst << ">(static_cast<"
+        << u_src << ">(" << src << "));\n";
     return absl::OkStatus();
   }
 
@@ -821,19 +799,20 @@ class MslEmitter {
     TF_ASSIGN_OR_RETURN(std::string u_dst, UnsignedMslType(op.getType()));
     TF_ASSIGN_OR_RETURN(std::string dst, TypeToMSL(op.getType()));
     TF_ASSIGN_OR_RETURN(std::string src, GetName(op.getIn()));
-    std::string name = CreateName(op.getResult());
-    os_ << dst << " " << name << " = static_cast<" << dst
-        << ">(static_cast<" << u_dst << ">(" << src << "));\n";
+    std::string name = BindValueName(op.getResult());
+    os_ << dst << " " << name << " = static_cast<" << dst << ">(static_cast<"
+        << u_dst << ">(" << src << "));\n";
     return absl::OkStatus();
   }
 
   // arith.uitofp: reinterpret the source as unsigned before converting to
   // float (a direct convert would treat it as signed).
   absl::Status EmitArithUIToFP(mlir::arith::UIToFPOp op) {
-    TF_ASSIGN_OR_RETURN(std::string u_src, UnsignedMslType(op.getIn().getType()));
+    TF_ASSIGN_OR_RETURN(std::string u_src,
+                        UnsignedMslType(op.getIn().getType()));
     TF_ASSIGN_OR_RETURN(std::string dst, TypeToMSL(op.getType()));
     TF_ASSIGN_OR_RETURN(std::string src, GetName(op.getIn()));
-    std::string name = CreateName(op.getResult());
+    std::string name = BindValueName(op.getResult());
     os_ << dst << " " << name << " = static_cast<" << dst << ">(static_cast<"
         << u_src << ">(" << src << "));\n";
     return absl::OkStatus();
@@ -843,7 +822,7 @@ class MslEmitter {
   absl::Status EmitArithBitcast(mlir::arith::BitcastOp op) {
     TF_ASSIGN_OR_RETURN(std::string dst, TypeToMSL(op.getType()));
     TF_ASSIGN_OR_RETURN(std::string src, GetName(op.getIn()));
-    std::string name = CreateName(op.getResult());
+    std::string name = BindValueName(op.getResult());
     os_ << dst << " " << name << " = as_type<" << dst << ">(" << src << ");\n";
     return absl::OkStatus();
   }
@@ -852,21 +831,21 @@ class MslEmitter {
   // propagates. MSL's metal::fmin/fmax don't, so we test explicitly.
   absl::Status EmitArithMinMaxF(mlir::Operation* op, bool is_min) {
     if (op->getNumOperands() != 2 || op->getNumResults() != 1) {
-      return absl::InternalError(absl::StrCat(
-          op->getName().getStringRef().str(),
-          " has unexpected arity: ", op->getNumOperands(), " operand(s), ",
-          op->getNumResults(), " result(s)."));
+      return absl::InternalError(
+          absl::StrCat(op->getName().getStringRef().str(),
+                       " has unexpected arity: ", op->getNumOperands(),
+                       " operand(s), ", op->getNumResults(), " result(s)."));
     }
     mlir::Type ty = op->getResult(0).getType();
     if (!mlir::isa<mlir::FloatType>(ty)) {
-      return absl::UnimplementedError(absl::StrCat(
-          op->getName().getStringRef().str(),
-          ": only scalar float operands are supported."));
+      return absl::UnimplementedError(
+          absl::StrCat(op->getName().getStringRef().str(),
+                       ": only scalar float operands are supported."));
     }
     TF_ASSIGN_OR_RETURN(std::string lhs, GetName(op->getOperand(0)));
     TF_ASSIGN_OR_RETURN(std::string rhs, GetName(op->getOperand(1)));
     TF_ASSIGN_OR_RETURN(std::string ty_msl, TypeToMSL(ty));
-    std::string name = CreateName(op->getResult(0));
+    std::string name = BindValueName(op->getResult(0));
     absl::string_view fn = is_min ? "metal::fmin" : "metal::fmax";
     os_ << ty_msl << " " << name << " = (metal::isnan(" << lhs
         << ") || metal::isnan(" << rhs << ")) ? metal::numeric_limits<"
@@ -885,20 +864,44 @@ class MslEmitter {
     absl::string_view op_str;
     bool unsigned_cmp = false;
     switch (op.getPredicate()) {
-      case P::eq:  op_str = "=="; break;
-      case P::ne:  op_str = "!="; break;
-      case P::slt: op_str = "<";  break;
-      case P::sle: op_str = "<="; break;
-      case P::sgt: op_str = ">";  break;
-      case P::sge: op_str = ">="; break;
-      case P::ult: op_str = "<";  unsigned_cmp = true; break;
-      case P::ule: op_str = "<="; unsigned_cmp = true; break;
-      case P::ugt: op_str = ">";  unsigned_cmp = true; break;
-      case P::uge: op_str = ">="; unsigned_cmp = true; break;
+      case P::eq:
+        op_str = "==";
+        break;
+      case P::ne:
+        op_str = "!=";
+        break;
+      case P::slt:
+        op_str = "<";
+        break;
+      case P::sle:
+        op_str = "<=";
+        break;
+      case P::sgt:
+        op_str = ">";
+        break;
+      case P::sge:
+        op_str = ">=";
+        break;
+      case P::ult:
+        op_str = "<";
+        unsigned_cmp = true;
+        break;
+      case P::ule:
+        op_str = "<=";
+        unsigned_cmp = true;
+        break;
+      case P::ugt:
+        op_str = ">";
+        unsigned_cmp = true;
+        break;
+      case P::uge:
+        op_str = ">=";
+        unsigned_cmp = true;
+        break;
     }
     TF_ASSIGN_OR_RETURN(std::string lhs, GetName(op.getLhs()));
     TF_ASSIGN_OR_RETURN(std::string rhs, GetName(op.getRhs()));
-    std::string name = CreateName(op.getResult());
+    std::string name = BindValueName(op.getResult());
     if (unsigned_cmp) {
       // Cast both operands to the matching unsigned type for the u*
       // predicates (signless ints map to MSL's signed spellings).
@@ -920,19 +923,31 @@ class MslEmitter {
     }
     TF_ASSIGN_OR_RETURN(std::string lhs, GetName(op.getLhs()));
     TF_ASSIGN_OR_RETURN(std::string rhs, GetName(op.getRhs()));
-    std::string name = CreateName(op.getResult());
+    std::string name = BindValueName(op.getResult());
     // "Ordered" (O*) predicates are false if either operand is NaN; the C/MSL
     // relational operators already have that semantics. "Unordered" (U*) are
     // the negation, and ORD/UNO test NaN-ness directly via self-comparison.
     using P = mlir::arith::CmpFPredicate;
     std::string e;
     switch (op.getPredicate()) {
-      case P::AlwaysFalse: e = "false"; break;
-      case P::OEQ: e = absl::StrCat("(", lhs, " == ", rhs, ")"); break;
-      case P::OGT: e = absl::StrCat("(", lhs, " > ", rhs, ")"); break;
-      case P::OGE: e = absl::StrCat("(", lhs, " >= ", rhs, ")"); break;
-      case P::OLT: e = absl::StrCat("(", lhs, " < ", rhs, ")"); break;
-      case P::OLE: e = absl::StrCat("(", lhs, " <= ", rhs, ")"); break;
+      case P::AlwaysFalse:
+        e = "false";
+        break;
+      case P::OEQ:
+        e = absl::StrCat("(", lhs, " == ", rhs, ")");
+        break;
+      case P::OGT:
+        e = absl::StrCat("(", lhs, " > ", rhs, ")");
+        break;
+      case P::OGE:
+        e = absl::StrCat("(", lhs, " >= ", rhs, ")");
+        break;
+      case P::OLT:
+        e = absl::StrCat("(", lhs, " < ", rhs, ")");
+        break;
+      case P::OLE:
+        e = absl::StrCat("(", lhs, " <= ", rhs, ")");
+        break;
       case P::ONE:
         e = absl::StrCat("(", lhs, " < ", rhs, " || ", lhs, " > ", rhs, ")");
         break;
@@ -942,15 +957,27 @@ class MslEmitter {
       case P::UEQ:
         e = absl::StrCat("!(", lhs, " < ", rhs, " || ", lhs, " > ", rhs, ")");
         break;
-      case P::UGT: e = absl::StrCat("!(", lhs, " <= ", rhs, ")"); break;
-      case P::UGE: e = absl::StrCat("!(", lhs, " < ", rhs, ")"); break;
-      case P::ULT: e = absl::StrCat("!(", lhs, " >= ", rhs, ")"); break;
-      case P::ULE: e = absl::StrCat("!(", lhs, " > ", rhs, ")"); break;
-      case P::UNE: e = absl::StrCat("(", lhs, " != ", rhs, ")"); break;
+      case P::UGT:
+        e = absl::StrCat("!(", lhs, " <= ", rhs, ")");
+        break;
+      case P::UGE:
+        e = absl::StrCat("!(", lhs, " < ", rhs, ")");
+        break;
+      case P::ULT:
+        e = absl::StrCat("!(", lhs, " >= ", rhs, ")");
+        break;
+      case P::ULE:
+        e = absl::StrCat("!(", lhs, " > ", rhs, ")");
+        break;
+      case P::UNE:
+        e = absl::StrCat("(", lhs, " != ", rhs, ")");
+        break;
       case P::UNO:
         e = absl::StrCat("(", lhs, " != ", lhs, " || ", rhs, " != ", rhs, ")");
         break;
-      case P::AlwaysTrue: e = "true"; break;
+      case P::AlwaysTrue:
+        e = "true";
+        break;
     }
     os_ << "bool " << name << " = " << e << ";\n";
     return absl::OkStatus();
@@ -961,7 +988,7 @@ class MslEmitter {
     TF_ASSIGN_OR_RETURN(std::string tval, GetName(op.getTrueValue()));
     TF_ASSIGN_OR_RETURN(std::string fval, GetName(op.getFalseValue()));
     TF_ASSIGN_OR_RETURN(std::string ty_msl, TypeToMSL(op.getType()));
-    std::string name = CreateName(op.getResult());
+    std::string name = BindValueName(op.getResult());
     // Scalar i1 condition -> ternary (also valid for a whole-vector result).
     // Element-wise vector condition -> metal::select(false, true, cond).
     if (mlir::isa<mlir::VectorType>(op.getCondition().getType())) {
@@ -979,32 +1006,32 @@ class MslEmitter {
   // primitive, so the cast is a `static_cast`.
   absl::Status EmitArithCast(mlir::Operation* op) {
     if (op->getNumOperands() != 1 || op->getNumResults() != 1) {
-      return absl::InternalError(absl::StrCat(
-          "Cast op ", op->getName().getStringRef().str(),
-          " has unexpected arity: ", op->getNumOperands(), " operand(s), ",
-          op->getNumResults(), " result(s)."));
+      return absl::InternalError(
+          absl::StrCat("Cast op ", op->getName().getStringRef().str(),
+                       " has unexpected arity: ", op->getNumOperands(),
+                       " operand(s), ", op->getNumResults(), " result(s)."));
     }
     TF_ASSIGN_OR_RETURN(std::string ty_msl,
                         TypeToMSL(op->getResult(0).getType()));
     TF_ASSIGN_OR_RETURN(std::string src, GetName(op->getOperand(0)));
-    std::string name = CreateName(op->getResult(0));
-    os_ << ty_msl << " " << name << " = static_cast<" << ty_msl << ">("
-        << src << ");\n";
+    std::string name = BindValueName(op->getResult(0));
+    os_ << ty_msl << " " << name << " = static_cast<" << ty_msl << ">(" << src
+        << ");\n";
     return absl::OkStatus();
   }
 
   absl::Status EmitBinary(mlir::Operation* op, absl::string_view op_str) {
     if (op->getNumOperands() != 2 || op->getNumResults() != 1) {
-      return absl::InternalError(absl::StrCat(
-          "Binary op ", op->getName().getStringRef().str(),
-          " has unexpected arity: ", op->getNumOperands(), " operand(s), ",
-          op->getNumResults(), " result(s)."));
+      return absl::InternalError(
+          absl::StrCat("Binary op ", op->getName().getStringRef().str(),
+                       " has unexpected arity: ", op->getNumOperands(),
+                       " operand(s), ", op->getNumResults(), " result(s)."));
     }
     TF_ASSIGN_OR_RETURN(std::string ty_msl,
                         TypeToMSL(op->getResult(0).getType()));
     TF_ASSIGN_OR_RETURN(std::string lhs, GetName(op->getOperand(0)));
     TF_ASSIGN_OR_RETURN(std::string rhs, GetName(op->getOperand(1)));
-    std::string name = CreateName(op->getResult(0));
+    std::string name = BindValueName(op->getResult(0));
     os_ << ty_msl << " " << name << " = " << lhs << " " << op_str << " " << rhs
         << ";\n";
     return absl::OkStatus();
@@ -1024,20 +1051,19 @@ class MslEmitter {
     } else {
       TF_ASSIGN_OR_RETURN(idx, GetName(op.getIndices().front()));
     }
-    std::string name = CreateName(op.getResult());
+    std::string name = BindValueName(op.getResult());
     os_ << ty_msl << " " << name << " = " << buf << "[" << idx << "];\n";
     return absl::OkStatus();
   }
 
   absl::Status HoistSharedAllocations(mlir::func::FuncOp func) {
     llvm::SmallVector<::xla::gpu::AllocateSharedOp> shared;
-    func.walk(
-        [&](::xla::gpu::AllocateSharedOp op) { shared.push_back(op); });
+    func.walk([&](::xla::gpu::AllocateSharedOp op) { shared.push_back(op); });
     for (::xla::gpu::AllocateSharedOp op : shared) {
       auto tensor_ty = mlir::cast<mlir::RankedTensorType>(op.getType());
       TF_ASSIGN_OR_RETURN(std::string elem_msl,
                           EmitElementType(tensor_ty.getElementType()));
-      std::string name = CreateName(op.getResult());
+      std::string name = BindValueName(op.getResult());
       addr_spaces_[op.getResult()] = "threadgroup";
       os_ << "threadgroup " << elem_msl << " " << name << "["
           << tensor_ty.getNumElements() << "];\n";
@@ -1083,33 +1109,47 @@ class MslEmitter {
                         TypeToMSL(op.getShuffleResult().getType()));
     absl::string_view fn;
     switch (op.getMode()) {
-      case mlir::gpu::ShuffleMode::IDX:  fn = "metal::simd_shuffle"; break;
-      case mlir::gpu::ShuffleMode::XOR:  fn = "metal::simd_shuffle_xor"; break;
-      case mlir::gpu::ShuffleMode::UP:   fn = "metal::simd_shuffle_up"; break;
-      case mlir::gpu::ShuffleMode::DOWN: fn = "metal::simd_shuffle_down"; break;
+      case mlir::gpu::ShuffleMode::IDX:
+        fn = "metal::simd_shuffle";
+        break;
+      case mlir::gpu::ShuffleMode::XOR:
+        fn = "metal::simd_shuffle_xor";
+        break;
+      case mlir::gpu::ShuffleMode::UP:
+        fn = "metal::simd_shuffle_up";
+        break;
+      case mlir::gpu::ShuffleMode::DOWN:
+        fn = "metal::simd_shuffle_down";
+        break;
     }
-    std::string shuf = CreateName(op.getShuffleResult());
-    os_ << ty << " " << shuf << " = " << fn << "(" << value << ", "
-        << offset << ");\n";
-    std::string valid = CreateName(op.getValid());
+    std::string shuf = BindValueName(op.getShuffleResult());
+    os_ << ty << " " << shuf << " = " << fn << "(" << value << ", " << offset
+        << ");\n";
+    std::string valid = BindValueName(op.getValid());
     os_ << "bool " << valid << " = true;\n";
     return absl::OkStatus();
   }
 
   absl::Status EmitDimComponent(mlir::Value result,
-                                 absl::string_view kernel_attr_name,
-                                 mlir::gpu::Dimension dim) {
+                                absl::string_view kernel_attr_name,
+                                mlir::gpu::Dimension dim) {
     const char* component = nullptr;
     switch (dim) {
-      case mlir::gpu::Dimension::x: component = "x"; break;
-      case mlir::gpu::Dimension::y: component = "y"; break;
-      case mlir::gpu::Dimension::z: component = "z"; break;
+      case mlir::gpu::Dimension::x:
+        component = "x";
+        break;
+      case mlir::gpu::Dimension::y:
+        component = "y";
+        break;
+      case mlir::gpu::Dimension::z:
+        component = "z";
+        break;
     }
     if (!component) {
       return absl::InternalError("gpu.* op has unknown dimension.");
     }
     TF_ASSIGN_OR_RETURN(std::string ty_msl, TypeToMSL(result.getType()));
-    std::string name = CreateName(result);
+    std::string name = BindValueName(result);
     os_ << ty_msl << " " << name << " = static_cast<" << ty_msl << ">("
         << kernel_attr_name << "." << component << ");\n";
     return absl::OkStatus();
@@ -1122,8 +1162,8 @@ class MslEmitter {
     }
     const int64_t n = ty.getDimSize(0);
     if (n != 2 && n != 3 && n != 4) {
-      return absl::UnimplementedError(absl::StrCat(
-          "MSL vector width must be 2, 3, or 4; got ", n));
+      return absl::UnimplementedError(
+          absl::StrCat("MSL vector width must be 2, 3, or 4; got ", n));
     }
     TF_ASSIGN_OR_RETURN(std::string elem, EmitElementType(ty.getElementType()));
     return absl::StrCat(elem, n);
@@ -1150,7 +1190,7 @@ class MslEmitter {
     TF_ASSIGN_OR_RETURN(std::string buf, GetName(op.getBase()));
     TF_ASSIGN_OR_RETURN(std::string idx, GetName(op.getIndices().front()));
     TF_ASSIGN_OR_RETURN(std::string space, AddrSpaceOf(op.getBase()));
-    std::string name = CreateName(op.getResult());
+    std::string name = BindValueName(op.getResult());
     os_ << vec_ty << " " << name << " = *(const " << space << " " << vec_ty
         << "*)(&" << buf << "[" << idx << "]);\n";
     return absl::OkStatus();
@@ -1193,7 +1233,7 @@ class MslEmitter {
     }
     TF_ASSIGN_OR_RETURN(std::string ty, TypeToMSL(op.getType()));
     TF_ASSIGN_OR_RETURN(std::string src, GetName(op.getSource()));
-    std::string name = CreateName(op.getResult());
+    std::string name = BindValueName(op.getResult());
     os_ << ty << " " << name << " = " << src << "[" << idx << "];\n";
     return absl::OkStatus();
   }
@@ -1216,7 +1256,7 @@ class MslEmitter {
     TF_ASSIGN_OR_RETURN(std::string ty, TypeToMSL(op.getResult().getType()));
     TF_ASSIGN_OR_RETURN(std::string dest, GetName(op.getDest()));
     TF_ASSIGN_OR_RETURN(std::string val, GetName(op.getValueToStore()));
-    std::string name = CreateName(op.getResult());
+    std::string name = BindValueName(op.getResult());
     os_ << ty << " " << name << " = " << dest << ";\n";
     os_ << name << "[" << idx << "] = " << val << ";\n";
     return absl::OkStatus();
@@ -1225,7 +1265,7 @@ class MslEmitter {
   absl::Status EmitVectorFromElements(mlir::vector::FromElementsOp op) {
     TF_ASSIGN_OR_RETURN(std::string vec_ty,
                         VectorTypeToMSL(op.getResult().getType()));
-    std::string name = CreateName(op.getResult());
+    std::string name = BindValueName(op.getResult());
     os_ << vec_ty << " " << name << " = " << vec_ty << "(";
     bool first = true;
     for (mlir::Value elt : op.getElements()) {
@@ -1255,7 +1295,7 @@ class MslEmitter {
     }
     TF_ASSIGN_OR_RETURN(std::string dst_msl, VectorTypeToMSL(dst_ty));
     TF_ASSIGN_OR_RETURN(std::string src, GetName(op.getSource()));
-    std::string name = CreateName(op.getResult());
+    std::string name = BindValueName(op.getResult());
     // MSL's vector ctor splats a scalar argument and copy-constructs from a
     // same-shape vector.
     os_ << dst_msl << " " << name << " = " << dst_msl << "(" << src << ");\n";
@@ -1277,19 +1317,18 @@ class MslEmitter {
         TF_RETURN_IF_ERROR(InheritAddrSpace(iter_arg, init));
       } else {
         TF_ASSIGN_OR_RETURN(std::string ty, TypeToMSL(iter_arg.getType()));
-        std::string var = CreateName(iter_arg);
+        std::string var = BindValueName(iter_arg);
         os_ << ty << " " << var << " = " << init_name << ";\n";
       }
     }
     TF_ASSIGN_OR_RETURN(std::string iv_ty,
                         TypeToMSL(op.getInductionVar().getType()));
-    std::string iv_name = CreateName(op.getInductionVar());
+    std::string iv_name = BindValueName(op.getInductionVar());
     TF_ASSIGN_OR_RETURN(std::string lo, GetName(op.getLowerBound()));
     TF_ASSIGN_OR_RETURN(std::string hi, GetName(op.getUpperBound()));
     TF_ASSIGN_OR_RETURN(std::string st, GetName(op.getStep()));
-    os_ << "for (" << iv_ty << " " << iv_name << " = " << lo << "; "
-        << iv_name << " < " << hi << "; " << iv_name << " += " << st
-        << ") {\n";
+    os_ << "for (" << iv_ty << " " << iv_name << " = " << lo << "; " << iv_name
+        << " < " << hi << "; " << iv_name << " += " << st << ") {\n";
     os_.indent();
     for (mlir::Operation& body_op : op.getBody()->without_terminator()) {
       TF_RETURN_IF_ERROR(EmitOp(&body_op));
@@ -1332,7 +1371,7 @@ class MslEmitter {
         continue;  // Resolved as an alias after both branches emit.
       }
       TF_ASSIGN_OR_RETURN(std::string ty_msl, TypeToMSL(result.getType()));
-      std::string name = CreateName(result);
+      std::string name = BindValueName(result);
       os_ << ty_msl << " " << name << ";\n";
       scalar_names[i] = std::move(name);
     }
@@ -1413,6 +1452,209 @@ class MslEmitter {
     return absl::OkStatus();
   }
 
+  struct AtomicStorage {
+    std::string atomic_ty;
+    std::string storage_ty;
+    bool bitcast_through_storage = false;
+  };
+
+  absl::StatusOr<AtomicStorage> GetAtomicStorage(mlir::Type element_ty) {
+    if (element_ty.isF32()) {
+      return AtomicStorage{/*atomic_ty=*/"atomic_uint",
+                           /*storage_ty=*/"uint",
+                           /*bitcast_through_storage=*/true};
+    }
+    if (auto int_ty = mlir::dyn_cast<mlir::IntegerType>(element_ty)) {
+      if (int_ty.getWidth() != 32) {
+        return absl::UnimplementedError(absl::StrCat(
+            "xla.atomic_rmw: only 32-bit integer atomics are supported by "
+            "the MSL emitter today; got ",
+            mlir::debugString(element_ty)));
+      }
+      return AtomicStorage{/*atomic_ty=*/int_ty.isUnsigned() ? "atomic_uint"
+                                                             : "atomic_int",
+                           /*storage_ty=*/int_ty.isUnsigned() ? "uint" : "int",
+                           /*bitcast_through_storage=*/false};
+    }
+    return absl::UnimplementedError(absl::StrCat(
+        "xla.atomic_rmw: unsupported element type for MSL CAS lowering: ",
+        mlir::debugString(element_ty)));
+  }
+
+  absl::Status EmitSmallIntegerAtomicRMW(::xla::AtomicRMWOp op,
+                                         int element_width) {
+    if (element_width != 8 && element_width != 16) {
+      return absl::UnimplementedError(absl::StrCat(
+          "xla.atomic_rmw: small integer atomics only support i8/i16 today; "
+          "got i",
+          element_width));
+    }
+
+    auto tensor_ty = mlir::cast<mlir::RankedTensorType>(
+        op.getInput().getType());
+    mlir::Type element_ty = tensor_ty.getElementType();
+    TF_ASSIGN_OR_RETURN(std::string element_msl, TypeToMSL(element_ty));
+    TF_ASSIGN_OR_RETURN(std::string buf, GetName(op.getInput()));
+    TF_ASSIGN_OR_RETURN(std::string space, AddrSpaceOf(op.getInput()));
+
+    std::string idx;
+    if (op.getIndices().empty()) {
+      idx = "0";
+    } else {
+      TF_ASSIGN_OR_RETURN(idx, GetName(op.getIndices().front()));
+    }
+
+    const int bytes_per_element = element_width / 8;
+    const uint32_t element_mask = (uint32_t{1} << element_width) - 1;
+
+    std::string element_index = CreateFreshName();
+    os_ << "ulong " << element_index << " = static_cast<ulong>(" << idx
+        << ");\n";
+    std::string byte_offset = CreateFreshName();
+    os_ << "ulong " << byte_offset << " = " << element_index;
+    if (bytes_per_element != 1) {
+      os_ << " * " << bytes_per_element << "ul";
+    }
+    os_ << ";\n";
+    std::string ptr = CreateFreshName();
+    os_ << space << " atomic_uint* " << ptr << " = ((" << space
+        << " atomic_uint*)" << buf << ") + (" << byte_offset << " >> 2);\n";
+    std::string shift = CreateFreshName();
+    os_ << "uint " << shift << " = static_cast<uint>((" << byte_offset
+        << " & 3ul) * 8ul);\n";
+    std::string field_mask = CreateFreshName();
+    os_ << "uint " << field_mask << " = " << element_mask << "u << " << shift
+        << ";\n";
+    std::string expected = CreateFreshName();
+    os_ << "uint " << expected << " = atomic_load_explicit(" << ptr
+        << ", memory_order_relaxed);\n";
+    std::string success = CreateFreshName();
+    os_ << "bool " << success << " = false;\n";
+    os_ << "do {\n";
+    os_.indent();
+
+    std::string current = CreateFreshName();
+    os_ << element_msl << " " << current << " = static_cast<" << element_msl
+        << ">((" << expected << " >> " << shift << ") & " << element_mask
+        << "u);\n";
+    names_[op.getCurrentValue()] = current;
+
+    for (mlir::Operation& body_op : op.getBody()->without_terminator()) {
+      TF_RETURN_IF_ERROR(EmitOp(&body_op));
+    }
+    auto yield = mlir::dyn_cast<::xla::YieldOp>(op.getBody()->getTerminator());
+    if (!yield || yield.getNumOperands() != 1) {
+      return absl::InvalidArgumentError(
+          "xla.atomic_rmw expected a single-value xla.yield terminator.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string yielded, GetName(yield.getOperand(0)));
+
+    std::string desired_field = CreateFreshName();
+    os_ << "uint " << desired_field << " = (static_cast<uint>(" << yielded
+        << ") & " << element_mask << "u) << " << shift << ";\n";
+    std::string desired = CreateFreshName();
+    os_ << "uint " << desired << " = (" << expected << " & ~" << field_mask
+        << ") | " << desired_field << ";\n";
+    os_ << success << " = atomic_compare_exchange_weak_explicit(" << ptr
+        << ", &" << expected << ", " << desired
+        << ", memory_order_relaxed, memory_order_relaxed);\n";
+    os_.unindent();
+    os_ << "} while (!" << success << ");\n";
+
+    names_[op.getResult()] = buf;
+    TF_RETURN_IF_ERROR(InheritAddrSpace(op.getResult(), op.getInput()));
+    return absl::OkStatus();
+  }
+
+  absl::Status EmitXlaAtomicRMW(::xla::AtomicRMWOp op) {
+    auto tensor_ty = mlir::dyn_cast<mlir::RankedTensorType>(
+        op.getInput().getType());
+    if (!tensor_ty) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "xla.atomic_rmw expected a ranked tensor input, got ",
+          mlir::debugString(op.getInput().getType())));
+    }
+    if (op.getIndices().size() > 1) {
+      return absl::UnimplementedError(absl::StrCat(
+          "xla.atomic_rmw with rank ", op.getIndices().size(),
+          " not yet supported by MSL emitter; only rank-0 and rank-1 today."));
+    }
+
+    mlir::Type element_ty = tensor_ty.getElementType();
+    if (mlir::isa<mlir::VectorType>(op.getCurrentValue().getType())) {
+      return absl::UnimplementedError(
+          "xla.atomic_rmw: vector atomics are not yet supported by the MSL "
+          "emitter.");
+    }
+    if (auto int_ty = mlir::dyn_cast<mlir::IntegerType>(element_ty);
+        int_ty && int_ty.getWidth() < 32) {
+      return EmitSmallIntegerAtomicRMW(op, int_ty.getWidth());
+    }
+    TF_ASSIGN_OR_RETURN(AtomicStorage atomic_storage,
+                        GetAtomicStorage(element_ty));
+    TF_ASSIGN_OR_RETURN(std::string element_msl, TypeToMSL(element_ty));
+    TF_ASSIGN_OR_RETURN(std::string buf, GetName(op.getInput()));
+    TF_ASSIGN_OR_RETURN(std::string space, AddrSpaceOf(op.getInput()));
+
+    std::string idx;
+    if (op.getIndices().empty()) {
+      idx = "0";
+    } else {
+      TF_ASSIGN_OR_RETURN(idx, GetName(op.getIndices().front()));
+    }
+
+    std::string ptr = CreateFreshName();
+    os_ << space << " " << atomic_storage.atomic_ty << "* " << ptr << " = ("
+        << space << " " << atomic_storage.atomic_ty << "*)(&" << buf << "["
+        << idx << "]);\n";
+
+    std::string expected = CreateFreshName();
+    os_ << atomic_storage.storage_ty << " " << expected
+        << " = atomic_load_explicit(" << ptr << ", memory_order_relaxed);\n";
+    std::string success = CreateFreshName();
+    os_ << "bool " << success << " = false;\n";
+    os_ << "do {\n";
+    os_.indent();
+
+    std::string current = CreateFreshName();
+    if (atomic_storage.bitcast_through_storage) {
+      os_ << element_msl << " " << current << " = as_type<" << element_msl
+          << ">(" << expected << ");\n";
+    } else {
+      os_ << element_msl << " " << current << " = static_cast<" << element_msl
+          << ">(" << expected << ");\n";
+    }
+    names_[op.getCurrentValue()] = current;
+
+    for (mlir::Operation& body_op : op.getBody()->without_terminator()) {
+      TF_RETURN_IF_ERROR(EmitOp(&body_op));
+    }
+    auto yield = mlir::dyn_cast<::xla::YieldOp>(op.getBody()->getTerminator());
+    if (!yield || yield.getNumOperands() != 1) {
+      return absl::InvalidArgumentError(
+          "xla.atomic_rmw expected a single-value xla.yield terminator.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string yielded, GetName(yield.getOperand(0)));
+
+    std::string desired = CreateFreshName();
+    if (atomic_storage.bitcast_through_storage) {
+      os_ << atomic_storage.storage_ty << " " << desired << " = as_type<"
+          << atomic_storage.storage_ty << ">(" << yielded << ");\n";
+    } else {
+      os_ << atomic_storage.storage_ty << " " << desired << " = static_cast<"
+          << atomic_storage.storage_ty << ">(" << yielded << ");\n";
+    }
+    os_ << success << " = atomic_compare_exchange_weak_explicit(" << ptr
+        << ", &" << expected << ", " << desired
+        << ", memory_order_relaxed, memory_order_relaxed);\n";
+    os_.unindent();
+    os_ << "} while (!" << success << ");\n";
+
+    names_[op.getResult()] = buf;
+    TF_RETURN_IF_ERROR(InheritAddrSpace(op.getResult(), op.getInput()));
+    return absl::OkStatus();
+  }
+
   absl::StatusOr<std::string> GetName(mlir::Value v) const {
     auto it = names_.find(v);
     if (it == names_.end()) {
@@ -1424,11 +1666,13 @@ class MslEmitter {
     return it->second;
   }
 
-  std::string CreateName(mlir::Value v) {
-    std::string name = absl::StrCat("v", next_id_++);
+  std::string BindValueName(mlir::Value v) {
+    std::string name = CreateFreshName();
     names_[v] = name;
     return name;
   }
+
+  std::string CreateFreshName() { return absl::StrCat("v", next_id_++); }
 
   mlir::raw_indented_ostream& os_;
   llvm::DenseMap<mlir::Value, std::string> names_;
@@ -1441,8 +1685,7 @@ class MslEmitter {
 
 }  // namespace
 
-absl::StatusOr<MslKernelSource> TranslateToMSL(mlir::ModuleOp module,
-                                               MslTranslationState* state) {
+absl::StatusOr<MslKernelSource> TranslateToMSL(mlir::ModuleOp module) {
   mlir::func::FuncOp entry;
   std::vector<mlir::func::FuncOp> helpers;
   for (mlir::func::FuncOp func : module.getOps<mlir::func::FuncOp>()) {
@@ -1469,25 +1712,6 @@ absl::StatusOr<MslKernelSource> TranslateToMSL(mlir::ModuleOp module,
   os << "#include <metal_stdlib>\n";
   os << "using namespace metal;\n";
   os << "\n";
-
-  // MSL has no log1p intrinsic. Pre-scan for which float types math.log1p is
-  // used at, then emit a __xla_log1p_<ty> helper per type before user code.
-  // When MetalCompiler shares one MslTranslationState across per-fusion
-  // translations, helpers it has already emitted are skipped here.
-  absl::flat_hash_set<std::string> log1p_types;
-  for (mlir::func::FuncOp func : module.getOps<mlir::func::FuncOp>()) {
-    func.walk([&](mlir::math::Log1pOp op) {
-      if (auto fty = mlir::dyn_cast<mlir::FloatType>(op.getOperand().getType())) {
-        auto t = EmitElementType(fty);
-        if (t.ok()) log1p_types.insert(*t);
-      }
-    });
-  }
-  for (const std::string& ty : log1p_types) {
-    if (state != nullptr && !state->log1p_emitted.insert(ty).second) continue;
-    EmitLog1pHelper(os, ty);
-    os << "\n";
-  }
 
   MslEmitter emitter(os);
   // Forward-declare every device function first so they can call one another

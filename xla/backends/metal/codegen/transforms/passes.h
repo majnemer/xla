@@ -12,24 +12,28 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+#ifndef XLA_BACKENDS_METAL_CODEGEN_TRANSFORMS_PASSES_H_
+#define XLA_BACKENDS_METAL_CODEGEN_TRANSFORMS_PASSES_H_
 
-#ifndef XLA_BACKENDS_METAL_CODEGEN_TRANSLATE_TO_MSL_H_
-#define XLA_BACKENDS_METAL_CODEGEN_TRANSLATE_TO_MSL_H_
+#include <memory>
 
-#include "absl/status/statusor.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "xla/backends/metal/codegen/msl_kernel_source.h"
+#include "mlir/Pass/Pass.h"
 
 namespace xla {
 namespace metal {
 
-// Emits MSL source for the entry-point func.func in `module` (the one
-// marked with the xla.entry unit attribute). Kernel argument types come
-// from the tensor types; `[[buffer(N)]]` indices come from each argument's
-// xla.slice_index attribute.
-absl::StatusOr<MslKernelSource> TranslateToMSL(mlir::ModuleOp module);
+#define GEN_PASS_DECL
+#include "xla/backends/metal/codegen/transforms/passes.h.inc"
+
+std::unique_ptr<mlir::Pass> CreateLowerFloatStoragePass();
+std::unique_ptr<mlir::Pass> CreateLowerSubByteStoragePass();
+std::unique_ptr<mlir::Pass> CreateExpandFloatOpsPass();
+std::unique_ptr<mlir::Pass> CreateConvertComplexToArithMathPass();
+
+#define GEN_PASS_REGISTRATION
+#include "xla/backends/metal/codegen/transforms/passes.h.inc"
 
 }  // namespace metal
 }  // namespace xla
 
-#endif  // XLA_BACKENDS_METAL_CODEGEN_TRANSLATE_TO_MSL_H_
+#endif  // XLA_BACKENDS_METAL_CODEGEN_TRANSFORMS_PASSES_H_
