@@ -236,6 +236,62 @@ TEST(KernelLoaderSpec, InProcessSymbolToProto) {
               )pb")));
 }
 
+TEST(KernelLoaderSpec, MslSource) {
+  static constexpr absl::string_view kMslSource =
+      "kernel void k(device float* x [[buffer(0)]]) { x[0] = 0.0f; }";
+  auto spec = KernelLoaderSpec::CreateMslSourceInMemorySpec(
+      kMslSource, "kernel24", /*arity=*/2);
+  EXPECT_FALSE(spec.has_cuda_cubin_in_memory());
+  EXPECT_FALSE(spec.has_cuda_ptx_in_memory());
+  EXPECT_FALSE(spec.has_in_process_symbol());
+  EXPECT_TRUE(spec.has_msl_source_in_memory());
+
+  EXPECT_THAT(spec.msl_source_in_memory(),
+              Optional(Field(&MslSourceInMemory::source, kMslSource)));
+  EXPECT_THAT(spec.kernel_name(), "kernel24");
+}
+
+TEST(KernelLoaderSpec, OwningMslSource) {
+  static constexpr absl::string_view kMslSource =
+      "kernel void k(device float* x [[buffer(0)]]) { x[0] = 0.0f; }";
+  auto spec = KernelLoaderSpec::CreateOwningMslSourceInMemorySpec(
+      std::string{kMslSource}, "kernel24", /*arity=*/2);
+  EXPECT_FALSE(spec.has_cuda_cubin_in_memory());
+  EXPECT_FALSE(spec.has_cuda_ptx_in_memory());
+  EXPECT_FALSE(spec.has_in_process_symbol());
+  EXPECT_TRUE(spec.has_msl_source_in_memory());
+
+  EXPECT_THAT(spec.msl_source_in_memory(),
+              Optional(Field(&MslSourceInMemory::source, kMslSource)));
+  EXPECT_THAT(spec.kernel_name(), "kernel24");
+}
+
+TEST(KernelLoaderSpec, MslKernelFromProto) {
+  auto proto = ParseTextProtoOrDie<KernelLoaderSpecProto>(R"pb(
+    msl_source { source: "MSL!" }
+    kernel_name: "kernel_name"
+    arity: 42
+  )pb");
+
+  TF_ASSERT_OK_AND_ASSIGN(KernelLoaderSpec spec,
+                          KernelLoaderSpec::FromProto(proto));
+  EXPECT_THAT(spec.kernel_name(), "kernel_name");
+  EXPECT_THAT(spec.arity(), 42);
+  EXPECT_THAT(spec.msl_source_in_memory(),
+              Optional(Field(&MslSourceInMemory::source, "MSL!")));
+}
+
+TEST(KernelLoaderSpec, MslKernelToProto) {
+  auto spec = KernelLoaderSpec::CreateMslSourceInMemorySpec(
+      "MSL!", "kernel_name", /*arity=*/42);
+
+  EXPECT_THAT(spec.ToProto(), absl_testing::IsOkAndHolds(EqualsProto(R"pb(
+                msl_source { source: "MSL!" }
+                kernel_name: "kernel_name"
+                arity: 42
+              )pb")));
+}
+
 TEST(kernelLoaderSpec, StoresKernelArgsPackingSpec) {
   auto kernel_args_packing_spec_proto =
       ParseTextProtoOrDie<KernelArgsPackingSpecProto>(

@@ -52,6 +52,10 @@ void VerifyKernelIsSerializable(const KernelLoaderSpec& kernel_spec,
   if (deserialized_spec.has_cuda_ptx_in_memory()) {
     EXPECT_THAT(deserialized_spec.cuda_ptx_in_memory()->ptx, Not(IsEmpty()));
   }
+  if (deserialized_spec.has_msl_source_in_memory()) {
+    EXPECT_THAT(deserialized_spec.msl_source_in_memory()->source,
+                Not(IsEmpty()));
+  }
 }
 
 }  // namespace stream_executor::gpu

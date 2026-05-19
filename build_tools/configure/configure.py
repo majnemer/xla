@@ -199,6 +199,7 @@ class Backend(ArgparseableEnum):
   CUDA = enum.auto()
   ROCM = enum.auto()
   SYCL = enum.auto()
+  METAL = enum.auto()
 
 
 class HostCompiler(ArgparseableEnum):
@@ -359,6 +360,7 @@ class XLAConfigOptions:
     elif self.backend == Backend.CUDA:
       build_and_test_tag_filters.append("-rocm-only")
       build_and_test_tag_filters.append("-oneapi-only")
+      build_and_test_tag_filters.append("-metal-only")
 
       compiler_pair = self.cuda_compiler, self.host_compiler
 
@@ -416,6 +418,7 @@ class XLAConfigOptions:
     elif self.backend == Backend.ROCM:
       build_and_test_tag_filters.append("-cuda-only")
       build_and_test_tag_filters.append("-oneapi-only")
+      build_and_test_tag_filters.append("-metal-only")
 
       compiler_pair = self.rocm_compiler, self.host_compiler
 
@@ -431,6 +434,7 @@ class XLAConfigOptions:
       build_and_test_tag_filters.append("-cuda-only")
       build_and_test_tag_filters.append("-rocm-only")
       build_and_test_tag_filters.append("-no-oneapi")
+      build_and_test_tag_filters.append("-metal-only")
 
       compiler_pair = self.sycl_compiler, self.host_compiler
 
@@ -439,6 +443,12 @@ class XLAConfigOptions:
         rc.append("build --config icpx_clang")
       else:
         raise NotImplementedError(" Sycl with host compiler not supported")
+    elif self.backend == Backend.METAL:
+      if self.os != OS.DARWIN:
+        raise NotImplementedError("METAL backend is only supported on macOS.")
+      build_and_test_tag_filters.append("-cuda-only")
+      build_and_test_tag_filters.append("-rocm-only")
+      build_and_test_tag_filters.append("-oneapi-only")
 
     # Lines that are added for every backend
     if dpav.ld_library_path:

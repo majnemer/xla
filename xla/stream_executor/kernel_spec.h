@@ -87,6 +87,18 @@ struct OwningCudaCubinInMemory {
   std::vector<uint8_t> cubin_bytes;
 };
 
+// Kernel loader specification for Metal Shading Language source text.
+// MSL is JIT-compiled at runtime via
+// [MTLDevice newLibraryWithSource:options:error:]; no AOT binary form.
+struct MslSourceInMemory {
+  absl::string_view source;
+};
+
+// Like MslSourceInMemory but the source text is owned by the loader spec.
+struct OwningMslSourceInMemory {
+  std::string source;
+};
+
 // Describes how to load a kernel on any subset of a number of target platforms.
 class KernelLoaderSpec {
  public:
@@ -120,6 +132,10 @@ class KernelLoaderSpec {
     return std::holds_alternative<CudaPtxInMemory>(payload_) ||
            std::holds_alternative<OwningCudaPtxInMemory>(payload_);
   }
+  bool has_msl_source_in_memory() const {
+    return std::holds_alternative<MslSourceInMemory>(payload_) ||
+           std::holds_alternative<OwningMslSourceInMemory>(payload_);
+  }
 
   // Accessors for platform variant kernel load specifications.
   std::optional<InProcessSymbol> in_process_symbol() const {
@@ -150,6 +166,17 @@ class KernelLoaderSpec {
     return std::nullopt;
   }
 
+  std::optional<MslSourceInMemory> msl_source_in_memory() const {
+    if (std::holds_alternative<MslSourceInMemory>(payload_)) {
+      return std::get<MslSourceInMemory>(payload_);
+    }
+    if (std::holds_alternative<OwningMslSourceInMemory>(payload_)) {
+      return MslSourceInMemory{
+          std::get<OwningMslSourceInMemory>(payload_).source};
+    }
+    return std::nullopt;
+  }
+
   // Use these factory functions to create a spec of any supported type.
   //
   // Note that the kernel_name parameter must be consistent with the kernel in
@@ -174,6 +201,12 @@ class KernelLoaderSpec {
   static KernelLoaderSpec CreateOwningCudaPtxInMemorySpec(
       std::string ptx, std::string kernel_name, size_t arity,
       KernelArgsPacking kernel_args_packing = KernelArgsPackingFunc{});
+  static KernelLoaderSpec CreateMslSourceInMemorySpec(
+      absl::string_view source, std::string kernel_name, size_t arity,
+      KernelArgsPacking kernel_args_packing = KernelArgsPackingFunc{});
+  static KernelLoaderSpec CreateOwningMslSourceInMemorySpec(
+      std::string source, std::string kernel_name, size_t arity,
+      KernelArgsPacking kernel_args_packing = KernelArgsPackingFunc{});
 
   void set_kernel_args_packing(KernelArgsPacking kernel_args_packing) {
     kernel_args_packing_ = std::move(kernel_args_packing);
@@ -197,7 +230,8 @@ class KernelLoaderSpec {
  private:
   using Payload =
       std::variant<InProcessSymbol, CudaCubinInMemory, CudaPtxInMemory,
-                   OwningCudaCubinInMemory, OwningCudaPtxInMemory>;
+                   OwningCudaCubinInMemory, OwningCudaPtxInMemory,
+                   MslSourceInMemory, OwningMslSourceInMemory>;
 
   explicit KernelLoaderSpec(
       Payload payload, std::string kernel_name, size_t arity,

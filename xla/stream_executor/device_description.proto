@@ -19,6 +19,7 @@ package stream_executor;
 
 import "xla/autotune_results.proto";
 import "xla/stream_executor/cuda/cuda_compute_capability.proto";
+import "xla/stream_executor/metal/metal_compute_capability.proto";
 import "xla/stream_executor/sycl/oneapi_compute_capability.proto";
 
 message RocmComputeCapabilityProto {
@@ -30,6 +31,7 @@ message GpuComputeCapabilityProto {
     CudaComputeCapabilityProto cuda_compute_capability = 1;
     RocmComputeCapabilityProto rocm_compute_capability = 2;
     OneAPIComputeCapabilityProto oneapi_compute_capability = 3;
+    MetalComputeCapabilityProto metal_compute_capability = 4;
   }
 }
 
@@ -48,7 +50,7 @@ message DeviceInterconnectInfoProto {
   string clique_id = 3;
 }
 
-// Next ID: 43
+// Next ID: 44
 message GpuDeviceInfoProto {
   string device_vendor = 30;
   string platform_version = 31;
@@ -74,6 +76,7 @@ message GpuDeviceInfoProto {
     CudaComputeCapabilityProto cuda_compute_capability = 16;
     RocmComputeCapabilityProto rocm_compute_capability = 17;
     OneAPIComputeCapabilityProto oneapi_compute_capability = 22;
+    MetalComputeCapabilityProto metal_compute_capability = 43;
   }
   int64 registers_per_core_limit = 18;
   int64 registers_per_block_limit = 19;

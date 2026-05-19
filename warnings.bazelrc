@@ -10,88 +10,88 @@ build:warnings --per_file_copt=external/.*@-w
 # ...and silence them on host builds.
 build:warnings --host_per_file_copt=external/.*@-w
 
-build:warnings --copt=-Wall
-build:warnings --copt=-Werror
-build:warnings --copt=-Wno-address-of-packed-member
-build:warnings --copt=-Wno-defaulted-function-deleted
-build:warnings --copt=-Wno-deprecated-builtins
-build:warnings --copt=-Wno-enum-compare-switch
-build:warnings --copt=-Wno-expansion-to-defined
-build:warnings --copt=-Wno-ignored-attributes
-build:warnings --copt=-Wno-ignored-qualifiers
-build:warnings --copt=-Wno-inconsistent-missing-override
-build:warnings --copt=-Wno-nontrivial-memaccess
-build:warnings --copt=-Wno-nullability-completeness
-build:warnings --copt=-Wno-potentially-evaluated-expression
-build:warnings --copt=-Wno-range-loop-analysis
-build:warnings --copt=-Wno-return-type-c-linkage
-build:warnings --copt=-Wno-tautological-undefined-compare
-build:warnings --copt=-Wno-unused-but-set-variable
-build:warnings --copt=-Wno-unused-lambda-capture
-build:warnings --copt=-Wno-unused-local-typedef
-build:warnings --copt=-Wno-deprecated-volatile
-build:warnings --copt=-Wno-deprecated-anon-enum-enum-conversion
-build:warnings --copt=-Wno-deprecated-enum-compare
-build:warnings --copt=-Wno-deprecated-enum-enum-conversion
-build:warnings --copt=-Wno-deprecated-enum-compare-conditional
-build:warnings --copt=-Wno-deprecated-enum-float-conversion
-build:warnings --copt=-Wno-deprecated-this-capture
-build:warnings --copt=-Wno-strict-prototypes
-build:warnings --copt=-Wno-tautological-type-limit-compare
-build:warnings --copt=-Wno-tautological-unsigned-enum-zero-compare
-build:warnings --copt=-Wno-tautological-unsigned-zero-compare
-build:warnings --copt=-Wno-thread-safety-reference
-build:warnings --copt=-Wno-undefined-func-template
-build:warnings --copt=-Wno-bitfield-constant-conversion
-build:warnings --copt=-Wno-bitwise-instead-of-logical
-build:warnings --copt=-Wno-comment
-build:warnings --copt=-Wno-compound-token-split
-build:warnings --copt=-Wno-deprecated-non-prototype
-build:warnings --copt=-Wno-misleading-indentation
-build:warnings --copt=-Wno-psabi
-build:warnings --copt=-Wno-unqualified-std-cast-call
-build:warnings --copt=-Wno-deprecated-literal-operator
-build:warnings --copt=-Wno-ambiguous-member-template
-build:warnings --copt=-Wno-char-subscripts
-build:warnings --copt=-Wno-deprecated-declarations
-build:warnings --copt=-Wno-deprecated-pragma
-build:warnings --copt=-Wno-extern-c-compat
-build:warnings --copt=-Wno-gnu-alignof-expression
-build:warnings --copt=-Wno-gnu-variable-sized-type-not-at-end
-build:warnings --copt=-Wno-implicit-int-float-conversion
-build:warnings --copt=-Wno-invalid-source-encoding
-build:warnings --copt=-Wno-pointer-sign
-build:warnings --copt=-Wno-private-header
-build:warnings --copt=-Wno-sign-compare
-build:warnings --copt=-Wno-strict-overflow
-build:warnings --copt=-Wno-unknown-pragmas
-build:warnings --copt=-Wno-unused-command-line-argument
-build:warnings --copt=-Wno-unused-const-variable
-build:warnings --copt=-Wno-unused-function
-build:warnings --copt=-Wno-unused-private-field
-build:warnings --copt=-Wno-user-defined-warnings
-build:warnings --copt=-Wno-mismatched-tags
-build:warnings --copt=-Wfloat-overflow-conversion
-build:warnings --copt=-Wfloat-zero-conversion
-build:warnings --copt=-Wfor-loop-analysis
-build:warnings --copt=-Wgnu-redeclared-enum
-build:warnings --copt=-Winfinite-recursion
-build:warnings --copt=-Wself-assign
-build:warnings --copt=-Wno-self-assign-overloaded
-build:warnings --copt=-Wstring-conversion
-build:warnings --copt=-Wtautological-overlap-compare
-build:warnings --copt=-Wunused-but-set-parameter
-build:warnings --copt=-Wunused-comparison
-build:warnings --copt=-Wvla
-build:warnings --copt=-Wctad-maybe-unsupported
-build:warnings --copt=-Wthread-safety-analysis
-build:warnings --copt=-Wno-trigraphs
-build:warnings --copt=-Woverloaded-virtual
-build:warnings --copt=-Wno-invalid-offsetof
-build:warnings --copt=-Wno-final-dtor-non-final-class
-build:warnings --copt=-Wnon-virtual-dtor
-build:warnings --copt=-Wimplicit-fallthrough
-build:warnings --copt=-Wno-builtin-macro-redefined
-build:warnings --copt=-Wno-macro-redefined
-build:warnings --copt=-Wno-deprecated-register
-build:warnings --copt=-Wno-register
+build:warnings --copt=-Wall --host_copt=-Wall
+build:warnings --copt=-Werror --host_copt=-Werror
+build:warnings --copt=-Wno-address-of-packed-member --host_copt=-Wno-address-of-packed-member
+build:warnings --copt=-Wno-defaulted-function-deleted --host_copt=-Wno-defaulted-function-deleted
+build:warnings --copt=-Wno-deprecated-builtins --host_copt=-Wno-deprecated-builtins
+build:warnings --copt=-Wno-enum-compare-switch --host_copt=-Wno-enum-compare-switch
+build:warnings --copt=-Wno-expansion-to-defined --host_copt=-Wno-expansion-to-defined
+build:warnings --copt=-Wno-ignored-attributes --host_copt=-Wno-ignored-attributes
+build:warnings --copt=-Wno-ignored-qualifiers --host_copt=-Wno-ignored-qualifiers
+build:warnings --copt=-Wno-inconsistent-missing-override --host_copt=-Wno-inconsistent-missing-override
+build:warnings --copt=-Wno-nontrivial-memaccess --host_copt=-Wno-nontrivial-memaccess
+build:warnings --copt=-Wno-nullability-completeness --host_copt=-Wno-nullability-completeness
+build:warnings --copt=-Wno-potentially-evaluated-expression --host_copt=-Wno-potentially-evaluated-expression
+build:warnings --copt=-Wno-range-loop-analysis --host_copt=-Wno-range-loop-analysis
+build:warnings --copt=-Wno-return-type-c-linkage --host_copt=-Wno-return-type-c-linkage
+build:warnings --copt=-Wno-tautological-undefined-compare --host_copt=-Wno-tautological-undefined-compare
+build:warnings --copt=-Wno-unused-but-set-variable --host_copt=-Wno-unused-but-set-variable
+build:warnings --copt=-Wno-unused-lambda-capture --host_copt=-Wno-unused-lambda-capture
+build:warnings --copt=-Wno-unused-local-typedef --host_copt=-Wno-unused-local-typedef
+build:warnings --copt=-Wno-deprecated-volatile --host_copt=-Wno-deprecated-volatile
+build:warnings --copt=-Wno-deprecated-anon-enum-enum-conversion --host_copt=-Wno-deprecated-anon-enum-enum-conversion
+build:warnings --copt=-Wno-deprecated-enum-compare --host_copt=-Wno-deprecated-enum-compare
+build:warnings --copt=-Wno-deprecated-enum-enum-conversion --host_copt=-Wno-deprecated-enum-enum-conversion
+build:warnings --copt=-Wno-deprecated-enum-compare-conditional --host_copt=-Wno-deprecated-enum-compare-conditional
+build:warnings --copt=-Wno-deprecated-enum-float-conversion --host_copt=-Wno-deprecated-enum-float-conversion
+build:warnings --copt=-Wno-deprecated-this-capture --host_copt=-Wno-deprecated-this-capture
+build:warnings --copt=-Wno-strict-prototypes --host_copt=-Wno-strict-prototypes
+build:warnings --copt=-Wno-tautological-type-limit-compare --host_copt=-Wno-tautological-type-limit-compare
+build:warnings --copt=-Wno-tautological-unsigned-enum-zero-compare --host_copt=-Wno-tautological-unsigned-enum-zero-compare
+build:warnings --copt=-Wno-tautological-unsigned-zero-compare --host_copt=-Wno-tautological-unsigned-zero-compare
+build:warnings --copt=-Wno-thread-safety-reference --host_copt=-Wno-thread-safety-reference
+build:warnings --copt=-Wno-undefined-func-template --host_copt=-Wno-undefined-func-template
+build:warnings --copt=-Wno-bitfield-constant-conversion --host_copt=-Wno-bitfield-constant-conversion
+build:warnings --copt=-Wno-bitwise-instead-of-logical --host_copt=-Wno-bitwise-instead-of-logical
+build:warnings --copt=-Wno-comment --host_copt=-Wno-comment
+build:warnings --copt=-Wno-compound-token-split --host_copt=-Wno-compound-token-split
+build:warnings --copt=-Wno-deprecated-non-prototype --host_copt=-Wno-deprecated-non-prototype
+build:warnings --copt=-Wno-misleading-indentation --host_copt=-Wno-misleading-indentation
+build:warnings --copt=-Wno-psabi --host_copt=-Wno-psabi
+build:warnings --copt=-Wno-unqualified-std-cast-call --host_copt=-Wno-unqualified-std-cast-call
+build:warnings --copt=-Wno-deprecated-literal-operator --host_copt=-Wno-deprecated-literal-operator
+build:warnings --copt=-Wno-ambiguous-member-template --host_copt=-Wno-ambiguous-member-template
+build:warnings --copt=-Wno-char-subscripts --host_copt=-Wno-char-subscripts
+build:warnings --copt=-Wno-deprecated-declarations --host_copt=-Wno-deprecated-declarations
+build:warnings --copt=-Wno-deprecated-pragma --host_copt=-Wno-deprecated-pragma
+build:warnings --copt=-Wno-extern-c-compat --host_copt=-Wno-extern-c-compat
+build:warnings --copt=-Wno-gnu-alignof-expression --host_copt=-Wno-gnu-alignof-expression
+build:warnings --copt=-Wno-gnu-variable-sized-type-not-at-end --host_copt=-Wno-gnu-variable-sized-type-not-at-end
+build:warnings --copt=-Wno-implicit-int-float-conversion --host_copt=-Wno-implicit-int-float-conversion
+build:warnings --copt=-Wno-invalid-source-encoding --host_copt=-Wno-invalid-source-encoding
+build:warnings --copt=-Wno-pointer-sign --host_copt=-Wno-pointer-sign
+build:warnings --copt=-Wno-private-header --host_copt=-Wno-private-header
+build:warnings --copt=-Wno-sign-compare --host_copt=-Wno-sign-compare
+build:warnings --copt=-Wno-strict-overflow --host_copt=-Wno-strict-overflow
+build:warnings --copt=-Wno-unknown-pragmas --host_copt=-Wno-unknown-pragmas
+build:warnings --copt=-Wno-unused-command-line-argument --host_copt=-Wno-unused-command-line-argument
+build:warnings --copt=-Wno-unused-const-variable --host_copt=-Wno-unused-const-variable
+build:warnings --copt=-Wno-unused-function --host_copt=-Wno-unused-function
+build:warnings --copt=-Wno-unused-private-field --host_copt=-Wno-unused-private-field
+build:warnings --copt=-Wno-user-defined-warnings --host_copt=-Wno-user-defined-warnings
+build:warnings --copt=-Wno-mismatched-tags --host_copt=-Wno-mismatched-tags
+build:warnings --copt=-Wfloat-overflow-conversion --host_copt=-Wfloat-overflow-conversion
+build:warnings --copt=-Wfloat-zero-conversion --host_copt=-Wfloat-zero-conversion
+build:warnings --copt=-Wfor-loop-analysis --host_copt=-Wfor-loop-analysis
+build:warnings --copt=-Wgnu-redeclared-enum --host_copt=-Wgnu-redeclared-enum
+build:warnings --copt=-Winfinite-recursion --host_copt=-Winfinite-recursion
+build:warnings --copt=-Wself-assign --host_copt=-Wself-assign
+build:warnings --copt=-Wno-self-assign-overloaded --host_copt=-Wno-self-assign-overloaded
+build:warnings --copt=-Wstring-conversion --host_copt=-Wstring-conversion
+build:warnings --copt=-Wtautological-overlap-compare --host_copt=-Wtautological-overlap-compare
+build:warnings --copt=-Wunused-but-set-parameter --host_copt=-Wunused-but-set-parameter
+build:warnings --copt=-Wunused-comparison --host_copt=-Wunused-comparison
+build:warnings --copt=-Wvla --host_copt=-Wvla
+build:warnings --copt=-Wctad-maybe-unsupported --host_copt=-Wctad-maybe-unsupported
+build:warnings --copt=-Wthread-safety-analysis --host_copt=-Wthread-safety-analysis
+build:warnings --copt=-Wno-trigraphs --host_copt=-Wno-trigraphs
+build:warnings --copt=-Woverloaded-virtual --host_copt=-Woverloaded-virtual
+build:warnings --copt=-Wno-invalid-offsetof --host_copt=-Wno-invalid-offsetof
+build:warnings --copt=-Wno-final-dtor-non-final-class --host_copt=-Wno-final-dtor-non-final-class
+build:warnings --copt=-Wnon-virtual-dtor --host_copt=-Wnon-virtual-dtor
+build:warnings --copt=-Wimplicit-fallthrough --host_copt=-Wimplicit-fallthrough
+build:warnings --copt=-Wno-builtin-macro-redefined --host_copt=-Wno-builtin-macro-redefined
+build:warnings --copt=-Wno-macro-redefined --host_copt=-Wno-macro-redefined
+build:warnings --copt=-Wno-deprecated-register --host_copt=-Wno-deprecated-register
+build:warnings --copt=-Wno-register --host_copt=-Wno-register
