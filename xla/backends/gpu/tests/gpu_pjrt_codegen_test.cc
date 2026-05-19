@@ -31,7 +31,7 @@ limitations under the License.
 #include "xla/service/executable.h"
 #include "xla/service/gpu/gpu_executable.h"
 #include "xla/service/hlo_module_config.h"
-#include "xla/service/llvm_compiler.h"
+#include "xla/service/gpu/gpu_llvm_compiler.h"
 #include "xla/shape_util.h"
 #include "xla/tests/codegen_utils.h"
 #include "xla/tsl/platform/statusor.h"
@@ -109,7 +109,7 @@ GpuPjRtCodegenTest::CompileToExecutable(std::unique_ptr<HloModule> hlo_module,
 absl::Status GpuPjRtCodegenTest::CompileAndVerifyIr(
     std::unique_ptr<HloModule> hlo_module, absl::string_view expected_llvm_ir,
     bool match_optimized_ir, bool run_optimization_passes) {
-  auto llvm_compiler = absl::down_cast<LLVMCompiler*>(compiler());
+  auto llvm_compiler = absl::down_cast<gpu::GpuLLVMCompiler*>(compiler());
   return xla::CompileAndVerifyIr(llvm_compiler, compile_options_,
                                  std::move(hlo_module), expected_llvm_ir,
                                  match_optimized_ir, run_optimization_passes);

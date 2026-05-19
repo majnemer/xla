@@ -58,9 +58,9 @@ limitations under the License.
 #include "xla/service/gpu/alias_info.h"
 #include "xla/service/gpu/compile_module_to_llvm_ir.h"
 #include "xla/service/gpu/gpu_compiler.h"
+#include "xla/service/gpu/gpu_llvm_compiler.h"
 #include "xla/service/gpu/gpu_executable.h"
 #include "xla/service/gpu/nvptx_alias_info.h"
-#include "xla/service/llvm_compiler.h"
 #include "xla/service/llvm_ir/llvm_util.h"
 #include "xla/service/spmd/schedule_aware_collective_ops_cse.h"
 #include "xla/shape.h"
@@ -201,8 +201,8 @@ class GpuOptProvider : public CompiledOptProvider {
     ASSIGN_OR_RETURN(se::StreamExecutor * executor, GetExecutor());
     ASSIGN_OR_RETURN(std::unique_ptr<Compiler> compiler, GetCompiler());
 
-    LLVMCompiler* llvm_compiler =
-        absl::down_cast<LLVMCompiler*>(compiler.get());
+    gpu::GpuLLVMCompiler* llvm_compiler =
+        absl::down_cast<gpu::GpuLLVMCompiler*>(compiler.get());
 
     llvm::LLVMContext context;
     std::vector<std::unique_ptr<llvm::Module>> modules;

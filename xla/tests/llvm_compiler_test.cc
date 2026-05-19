@@ -27,6 +27,8 @@ limitations under the License.
 #include "xla/hlo/testlib/test_helpers.h"
 #include "xla/literal_util.h"
 #include "xla/service/backend.h"
+#include "xla/service/compiler.h"
+#include "xla/service/gpu/gpu_llvm_compiler.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tests/hlo_test_base.h"
@@ -66,13 +68,23 @@ TEST_F(LLVMCompilerTest, HooksTest) {
   // 'add' instruction), otherwise the hooks are never called.
   auto hlo_module = ParseAndReturnVerifiedModule(kHloText).value();
 
-  // Create and run the compiler.
-  LLVMCompiler* compiler =
-      tensorflow::down_cast<xla::LLVMCompiler*>(backend().compiler());
-  compiler->SetPreOptimizationHook(pre_opt_hook);
-  compiler->SetPostOptimizationHook(post_opt_hook);
+  // Both CPU (LLVMCompiler) and GPU (gpu::GpuLLVMCompiler) expose the same
+  // pre/post-optimization hook API, but no longer share a base class, so this
+  // test runtime-selects which one is in use.
+  Compiler* base_compiler = backend().compiler();
+  auto* llvm_compiler = dynamic_cast<xla::LLVMCompiler*>(base_compiler);
+  auto* gpu_llvm_compiler =
+      dynamic_cast<xla::gpu::GpuLLVMCompiler*>(base_compiler);
+  ASSERT_TRUE(llvm_compiler != nullptr || gpu_llvm_compiler != nullptr);
+  if (llvm_compiler != nullptr) {
+    llvm_compiler->SetPreOptimizationHook(pre_opt_hook);
+    llvm_compiler->SetPostOptimizationHook(post_opt_hook);
+  } else {
+    gpu_llvm_compiler->SetPreOptimizationHook(pre_opt_hook);
+    gpu_llvm_compiler->SetPostOptimizationHook(post_opt_hook);
+  }
 
-  ASSERT_TRUE(compiler
+  ASSERT_TRUE(base_compiler
                   ->RunBackend(std::move(hlo_module),
                                backend().default_stream_executor(),
                                /*device_allocator=*/nullptr)

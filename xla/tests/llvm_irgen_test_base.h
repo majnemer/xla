@@ -52,8 +52,6 @@ class LlvmIrGenTestBase : public HloTestBaseLegacy {
                           bool run_optimization_passes = true);
 
  private:
-  LLVMCompiler* GetLLVMCompiler();
-
   void SetIrHook(bool match_optimized_ir);
   void ResetIrHook();
 

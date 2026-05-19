@@ -16,21 +16,12 @@ limitations under the License.
 #include "xla/tests/codegen_utils.h"
 
 #include <memory>
-#include <string>
 #include <utility>
 
-#include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/str_cat.h"
-#include "absl/strings/string_view.h"
-#include "llvm/IR/Module.h"
 #include "xla/hlo/ir/hlo_module.h"
-#include "xla/hlo/testlib/filecheck.h"
 #include "xla/service/compiler.h"
 #include "xla/service/executable.h"
-#include "xla/service/llvm_compiler.h"
-#include "xla/service/llvm_ir/llvm_util.h"
-#include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
 
 namespace xla {
@@ -45,83 +36,6 @@ absl::StatusOr<std::unique_ptr<Executable>> CompileToExecutable(
   }
   return compiler->RunBackend(std::move(hlo_module), /*executor=*/nullptr,
                               compile_options);
-}
-
-namespace {
-void IrHook(const llvm::Module& module, std::string& ir) {
-  ir += llvm_ir::DumpToString(&module);
-}
-
-void SetIrHook(LLVMCompiler* llvm_compiler,
-               const LLVMCompiler::ModuleHook& ir_hook,
-               bool match_optimized_ir) {
-  // Add the IR inspection hook to the LLVM compiler.
-  if (match_optimized_ir) {
-    llvm_compiler->SetPostOptimizationHook(ir_hook);
-  } else {
-    llvm_compiler->SetPreOptimizationHook(ir_hook);
-  }
-}
-
-void ResetIrHook(LLVMCompiler* llvm_compiler) {
-  llvm_compiler->RemovePreOptimizationHook();
-  llvm_compiler->RemovePostOptimizationHook();
-}
-
-class ScopedHookHandler final {
- public:
-  ScopedHookHandler(LLVMCompiler* compiler, bool match_optimized_ir)
-      : compiler_(compiler) {
-    SetIrHook(
-        compiler, [this](const llvm::Module& module) { IrHook(module, ir_); },
-        match_optimized_ir);
-  }
-  ~ScopedHookHandler() { ResetIrHook(compiler_); }
-  const std::string& ir() const { return ir_; }
-
- private:
-  LLVMCompiler* compiler_;
-  std::string ir_;
-};
-}  // namespace
-
-absl::Status CompileAndVerifyIr(LLVMCompiler* compiler,
-                                const Compiler::CompileOptions& compile_options,
-                                std::unique_ptr<HloModule> hlo_module,
-                                absl::string_view pattern,
-                                bool match_optimized_ir,
-                                bool run_optimization_passes) {
-  ScopedHookHandler hook_handler(compiler, match_optimized_ir);
-
-  TF_RETURN_IF_ERROR(CompileToExecutable(compiler, compile_options,
-                                         std::move(hlo_module),
-                                         run_optimization_passes)
-                         .status());
-
-  TF_ASSIGN_OR_RETURN(bool succeeded, RunFileCheck(hook_handler.ir(), pattern));
-  if (!succeeded) {
-    return absl::InternalError(
-        absl::StrCat("FileCheck failed. Full IR: ", hook_handler.ir()));
-  }
-  return absl::OkStatus();
-}
-
-absl::Status CompileAheadOfTimeAndVerifyIr(
-    LLVMCompiler* compiler, const AotCompilationOptions& aot_options,
-    std::unique_ptr<HloModule> hlo_module, absl::string_view pattern,
-    bool match_optimized_ir) {
-  ScopedHookHandler hook_handler(compiler, match_optimized_ir);
-
-  TF_RETURN_IF_ERROR(
-      compiler->CompileAheadOfTime(std::move(hlo_module), aot_options)
-          .status());
-
-  TF_ASSIGN_OR_RETURN(bool succeeded, RunFileCheck(hook_handler.ir(), pattern));
-  if (!succeeded) {
-    return absl::InternalError(
-        absl::StrCat("FileCheck failed. Full IR: ", hook_handler.ir()));
-  }
-  return absl::OkStatus();
 }
 
 }  // namespace xla

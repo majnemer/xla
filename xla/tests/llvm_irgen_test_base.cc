@@ -19,11 +19,15 @@ limitations under the License.
 #include <memory>
 #include <utility>
 
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/testlib/filecheck.h"
+#include "xla/service/compiler.h"
 #include "xla/service/executable.h"
+#include "xla/service/gpu/gpu_llvm_compiler.h"
+#include "xla/service/llvm_compiler.h"
 #include "xla/service/llvm_ir/llvm_util.h"
 #include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/tsl/platform/statusor.h"
@@ -46,24 +50,40 @@ LlvmIrGenTestBase::CompileToExecutable(std::unique_ptr<HloModule> hlo_module,
 }
 
 void LlvmIrGenTestBase::SetIrHook(bool match_optimized_ir) {
-  auto llvm_compiler = GetLLVMCompiler();
   using std::placeholders::_1;
+  auto hook = std::bind(&LlvmIrGenTestBase::IrHook, this, _1);
 
-  // Add the IR inspection hook to the LLVM compiler.
+  Compiler* base_compiler = backend().compiler();
+  if (auto* llvm_compiler = dynamic_cast<LLVMCompiler*>(base_compiler)) {
+    if (match_optimized_ir) {
+      llvm_compiler->SetPostOptimizationHook(hook);
+    } else {
+      llvm_compiler->SetPreOptimizationHook(hook);
+    }
+    return;
+  }
+  auto* gpu_llvm_compiler =
+      dynamic_cast<gpu::GpuLLVMCompiler*>(base_compiler);
+  CHECK_NE(gpu_llvm_compiler, nullptr);
   if (match_optimized_ir) {
-    llvm_compiler->SetPostOptimizationHook(
-        std::bind(&LlvmIrGenTestBase::IrHook, this, _1));
+    gpu_llvm_compiler->SetPostOptimizationHook(hook);
   } else {
-    llvm_compiler->SetPreOptimizationHook(
-        std::bind(&LlvmIrGenTestBase::IrHook, this, _1));
+    gpu_llvm_compiler->SetPreOptimizationHook(hook);
   }
 }
 
 void LlvmIrGenTestBase::ResetIrHook() {
-  auto llvm_compiler = GetLLVMCompiler();
-
-  llvm_compiler->RemovePreOptimizationHook();
-  llvm_compiler->RemovePostOptimizationHook();
+  Compiler* base_compiler = backend().compiler();
+  if (auto* llvm_compiler = dynamic_cast<LLVMCompiler*>(base_compiler)) {
+    llvm_compiler->RemovePreOptimizationHook();
+    llvm_compiler->RemovePostOptimizationHook();
+    return;
+  }
+  auto* gpu_llvm_compiler =
+      dynamic_cast<gpu::GpuLLVMCompiler*>(base_compiler);
+  CHECK_NE(gpu_llvm_compiler, nullptr);
+  gpu_llvm_compiler->RemovePreOptimizationHook();
+  gpu_llvm_compiler->RemovePostOptimizationHook();
 }
 
 void LlvmIrGenTestBase::CompileAndVerifyIr(
@@ -91,10 +111,6 @@ void LlvmIrGenTestBase::CompileAndVerifyIr(const std::string& hlo_text,
                           ParseAndReturnVerifiedModule(hlo_text, config));
   CompileAndVerifyIr(std::move(module), expected_llvm_ir, match_optimized_ir,
                      run_optimization_passes);
-}
-
-LLVMCompiler* LlvmIrGenTestBase::GetLLVMCompiler() {
-  return static_cast<LLVMCompiler*>(backend().compiler());
 }
 
 absl::Status LlvmIrGenTestBase::IrHook(const llvm::Module& module) {

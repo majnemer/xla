@@ -34,7 +34,7 @@ limitations under the License.
 #include "xla/hlo/pass/hlo_pass_pipeline.h"
 #include "xla/service/compilation_stats.h"
 #include "xla/service/gpu/alias_info.h"
-#include "xla/service/gpu/gpu_compiler.h"
+#include "xla/service/gpu/gpu_llvm_compiler.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/stream_executor/cuda/compilation_provider.h"
@@ -52,7 +52,7 @@ namespace gpu {
 void WarnIfBadDriverJITVersion();
 
 // NVPTXCompiler generates efficient GPU executables for NVPTX target.
-class NVPTXCompiler : public GpuCompiler {
+class NVPTXCompiler : public GpuLLVMCompiler {
  public:
   explicit NVPTXCompiler();
 

@@ -17,42 +17,96 @@ limitations under the License.
 #define XLA_TESTS_CODEGEN_UTILS_H_
 
 #include <memory>
+#include <string>
+#include <utility>
 
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "llvm/IR/Module.h"
 #include "xla/hlo/ir/hlo_module.h"
+#include "xla/hlo/testlib/filecheck.h"
 #include "xla/service/compiler.h"
 #include "xla/service/executable.h"
-#include "xla/service/llvm_compiler.h"
+#include "xla/service/llvm_ir/llvm_util.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace xla {
 
-// Compiles `hlo_module` with the provided `compiler` and `compile_options`. If
-// `run_optimization_passes` is true, also the HLO optimization pass pipeline is
-// run.
 absl::StatusOr<std::unique_ptr<Executable>> CompileToExecutable(
     Compiler* compiler, const Compiler::CompileOptions& compile_options,
     std::unique_ptr<HloModule> hlo_module, bool run_optimization_passes);
 
-// Compiles the given HLO module to LLVM IR and verifies the IR matches the
-// given pattern. `pattern` is in the FileCheck pattern matching syntax
-// (http://llvm.org/docs/CommandGuide/FileCheck.html).
-//
-// This function invokes the JIT compiler.
-//
-// If `match_optimized_ir` is true, match the version of the IR after internal
-// optimizations are applied; otherwise, the IR before optimizations is
-// matched.
-absl::Status CompileAndVerifyIr(LLVMCompiler* compiler,
+namespace internal {
+
+template <typename CompilerT>
+class ScopedHookHandler final {
+ public:
+  ScopedHookHandler(CompilerT* compiler, bool match_optimized_ir)
+      : compiler_(compiler) {
+    auto hook = [this](const llvm::Module& module) {
+      ir_ += llvm_ir::DumpToString(&module);
+    };
+    if (match_optimized_ir) {
+      compiler_->SetPostOptimizationHook(hook);
+    } else {
+      compiler_->SetPreOptimizationHook(hook);
+    }
+  }
+  ~ScopedHookHandler() {
+    compiler_->RemovePreOptimizationHook();
+    compiler_->RemovePostOptimizationHook();
+  }
+  const std::string& ir() const { return ir_; }
+
+ private:
+  CompilerT* compiler_;
+  std::string ir_;
+};
+
+}  // namespace internal
+
+// Compiles the given HLO module and verifies the emitted LLVM IR matches
+// `pattern` (FileCheck syntax).
+template <typename CompilerT>
+absl::Status CompileAndVerifyIr(CompilerT* compiler,
                                 const Compiler::CompileOptions& compile_options,
                                 std::unique_ptr<HloModule> hlo_module,
                                 absl::string_view pattern,
                                 bool match_optimized_ir,
-                                bool run_optimization_passes = true);
+                                bool run_optimization_passes = true) {
+  internal::ScopedHookHandler<CompilerT> hook_handler(compiler,
+                                                      match_optimized_ir);
+  TF_RETURN_IF_ERROR(CompileToExecutable(compiler, compile_options,
+                                         std::move(hlo_module),
+                                         run_optimization_passes)
+                         .status());
+  TF_ASSIGN_OR_RETURN(bool succeeded, RunFileCheck(hook_handler.ir(), pattern));
+  if (!succeeded) {
+    return absl::InternalError(
+        absl::StrCat("FileCheck failed. Full IR: ", hook_handler.ir()));
+  }
+  return absl::OkStatus();
+}
 
+template <typename CompilerT>
 absl::Status CompileAheadOfTimeAndVerifyIr(
-    LLVMCompiler* compiler, const AotCompilationOptions& aot_options,
+    CompilerT* compiler, const AotCompilationOptions& aot_options,
     std::unique_ptr<HloModule> hlo_module, absl::string_view pattern,
-    bool match_optimized_ir);
+    bool match_optimized_ir) {
+  internal::ScopedHookHandler<CompilerT> hook_handler(compiler,
+                                                      match_optimized_ir);
+  TF_RETURN_IF_ERROR(
+      compiler->CompileAheadOfTime(std::move(hlo_module), aot_options)
+          .status());
+  TF_ASSIGN_OR_RETURN(bool succeeded, RunFileCheck(hook_handler.ir(), pattern));
+  if (!succeeded) {
+    return absl::InternalError(
+        absl::StrCat("FileCheck failed. Full IR: ", hook_handler.ir()));
+  }
+  return absl::OkStatus();
+}
 
 }  // namespace xla
 

@@ -22,14 +22,14 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "llvm/IR/Module.h"
 #include "xla/hlo/ir/hlo_module.h"
-#include "xla/service/gpu/gpu_compiler.h"
+#include "xla/service/gpu/gpu_llvm_compiler.h"
 #include "xla/stream_executor/semantic_version.h"
 #include "xla/stream_executor/stream_executor.h"
 
 namespace xla {
 namespace gpu {
 
-class IntelGpuCompiler : public GpuCompiler {
+class IntelGpuCompiler : public GpuLLVMCompiler {
  public:
   IntelGpuCompiler();
 

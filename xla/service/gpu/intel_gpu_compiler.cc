@@ -24,8 +24,8 @@ namespace xla {
 namespace gpu {
 
 IntelGpuCompiler::IntelGpuCompiler()
-    : GpuCompiler(stream_executor::sycl::kSyclPlatformId, spir::TargetTriple(),
-                  spir::DataLayout()) {}
+    : GpuLLVMCompiler(stream_executor::sycl::kSyclPlatformId,
+                      spir::TargetTriple(), spir::DataLayout()) {}
 
 absl::Status IntelGpuCompiler::OptimizeHloConvolutionCanonicalization(
     HloModule* hlo_module, const se::GpuComputeCapability& gpu_version,
@@ -55,7 +55,7 @@ absl::Status IntelGpuCompiler::AddConvAndGemmAutotuningPass(
   return absl::OkStatus();
 }
 
-absl::StatusOr<GpuCompiler::BackendCompileResult>
+absl::StatusOr<GpuLLVMCompiler::BackendCompileResult>
 IntelGpuCompiler::CompileTargetBinary(
     const HloModuleConfig& module_config, llvm::Module* llvm_module,
     const stream_executor::DeviceDescription& device_description,
