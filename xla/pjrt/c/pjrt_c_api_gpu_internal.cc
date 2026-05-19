@@ -86,6 +86,8 @@ namespace gpu_plugin {
 #define PJRT_GPU_PLUGIN_PLATFORM_NAME "ROCM"
 #elif TENSORFLOW_USE_SYCL
 #define PJRT_GPU_PLUGIN_PLATFORM_NAME "ONEAPI"
+#elif XLA_USE_METAL
+#define PJRT_GPU_PLUGIN_PLATFORM_NAME "METAL"
 #else
 #define PJRT_GPU_PLUGIN_PLATFORM_NAME "CUDA"
 #endif
@@ -322,6 +324,9 @@ PJRT_Error* PJRT_GpuDeviceTopology_Create(
   } else if (plugin_platform == "ONEAPI") {
     platform_id = xla::OneapiId();
     platform_name = xla::OneapiName();
+  } else if (plugin_platform == "METAL") {
+    platform_id = xla::MetalId();
+    platform_name = xla::MetalName();
   } else {
     platform_id = xla::CudaId();
     platform_name = xla::CudaName();

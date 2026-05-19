@@ -69,6 +69,10 @@ inline const char* OneapiName() {
 // TODO(intel-tf): Remove this function once Tensorflow is updated to use
 // OneapiName() instead of SyclName()
 inline const char* SyclName() { return OneapiName(); }
+inline const char* MetalName() {
+  static constexpr char kMetalName[] = "metal";
+  return kMetalName;
+}
 inline const char* TpuName() {
   static constexpr char kTpuName[] = "tpu";
   return kTpuName;
@@ -94,6 +98,10 @@ inline PjRtPlatformId OneapiId() {
 // TODO(intel-tf): Remove this function once Jaxlib is updated to use
 // OneapId() instead of SyclId()
 inline PjRtPlatformId SyclId() { return OneapiId(); }
+inline PjRtPlatformId MetalId() {
+  static const PjRtPlatformId kMetalId = tsl::Fingerprint64(MetalName());
+  return kMetalId;
+}
 inline PjRtPlatformId TpuId() {
   static const PjRtPlatformId kTpuId = tsl::Fingerprint64(TpuName());
   return kTpuId;
@@ -413,7 +421,7 @@ inline bool IsTpuId(PjRtPlatformId platform_id) {
 // Returns true if it's GPU id.
 inline bool IsGpuId(PjRtPlatformId platform_id) {
   return platform_id == xla::CudaId() || platform_id == xla::RocmId() ||
-         platform_id == xla::SyclId();
+         platform_id == xla::SyclId() || platform_id == xla::MetalId();
 }
 
 // Returns true if it's CPU id.

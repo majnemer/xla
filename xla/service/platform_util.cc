@@ -70,11 +70,14 @@ std::string CanonicalPlatformName(absl::string_view platform_name) {
   // When configured on CUDA, "gpu" and "cuda" mean the same thing.
   // When configured on ROCm, "gpu" and "rocm" mean the same thing.
   // When configured on SYCL, "gpu" and "sycl" mean the same thing.
+  // On macOS (XLA_USE_METAL), "gpu" and "metal" mean the same thing.
   if (lowercase_platform_name == "gpu") {
 #if TENSORFLOW_USE_ROCM
     return "rocm";
 #elif TENSORFLOW_USE_SYCL
     return "sycl";
+#elif XLA_USE_METAL
+    return "metal";
 #else
     return "cuda";
 #endif

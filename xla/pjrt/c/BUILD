@@ -16,6 +16,7 @@ load(
     "//xla/tsl:tsl.bzl",
     "if_google",
     "if_macos",
+    "if_metal",
     "internal_visibility",
 )
 load("//xla/tsl/platform:rules_cc.bzl", "cc_library")
@@ -635,7 +636,8 @@ cc_library(
     local_defines = (
         if_cuda_is_configured(["GOOGLE_CUDA=1"]) + if_rocm_is_configured([
             "TENSORFLOW_USE_ROCM=1",
-        ]) + if_sycl_is_configured(["TENSORFLOW_USE_SYCL=1"])
+        ]) + if_sycl_is_configured(["TENSORFLOW_USE_SYCL=1"]) +
+        if_metal(["XLA_USE_METAL=1"])
     ),
     visibility = ["//visibility:public"],
     deps = [
@@ -745,6 +747,8 @@ xla_cc_binary(
         "//xla/stream_executor:rocm_platform",
     ]) + if_sycl_is_configured([
         "//xla/stream_executor:sycl_platform",
+    ]) + if_metal([
+        "//xla/stream_executor/metal:metal_platform",
     ]),
 )
 

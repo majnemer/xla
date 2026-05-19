@@ -15,7 +15,7 @@ load(
 load("//xla/service:xla_compile.bzl", "xla_aot_compile_cpu", "xla_aot_compile_gpu", "xla_aot_compile_gpu_runtime_autotuning")
 load("//xla/stream_executor:build_defs.bzl", "if_cuda_or_rocm_is_configured", "if_gpu_is_configured")
 load("//xla/tests:build_defs.bzl", "xla_test")
-load("//xla/tsl:tsl.bzl", "if_google", "if_libtpu", "internal_visibility", "tsl_copts")
+load("//xla/tsl:tsl.bzl", "if_google", "if_libtpu", "if_metal", "internal_visibility", "tsl_copts")
 load("//xla/tsl:tsl.default.bzl", "filegroup", "get_compatible_with_portable")
 load("//xla/tsl/mkl:build_defs.bzl", "if_onednn")
 load(
@@ -1207,7 +1207,7 @@ cc_library(
     hdrs = ["platform_util.h"],
     local_defines = if_rocm(["TENSORFLOW_USE_ROCM=1"]) + if_sycl([
         "TENSORFLOW_USE_SYCL=1",
-    ]),
+    ]) + if_metal(["XLA_USE_METAL=1"]),
     deps = [
         ":compiler",
         "//xla:debug_options_flags",
@@ -1619,6 +1619,8 @@ cc_library(
         ":gpu_plugin_without_collectives",
     ] + if_gpu_is_configured([
         "//xla/backends/gpu/runtime:thunk_runtime_dependencies",
+    ]) + if_metal([
+        "//xla/backends/gpu/runtime:thunk_runtime_dependencies",
     ]),
 )
 
@@ -1638,6 +1640,16 @@ cc_library(
         "//xla/stream_executor/rocm:stream_executor_rocm",
     ]) + if_sycl_is_configured([
         "//xla/service/gpu:intel_gpu_compiler",
+    ]) + if_metal([
+        # On macOS, if_gpu_is_configured is false (CUDA/ROCm/SYCL aren't
+        # configured), so the shared GPU deps that are normally pulled by
+        # that branch must come in here.
+        ":service",
+        "//xla/backends/metal:collectives_registration",
+        "//xla/backends/metal:compiler",
+        "//xla/service/gpu:gpu_compiler",
+        "//xla/service/gpu:gpu_transfer_manager",
+        "//xla/stream_executor/metal:metal_platform",
     ]),
 )
 

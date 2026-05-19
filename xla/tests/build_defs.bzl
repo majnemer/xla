@@ -45,7 +45,11 @@ AMD_GPU_DEFAULT_BACKENDS = ["amdgpu_any"]
 
 INTEL_GPU_DEFAULT_BACKENDS = ["intelgpu_any"]
 
-_DEFAULT_BACKENDS = ["cpu"] + NVIDIA_GPU_DEFAULT_BACKENDS + AMD_GPU_DEFAULT_BACKENDS + INTEL_GPU_DEFAULT_BACKENDS
+APPLE_METAL_DEFAULT_BACKENDS = ["metal"]
+
+# Metal targets are macOS-only via target_compatible_with; on Linux they
+# auto-skip rather than fail.
+_DEFAULT_BACKENDS = ["cpu"] + NVIDIA_GPU_DEFAULT_BACKENDS + AMD_GPU_DEFAULT_BACKENDS + INTEL_GPU_DEFAULT_BACKENDS + APPLE_METAL_DEFAULT_BACKENDS
 
 GPU_BACKENDS = NVIDIA_GPU_BACKENDS + AMD_GPU_DEFAULT_BACKENDS + INTEL_GPU_DEFAULT_BACKENDS
 
@@ -53,7 +57,7 @@ GPU_DEFAULT_BACKENDS = NVIDIA_GPU_DEFAULT_BACKENDS
 
 DEFAULT_DISABLED_BACKENDS = []
 
-_ALL_BACKENDS = ["cpu", "interpreter"] + NVIDIA_GPU_BACKENDS + AMD_GPU_DEFAULT_BACKENDS + INTEL_GPU_DEFAULT_BACKENDS + list(plugins.keys())
+_ALL_BACKENDS = ["cpu", "interpreter"] + NVIDIA_GPU_BACKENDS + AMD_GPU_DEFAULT_BACKENDS + INTEL_GPU_DEFAULT_BACKENDS + APPLE_METAL_DEFAULT_BACKENDS + list(plugins.keys())
 
 # buildifier: disable=function-docstring
 def prepare_nvidia_gpu_backend_data(backends, disabled_backends, backend_tags, backend_args, common_tags):
@@ -411,6 +415,25 @@ def xla_test(
                     "//xla/stream_executor/sycl:stream_executor_sycl",
                 ]
 
+            if not use_legacy_runtime:
+                backend_deps.append("//xla/tests:pjrt_gpu_client_registry")
+        elif backend in APPLE_METAL_DEFAULT_BACKENDS:
+            # Metal is a GPU from the test framework's POV: XLA_TEST_DEVICE_TYPE
+            # stays "gpu" so backend-conditional code (e.g. `if (gpu) ...`)
+            # picks it up. The binary itself is macOS-only because the
+            # underlying StreamExecutor platform is Objective-C++.
+            #
+            # gpu_plugin pulls in MetalCompiler / collectives stub / Metal
+            # StreamExecutor / GpuTransferManager / Metal PJRT compiler
+            # registration via the if_metal() arm on gpu_plugin_without_
+            # collectives. On macOS, XLA_USE_METAL flips platform_util's
+            # "gpu" alias to "metal" so pjrt_gpu_client_registry resolves
+            # to the Metal platform without any Metal-specific test glue.
+            device_type_for_env = "gpu"
+            this_backend_tags.append("gpu")
+            this_backend_kwargs["target_compatible_with"] = \
+                ["@platforms//os:macos"]
+            backend_deps.append("//xla/service:gpu_plugin")
             if not use_legacy_runtime:
                 backend_deps.append("//xla/tests:pjrt_gpu_client_registry")
         elif backend == "interpreter":
