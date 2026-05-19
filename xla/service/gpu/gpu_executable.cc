@@ -120,6 +120,7 @@ limitations under the License.
 #include "xla/stream_executor/kernel_stats.h"
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/memory_reservation.h"
+#include "xla/stream_executor/metal/metal_platform_id.h"
 #include "xla/stream_executor/module_spec.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_id.h"
@@ -551,6 +552,10 @@ absl::Status GpuExecutable::CheckCompatibilityWithServiceExecutableRunOptions(
         << "}, but was {" << cc.ToString() << "}";
   } else if (platform_id == se::sycl::kSyclPlatformId) {
     // TODO: Add check.
+  } else if (platform_id == stream_executor::metal::kMetalPlatformId) {
+    // Metal kernels are JIT-compiled from MSL source at thunk-Initialize
+    // time, so there is no AOT-stamped compute capability to verify here.
+    // The MetalExecutor's family check happens when LoadKernel is invoked.
   } else {
     return Internal("Unknown platform");
   }
@@ -1035,11 +1040,19 @@ GpuExecutable::ResolveConstantGlobals(se::Stream* stream) {
 
   auto globals = std::make_unique<BufferAllocToDeviceMemoryMap>();
   se::ModuleHandle module_handle;
-  // The CUDA driver isn't able to load a PTX and a binary which are both empty.
-  // It's okay if we skip loading in this case; if the module isn't loaded, all
-  // symbol lookups will fail, just as they should for an empty module.
-  if (!(executor->GetPlatform()->id() == se::cuda::kCudaPlatformId &&
-        binary().empty() && text().empty())) {
+  // Backends without implicit constant allocation (Metal) use this list to
+  // allocate device backing per constant; CUDA pulls constants from PTX in
+  // LoadModule and ignores it.
+  for (const ConstantInfo& info : constants_) {
+    module_spec.AddConstant(info.symbol_name, info.content.span());
+  }
+  // The CUDA driver rejects loading an empty PTX/cubin combo; skip in that
+  // case. Symbol lookups will fail as they should for an empty module.
+  const auto platform_id = executor->GetPlatform()->id();
+  const bool skip_module_load =
+      platform_id == stream_executor::cuda::kCudaPlatformId &&
+      binary().empty() && text().empty();
+  if (!skip_module_load) {
     ASSIGN_OR_RETURN(module_handle, executor->LoadModule(module_spec));
   }
 
@@ -1048,23 +1061,19 @@ GpuExecutable::ResolveConstantGlobals(se::Stream* stream) {
   int submitted_mem_copies = 0;
 
   for (const ConstantInfo& info : constants_) {
+    se::DeviceAddressBase global;
     absl::StatusOr<se::DeviceAddressBase> global_status;
     if (static_cast<bool>(module_handle)) {
       global_status = executor->GetSymbol(info.symbol_name, module_handle);
     }
-
-    se::DeviceAddressBase global;
-
     CHECK(static_cast<bool>(module_handle) && global_status.ok());
-    // The constant was defined in the PTX and has been allocated by the CUDA
-    // driver.
     global = *global_status;
     XLA_VLOG_DEVICE(3, executor->device_ordinal()) << absl::StreamFormat(
         "Resolved global %s to %p", info.symbol_name, global.opaque());
 
     if (!info.content.span().empty()) {
-      // This means the constant did not have an initializer in the PTX and
-      // therefore must be initialized by XLA here.
+      // CUDA: large constants have no PTX initializer and need an explicit H2D.
+      // Metal: LoadModule only allocated — every constant needs an H2D here.
       RETURN_IF_ERROR(stream->Memcpy(&global, info.content.span().data(),
                                      info.content.span().size()));
       submitted_mem_copies = true;

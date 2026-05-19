@@ -353,6 +353,7 @@ limitations under the License.
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/casts.h"
 #include "tsl/platform/cpu_info.h"
+#include "tsl/platform/denormal.h"
 #include "tsl/platform/numbers.h"
 #include "tsl/platform/path.h"
 #include "tsl/platform/protobuf.h"  // IWYU pragma: keep
@@ -1825,11 +1826,12 @@ absl::Status GpuCompiler::RunPreSchedulingCopyInsertion(
       .status();
 }
 
-namespace {
-void AddGemmRewriterPasses(HloPassPipeline& pipeline,
-                           const DebugOptions& debug_options,
-                           const se::GpuComputeCapability gpu_version,
-                           const se::SemanticVersion& toolkit_version) {
+void GpuCompiler::AddGemmRewriteCustomCallPasses(
+    HloPassPipeline& pipeline, const DebugOptions& debug_options,
+    se::GpuComputeCapability gpu_version,
+    const se::SemanticVersion& toolkit_version) {
+  AddPaddingForGpublasGemms(pipeline, debug_options, gpu_version);
+
   // Adding bias to GEMMs is helpful for skipping kernel launches for `add`
   // operations. However, the bias term can add dependencies between the GEMMs
   // that could otherwise be parallelized. Because of this, we disable bias
@@ -1853,7 +1855,6 @@ void AddGemmRewriterPasses(HloPassPipeline& pipeline,
       gpu_version, toolkit_version,
       GemmRewriterOptions{GemmRewriterOptions::DType::kNonFp8Only, bias_mode});
 }
-}  // namespace
 
 absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
     HloModule* hlo_module, se::StreamExecutor* stream_exec,
@@ -1951,13 +1952,9 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
     }
 
     // Rewrite GEMMs into custom calls.
-    AddPaddingForGpublasGemms(pipeline, debug_options, gpu_version);
-    AddGemmRewriterPasses(
+    AddGemmRewriteCustomCallPasses(
         pipeline, debug_options, gpu_version,
         gpu_target_config.device_description.runtime_version());
-
-    // Rewrite GEMMs with broadcasted inputs as strided GEMMs.
-    pipeline.AddPass<GemmBroadcastFoldingRewriter>();
 
     // GemmRewriter pins "__cublas$lt$matmul" output layouts to {n-1,...,1,0},
     // which can leave a downstream reshape no longer bitcast-compatible.
@@ -2567,7 +2564,6 @@ absl::StatusOr<ScheduleMetadata> GpuCompiler::ScheduleAndVerify(
   return schedule_metadata;
 }
 
-
 absl::StatusOr<std::unique_ptr<Executable>> GpuCompiler::RunBackend(
     std::unique_ptr<HloModule> module, se::StreamExecutor* stream_exec,
     const CompileOptions& options) {
@@ -2921,7 +2917,6 @@ absl::Status GpuCompiler::SerializeAutotuneResultsToFile(
   }
   return absl::OkStatus();
 }
-
 
 absl::Status GpuCompiler::AddConvAndGemmAutotuningPass(
     HloPassPipeline* pipeline, HloModule* hlo_module,
