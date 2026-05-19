@@ -23,15 +23,17 @@ limitations under the License.
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
-#include "xla/backends/gpu/codegen/emitters/ir/xla_gpu_ops.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Parser/Parser.h"
+#include "xla/backends/gpu/codegen/emitters/ir/xla_gpu_ops.h"
 #include "xla/backends/metal/codegen/msl_kernel_source.h"
+#include "xla/codegen/emitters/ir/xla_ops.h"
 #include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/tsl/platform/statusor.h"
 
@@ -42,9 +44,10 @@ namespace {
 std::unique_ptr<mlir::MLIRContext> MakeMlirContext() {
   mlir::DialectRegistry registry;
   registry.insert<mlir::arith::ArithDialect, mlir::func::FuncDialect,
-                  mlir::gpu::GPUDialect, mlir::scf::SCFDialect,
-                  mlir::tensor::TensorDialect, mlir::vector::VectorDialect,
-                  ::xla::gpu::XlaGpuDialect>();
+                  mlir::gpu::GPUDialect, mlir::math::MathDialect,
+                  mlir::scf::SCFDialect, mlir::tensor::TensorDialect,
+                  mlir::vector::VectorDialect, ::xla::gpu::XlaGpuDialect,
+                  ::xla::XlaDialect>();
   return std::make_unique<mlir::MLIRContext>(registry);
 }
 
@@ -124,7 +127,8 @@ TEST(TranslateToMSL, PicksEntryFuncAmongMultipleFuncs) {
 
   TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
   EXPECT_EQ(result.entry_point(), "entry_kernel");
-  EXPECT_NE(result.source().find("kernel void entry_kernel"), std::string::npos);
+  EXPECT_NE(result.source().find("kernel void entry_kernel"),
+            std::string::npos);
   EXPECT_EQ(result.source().find("helper"), std::string::npos)
       << "Helper func leaked into the kernel signature";
 }
@@ -238,6 +242,142 @@ TEST(TranslateToMSL, EmitsBodyForArithChain) {
             "}\n");
 }
 
+TEST(TranslateToMSL, EmitsAtomicRMWStoreAsCasLoop) {
+  auto ctx = MakeMlirContext();
+  constexpr absl::string_view kInput = R"mlir(
+    module {
+      func.func @atomic_store(%dst: tensor<4xi32> {xla.slice_index = 0 : i64},
+                              %updates: tensor<4xi32> {xla.slice_index = 1 : i64})
+          -> tensor<4xi32> attributes {xla.entry} {
+        %i = arith.constant 0 : index
+        %u = tensor.extract %updates[%i] : tensor<4xi32>
+        %out = xla.atomic_rmw %dst[%i] : tensor<4xi32> {
+          ^bb0(%current : i32):
+            xla.yield %u : i32
+        }
+        return %out : tensor<4xi32>
+      }
+    }
+  )mlir";
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(kInput, ctx.get());
+  ASSERT_TRUE(module);
+
+  TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
+  EXPECT_EQ(result.source(),
+            "#include <metal_stdlib>\n"
+            "using namespace metal;\n"
+            "\n"
+            "kernel void atomic_store("
+            "\n    device int* arg0 [[buffer(0)]],"
+            "\n    device int* arg1 [[buffer(1)]]) {\n"
+            "  long v0 = static_cast<long>(0);\n"
+            "  int v1 = arg1[v0];\n"
+            "  device atomic_int* v2 = (device atomic_int*)(&arg0[v0]);\n"
+            "  int v3 = atomic_load_explicit(v2, memory_order_relaxed);\n"
+            "  bool v4 = false;\n"
+            "  do {\n"
+            "    int v5 = static_cast<int>(v3);\n"
+            "    int v6 = static_cast<int>(v1);\n"
+            "    v4 = atomic_compare_exchange_weak_explicit(v2, &v3, v6, memory_order_relaxed, memory_order_relaxed);\n"
+            "  } while (!v4);\n"
+            "}\n");
+}
+
+TEST(TranslateToMSL, EmitsAtomicRMWF32AsCasLoop) {
+  auto ctx = MakeMlirContext();
+  constexpr absl::string_view kInput = R"mlir(
+    module {
+      func.func @atomic_add(%dst: tensor<4xf32> {xla.slice_index = 0 : i64},
+                            %updates: tensor<4xf32> {xla.slice_index = 1 : i64})
+          -> tensor<4xf32> attributes {xla.entry} {
+        %i = arith.constant 0 : index
+        %u = tensor.extract %updates[%i] : tensor<4xf32>
+        %out = xla.atomic_rmw %dst[%i] : tensor<4xf32> {
+          ^bb0(%current : f32):
+            %sum = arith.addf %current, %u : f32
+            xla.yield %sum : f32
+        }
+        return %out : tensor<4xf32>
+      }
+    }
+  )mlir";
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(kInput, ctx.get());
+  ASSERT_TRUE(module);
+
+  TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
+  EXPECT_EQ(result.source(),
+            "#include <metal_stdlib>\n"
+            "using namespace metal;\n"
+            "\n"
+            "kernel void atomic_add("
+            "\n    device float* arg0 [[buffer(0)]],"
+            "\n    device float* arg1 [[buffer(1)]]) {\n"
+            "  long v0 = static_cast<long>(0);\n"
+            "  float v1 = arg1[v0];\n"
+            "  device atomic_uint* v2 = (device atomic_uint*)(&arg0[v0]);\n"
+            "  uint v3 = atomic_load_explicit(v2, memory_order_relaxed);\n"
+            "  bool v4 = false;\n"
+            "  do {\n"
+            "    float v5 = as_type<float>(v3);\n"
+            "    float v6 = v5 + v1;\n"
+            "    uint v7 = as_type<uint>(v6);\n"
+            "    v4 = atomic_compare_exchange_weak_explicit(v2, &v3, v7, memory_order_relaxed, memory_order_relaxed);\n"
+            "  } while (!v4);\n"
+            "}\n");
+}
+
+TEST(TranslateToMSL, EmitsAtomicRMWI8AsWordCasLoop) {
+  auto ctx = MakeMlirContext();
+  constexpr absl::string_view kInput = R"mlir(
+    module {
+      func.func @atomic_i8(%dst: tensor<4xi8> {xla.slice_index = 0 : i64},
+                           %updates: tensor<4xi8> {xla.slice_index = 1 : i64})
+          -> tensor<4xi8> attributes {xla.entry} {
+        %i = arith.constant 1 : index
+        %u = tensor.extract %updates[%i] : tensor<4xi8>
+        %out = xla.atomic_rmw %dst[%i] : tensor<4xi8> {
+          ^bb0(%current : i8):
+            %mask = arith.constant 15 : i8
+            %preserved = arith.andi %current, %mask : i8
+            %new = arith.ori %preserved, %u : i8
+            xla.yield %new : i8
+        }
+        return %out : tensor<4xi8>
+      }
+    }
+  )mlir";
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(kInput, ctx.get());
+  ASSERT_TRUE(module);
+
+  TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
+  EXPECT_EQ(result.source(),
+            "#include <metal_stdlib>\n"
+            "using namespace metal;\n"
+            "\n"
+            "kernel void atomic_i8("
+            "\n    device char* arg0 [[buffer(0)]],"
+            "\n    device char* arg1 [[buffer(1)]]) {\n"
+            "  long v0 = static_cast<long>(1);\n"
+            "  char v1 = arg1[v0];\n"
+            "  ulong v2 = static_cast<ulong>(v0);\n"
+            "  ulong v3 = v2;\n"
+            "  device atomic_uint* v4 = ((device atomic_uint*)arg0) + (v3 >> 2);\n"
+            "  uint v5 = static_cast<uint>((v3 & 3ul) * 8ul);\n"
+            "  uint v6 = 255u << v5;\n"
+            "  uint v7 = atomic_load_explicit(v4, memory_order_relaxed);\n"
+            "  bool v8 = false;\n"
+            "  do {\n"
+            "    char v9 = static_cast<char>((v7 >> v5) & 255u);\n"
+            "    char v10 = static_cast<char>(15);\n"
+            "    char v11 = v9 & v10;\n"
+            "    char v12 = v11 | v1;\n"
+            "    uint v13 = (static_cast<uint>(v12) & 255u) << v5;\n"
+            "    uint v14 = (v7 & ~v6) | v13;\n"
+            "    v8 = atomic_compare_exchange_weak_explicit(v4, &v7, v14, memory_order_relaxed, memory_order_relaxed);\n"
+            "  } while (!v8);\n"
+            "}\n");
+}
+
 TEST(TranslateToMSL, EmitsIntegerAddAndBoolConstant) {
   auto ctx = MakeMlirContext();
   constexpr absl::string_view kInput = R"mlir(
@@ -261,6 +401,57 @@ TEST(TranslateToMSL, EmitsIntegerAddAndBoolConstant) {
   EXPECT_NE(result.source().find("int v3 = v1 + v2"), std::string::npos)
       << result.source();
   EXPECT_NE(result.source().find("int v2 = static_cast<int>(5)"),
+            std::string::npos)
+      << result.source();
+}
+
+TEST(TranslateToMSL, EmitsCountLeadingZeros) {
+  auto ctx = MakeMlirContext();
+  constexpr absl::string_view kInput = R"mlir(
+    module {
+      func.func @clz(%a: tensor<1xi32> {xla.slice_index = 0 : i64},
+                     %c: tensor<1xi32> {xla.slice_index = 1 : i64})
+          -> tensor<1xi32> attributes {xla.entry} {
+        %i = arith.constant 0 : index
+        %x = tensor.extract %a[%i] : tensor<1xi32>
+        %y = math.ctlz %x : i32
+        %out = tensor.insert %y into %c[%i] : tensor<1xi32>
+        return %out : tensor<1xi32>
+      }
+    }
+  )mlir";
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(kInput, ctx.get());
+  ASSERT_TRUE(module);
+
+  TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
+  EXPECT_NE(result.source().find(
+                "int v2 = static_cast<int>(metal::clz(static_cast<uint>(v1)))"),
+            std::string::npos)
+      << result.source();
+}
+
+TEST(TranslateToMSL, IndexCastUIZeroExtendsSignlessInput) {
+  auto ctx = MakeMlirContext();
+  constexpr absl::string_view kInput = R"mlir(
+    module {
+      func.func @index_castui(%a: tensor<1xi8> {xla.slice_index = 0 : i64},
+                              %c: tensor<1xi64> {xla.slice_index = 1 : i64})
+          -> tensor<1xi64> attributes {xla.entry} {
+        %i = arith.constant 0 : index
+        %x = tensor.extract %a[%i] : tensor<1xi8>
+        %idx = arith.index_castui %x : i8 to index
+        %y = arith.index_cast %idx : index to i64
+        %out = tensor.insert %y into %c[%i] : tensor<1xi64>
+        return %out : tensor<1xi64>
+      }
+    }
+  )mlir";
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(kInput, ctx.get());
+  ASSERT_TRUE(module);
+
+  TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
+  EXPECT_NE(result.source().find(
+                "long v2 = static_cast<long>(static_cast<uchar>(v1));"),
             std::string::npos)
       << result.source();
 }
@@ -296,8 +487,9 @@ TEST(TranslateToMSL, EmitsSpecialFloatValues) {
       result.source().find("= (-metal::numeric_limits<float>::infinity());"),
       std::string::npos)
       << result.source();
-  EXPECT_NE(result.source().find("= metal::numeric_limits<float>::quiet_NaN();"),
-            std::string::npos)
+  EXPECT_NE(
+      result.source().find("= metal::numeric_limits<float>::quiet_NaN();"),
+      std::string::npos)
       << result.source();
 }
 
@@ -416,8 +608,7 @@ TEST(TranslateToMSL, EmitsScfForLoop) {
   TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
   // Walk through expected lines: counted-loop syntax with the induction
   // variable, body writing to the destination via the iter_arg alias.
-  EXPECT_NE(result.source().find(
-                "for (long v4 = v0; v4 < v1; v4 += v2) {\n"),
+  EXPECT_NE(result.source().find("for (long v4 = v0; v4 < v1; v4 += v2) {\n"),
             std::string::npos)
       << result.source();
   EXPECT_NE(result.source().find("arg0[v4] = v3;"), std::string::npos)
@@ -506,23 +697,19 @@ TEST(TranslateToMSL, AddsKernelAttributeParamsForGpuOps) {
   ASSERT_TRUE(module);
 
   TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
-  EXPECT_NE(result.source().find(
-                "uint3 tid [[thread_position_in_threadgroup]]"),
+  EXPECT_NE(
+      result.source().find("uint3 tid [[thread_position_in_threadgroup]]"),
+      std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find("uint3 bid [[threadgroup_position_in_grid]]"),
             std::string::npos)
       << result.source();
-  EXPECT_NE(result.source().find(
-                "uint3 bid [[threadgroup_position_in_grid]]"),
+  EXPECT_NE(result.source().find("uint3 block_dim [[threads_per_threadgroup]]"),
             std::string::npos)
       << result.source();
-  EXPECT_NE(result.source().find(
-                "uint3 block_dim [[threads_per_threadgroup]]"),
-            std::string::npos)
+  EXPECT_NE(result.source().find("static_cast<long>(tid.x)"), std::string::npos)
       << result.source();
-  EXPECT_NE(result.source().find("static_cast<long>(tid.x)"),
-            std::string::npos)
-      << result.source();
-  EXPECT_NE(result.source().find("static_cast<long>(bid.x)"),
-            std::string::npos)
+  EXPECT_NE(result.source().find("static_cast<long>(bid.x)"), std::string::npos)
       << result.source();
   EXPECT_NE(result.source().find("static_cast<long>(block_dim.x)"),
             std::string::npos)
@@ -549,8 +736,7 @@ TEST(TranslateToMSL, OmitsUnusedKernelAttributeParams) {
   TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
   EXPECT_EQ(result.source().find("[[thread_position_"), std::string::npos)
       << result.source();
-  EXPECT_EQ(result.source().find("[[threadgroup_position_"),
-            std::string::npos)
+  EXPECT_EQ(result.source().find("[[threadgroup_position_"), std::string::npos)
       << result.source();
 }
 
@@ -604,9 +790,9 @@ TEST(TranslateToMSL, DetectsGpuOpsInsideScfFor) {
   ASSERT_TRUE(module);
 
   TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
-  EXPECT_NE(result.source().find(
-                "uint3 tid [[thread_position_in_threadgroup]]"),
-            std::string::npos)
+  EXPECT_NE(
+      result.source().find("uint3 tid [[thread_position_in_threadgroup]]"),
+      std::string::npos)
       << result.source();
 }
 
@@ -724,9 +910,8 @@ TEST(TranslateToMSL, EmitsVectorTransferWriteRoundTrip) {
       result.source().find("float4 v2 = *(const device float4*)(&arg0[v0]);"),
       std::string::npos)
       << result.source();
-  EXPECT_NE(
-      result.source().find("*(device float4*)(&arg1[v0]) = v2;"),
-      std::string::npos)
+  EXPECT_NE(result.source().find("*(device float4*)(&arg1[v0]) = v2;"),
+            std::string::npos)
       << result.source();
 }
 
@@ -753,13 +938,10 @@ TEST(TranslateToMSL, EmitsVectorOnThreadgroupAddressSpace) {
   ASSERT_TRUE(module);
 
   TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
-  EXPECT_NE(
-      result.source().find("(const threadgroup float4*)(&v0["),
-      std::string::npos)
+  EXPECT_NE(result.source().find("(const threadgroup float4*)(&v0["),
+            std::string::npos)
       << result.source();
-  EXPECT_NE(
-      result.source().find("(device float4*)(&arg0["),
-      std::string::npos)
+  EXPECT_NE(result.source().find("(device float4*)(&arg0["), std::string::npos)
       << result.source();
 }
 

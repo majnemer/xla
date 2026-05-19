@@ -13,23 +13,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef XLA_BACKENDS_METAL_CODEGEN_TRANSLATE_TO_MSL_H_
-#define XLA_BACKENDS_METAL_CODEGEN_TRANSLATE_TO_MSL_H_
+#ifndef XLA_BACKENDS_METAL_CODEGEN_MSL_KERNEL_EMITTER_H_
+#define XLA_BACKENDS_METAL_CODEGEN_MSL_KERNEL_EMITTER_H_
 
 #include "absl/status/statusor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "xla/backends/metal/codegen/msl_kernel_source.h"
+#include "xla/backends/metal/codegen/translate_to_msl.h"
 
 namespace xla {
 namespace metal {
 
-// Emits MSL source for the entry-point func.func in `module` (the one
-// marked with the xla.entry unit attribute). Kernel argument types come
-// from the tensor types; `[[buffer(N)]]` indices come from each argument's
-// xla.slice_index attribute.
-absl::StatusOr<MslKernelSource> TranslateToMSL(mlir::ModuleOp module);
+// Runs the Metal-specific MLIR pass pipeline on `module`, then translates
+// the entry-point func.func to MSL via TranslateToMSL. The input module is
+// mutated in place by the pipeline.
+absl::StatusOr<MslKernelSource> EmitMslKernel(mlir::ModuleOp module);
 
 }  // namespace metal
 }  // namespace xla
 
-#endif  // XLA_BACKENDS_METAL_CODEGEN_TRANSLATE_TO_MSL_H_
+#endif  // XLA_BACKENDS_METAL_CODEGEN_MSL_KERNEL_EMITTER_H_

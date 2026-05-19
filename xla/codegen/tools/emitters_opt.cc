@@ -35,6 +35,7 @@ limitations under the License.
 #include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassOptions.h"
@@ -49,6 +50,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/emitters/ir/xla_gpu_ops.h"
 #include "xla/backends/gpu/codegen/emitters/mlir_kernel_emitter.h"
 #include "xla/backends/gpu/codegen/emitters/transforms/passes.h"
+#include "xla/backends/metal/codegen/transforms/passes.h"
 #include "xla/codegen/emitters/ir/xla_dialect.h"
 #include "xla/codegen/emitters/transforms/lower_to_llvm_gpu.h"
 #include "xla/codegen/emitters/transforms/pass_pipelines.h"
@@ -88,7 +90,8 @@ int main(int argc, char** argv) {
       mlir::complex::ComplexDialect, mlir::func::FuncDialect,
       mlir::gpu::GPUDialect, mlir::math::MathDialect, mlir::mhlo::MhloDialect,
       mlir::mhlo::MhloDialect, mlir::scf::SCFDialect,
-      mlir::tensor::TensorDialect, mlir::vector::VectorDialect, xla::XlaDialect,
+      mlir::tensor::TensorDialect, mlir::ub::UBDialect,
+      mlir::vector::VectorDialect, xla::XlaDialect,
       xla::cpu::XlaCpuDialect, xla::gpu::XlaGpuDialect,
       xla::xtile::XTileDialect, mlir::stablehlo::StablehloDialect,
       mlir::ROCDL::ROCDLDialect>();
@@ -100,6 +103,7 @@ int main(int argc, char** argv) {
   xla::emitters::registerTransformsPasses();
   xla::emitters::registerTransformsLLVMGPUPasses();
   xla::gpu::registerGpuFusionTransformsPasses();
+  xla::metal::registerMetalTransformsPasses();
   xla::cpu::registerXlaCpuTransformsPasses();
   xla::cpu::registerXTileCpuTransformsPasses();
   xla::xtile::registerXTileTransformsPasses();

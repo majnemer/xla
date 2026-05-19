@@ -13,23 +13,32 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef XLA_BACKENDS_METAL_CODEGEN_TRANSLATE_TO_MSL_H_
-#define XLA_BACKENDS_METAL_CODEGEN_TRANSLATE_TO_MSL_H_
+#include "xla/backends/metal/codegen/msl_kernel_emitter.h"
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Passes.h"
 #include "xla/backends/metal/codegen/msl_kernel_source.h"
+#include "xla/backends/metal/codegen/transforms/passes.h"
+#include "xla/backends/metal/codegen/translate_to_msl.h"
 
 namespace xla {
 namespace metal {
 
-// Emits MSL source for the entry-point func.func in `module` (the one
-// marked with the xla.entry unit attribute). Kernel argument types come
-// from the tensor types; `[[buffer(N)]]` indices come from each argument's
-// xla.slice_index attribute.
-absl::StatusOr<MslKernelSource> TranslateToMSL(mlir::ModuleOp module);
+absl::StatusOr<MslKernelSource> EmitMslKernel(mlir::ModuleOp module) {
+  mlir::PassManager pm(module.getContext());
+  pm.addPass(CreateConvertComplexToArithMathPass());
+  pm.addPass(CreateExpandFloatOpsPass());
+  pm.addPass(mlir::createCanonicalizerPass());
+  pm.addPass(mlir::createCSEPass());
+  if (mlir::failed(pm.run(module))) {
+    return absl::InvalidArgumentError(
+        "Pre-translation pass pipeline failed on the input module.");
+  }
+  return TranslateToMSL(module);
+}
 
 }  // namespace metal
 }  // namespace xla
-
-#endif  // XLA_BACKENDS_METAL_CODEGEN_TRANSLATE_TO_MSL_H_

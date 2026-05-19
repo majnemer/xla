@@ -42,6 +42,19 @@ class MetalCompiler : public xla::gpu::GpuCompiler {
   ~MetalCompiler() override = default;
 
  protected:
+  // Normalizes BF16, all F8 variants, F4E2M1FN, and F8E8M0FNU away before
+  // delegating to the GpuCompiler base. The MSL emitter cannot lower those
+  // types, and the inherited float_normalization sub-pipeline gates many of
+  // them on CUDA/ROCm compute capabilities that don't apply here. Mirrors
+  // AMDGPUCompiler's pre-pipeline pattern (see amdgpu_compiler.cc).
+  absl::Status OptimizeHloPostLayoutAssignment(
+      HloModule* hlo_module, se::StreamExecutor* stream_exec,
+      const CompileOptions& options,
+      const xla::gpu::GpuTargetConfig& gpu_target_config,
+      const xla::gpu::GpuAliasInfo* alias_info,
+      tsl::thread::ThreadPool* thread_pool,
+      CompilationStats* compilation_stats) override;
+
   void AddGemmRewriteCustomCallPasses(
       HloPassPipeline& pipeline, const DebugOptions& debug_options,
       se::GpuComputeCapability gpu_version,
