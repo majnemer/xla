@@ -166,6 +166,12 @@ def if_macos(a, otherwise = []):
         "//conditions:default": otherwise,
     })
 
+# Metal is the only XLA GPU backend on macOS and is always available
+# (system framework, no configure step), so the macOS platform constraint
+# is the gate. Mirrors if_sycl / if_cuda / if_rocm at the call site.
+def if_metal(a, otherwise = []):
+    return if_macos(a, otherwise)
+
 def if_windows(a, otherwise = []):
     return select({
         clean_dep("//xla/tsl:windows"): a,
