@@ -60,6 +60,7 @@ limitations under the License.
 #include "xla/stream_executor/kernel_metadata.h"
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/launch_dim.h"
+#include "xla/stream_executor/metal/metal_platform_id.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
@@ -377,11 +378,18 @@ absl::Mutex& GetGpuMutex(const se::StreamExecutor* stream_exec) {
 }
 
 absl::StatusOr<std::unique_ptr<se::Kernel>> CreateKernel(
-    std::string kernel_name, uint64_t num_args, absl::string_view ptx,
+    std::string kernel_name, uint64_t num_args, absl::string_view text,
     se::StreamExecutor* stream_exec, uint32_t shared_mem_bytes, bool use_pdl) {
+  // The textual variant carries different content per platform: CUDA PTX,
+  // ROCm HSACO assembly, or Metal Shading Language source. Pick the matching
+  // loader-spec constructor based on the executor's platform id.
   se::KernelLoaderSpec loader_spec =
-      se::KernelLoaderSpec::CreateCudaPtxInMemorySpec(
-          ptx, std::move(kernel_name), num_args);
+      stream_exec->GetPlatform()->id() ==
+              stream_executor::metal::kMetalPlatformId
+          ? se::KernelLoaderSpec::CreateMslSourceInMemorySpec(
+                text, std::move(kernel_name), num_args)
+          : se::KernelLoaderSpec::CreateCudaPtxInMemorySpec(
+                text, std::move(kernel_name), num_args);
 
   TF_ASSIGN_OR_RETURN(std::unique_ptr<se::Kernel> kernel,
                       stream_exec->LoadKernel(loader_spec));

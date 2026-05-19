@@ -186,6 +186,13 @@ class GpuCompiler : public Compiler {
       HloPassPipeline& pipeline, const DebugOptions& debug_options,
       const se::GpuComputeCapability& gpu_version) {}
 
+  // Adds passes that rewrite GEMMs into gpublas custom calls. Non-gpublas
+  // backends override this to keep dots in the elemental fusion path.
+  virtual void AddGemmRewriteCustomCallPasses(
+      HloPassPipeline& pipeline, const DebugOptions& debug_options,
+      se::GpuComputeCapability gpu_version,
+      const se::SemanticVersion& toolkit_version);
+
   // During compilation with device, stream_exec != null and autotune_results
   // == null. During deviceless AOT compilation, stream_exec == null and
   // autotune_results != null.
