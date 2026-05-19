@@ -18,8 +18,10 @@ limitations under the License.
 
 #include <cstdint>
 #include <iosfwd>
+#include <vector>
 
 #include "absl/strings/str_format.h"
+#include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/tsl/platform/logging.h"
 
@@ -76,6 +78,16 @@ class ModuleHandle {
 // corresponds to CUmodule when running on CUDA.
 class MultiModuleLoaderSpec {
  public:
+  // A constant whose backing device memory the executor is asked to allocate
+  // at LoadModule time and tear down at UnloadModule time. CUDA does not use
+  // this list — its constants are embedded in the PTX/cubin and managed by
+  // cuModuleLoad/cuModuleUnload. Metal has no such driver-side mechanism, so
+  // the runtime supplies the constants here and the executor allocates them.
+  struct ConstantSpec {
+    absl::string_view symbol_name;
+    absl::Span<const uint8_t> initial_bytes;
+  };
+
   bool has_cuda_cubin_in_memory() const { return has_cuda_cubin_in_memory_; }
   absl::Span<const uint8_t> cuda_cubin_in_memory() const {
     CHECK(has_cuda_cubin_in_memory());
@@ -87,6 +99,8 @@ class MultiModuleLoaderSpec {
     CHECK(has_cuda_ptx_in_memory());
     return cuda_ptx_in_memory_;
   }
+
+  absl::Span<const ConstantSpec> constants() const { return constants_; }
 
   void AddCudaCubinInMemory(absl::Span<const uint8_t> cubin_bytes) {
     CHECK(!cubin_bytes.empty());
@@ -100,11 +114,17 @@ class MultiModuleLoaderSpec {
     cuda_ptx_in_memory_ = *ptx ? ptx : nullptr;
   }
 
+  void AddConstant(absl::string_view symbol_name,
+                   absl::Span<const uint8_t> initial_bytes) {
+    constants_.push_back({symbol_name, initial_bytes});
+  }
+
  private:
   absl::Span<const uint8_t> cuda_cubin_in_memory_;
   bool has_cuda_cubin_in_memory_ = false;
   const char* cuda_ptx_in_memory_;
   bool has_cuda_ptx_in_memory_ = false;
+  std::vector<ConstantSpec> constants_;
 };
 
 }  // namespace stream_executor
