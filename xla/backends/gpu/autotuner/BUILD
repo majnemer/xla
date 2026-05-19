@@ -610,6 +610,29 @@ cc_library(
 )
 
 cc_library(
+    name = "factory_metal",
+    srcs = ["factory_metal.cc"],
+    tags = ["gpu"],
+    target_compatible_with = ["@platforms//os:macos"],
+    visibility = ["//xla/backends/metal:__subpackages__"],
+    deps = [
+        ":factory",
+        "//xla:xla_proto_cc",
+        "//xla/backends/autotuner:backends_proto_cc",
+        "//xla/backends/autotuner:codegen_backend",
+        "//xla/hlo/analysis:alias_info",
+        "//xla/service:compiler",
+        "//xla/stream_executor:device_address_allocator",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/metal:metal_platform_id",
+        "//xla/stream_executor/platform:platform_object_registry",
+        "@com_google_absl//absl/types:span",
+        "@llvm-project//mlir:IR",
+    ],
+    alwayslink = True,
+)
+
+cc_library(
     name = "rocblas",
     srcs = ["rocblas.cc"],
     hdrs = ["rocblas.h"],
