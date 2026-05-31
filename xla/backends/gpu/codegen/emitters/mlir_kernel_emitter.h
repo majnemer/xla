@@ -212,7 +212,8 @@ class MlirKernelFusion final : public KernelFusionInterface {
 // vectorize.
 void AddLoopTransformationPasses(mlir::OpPassManager& pm,
                                  const se::DeviceDescription& device,
-                                 int max_unroll_factor = 0);
+                                 int max_unroll_factor = 0,
+                                 int64_t max_vector_elements = 32);
 
 // Adds passes that lower transformed loops to LLVM.
 void AddLoweringPasses(mlir::OpPassManager& pm,

@@ -54,9 +54,10 @@ std::unique_ptr<mlir::Pass> CreateSimplifyArithPass(
 std::unique_ptr<mlir::Pass> CreateUnswitchLoopsPass();
 std::unique_ptr<mlir::Pass> CreateVectorizeLoadsAndStoresPass(
     const std::string& target_type = "gpu",
-    const std::string& gpu_device_info = "");
+    const std::string& gpu_device_info = "", int64_t max_vector_elements = 32);
 std::unique_ptr<mlir::Pass> CreateVectorizeLoadsAndStoresPass(
-    const stream_executor::DeviceDescription& device_description);
+    const stream_executor::DeviceDescription& device_description,
+    int64_t max_vector_elements = 32);
 std::unique_ptr<mlir::Pass> CreateSafeIntegerArithmeticPass();
 std::unique_ptr<mlir::Pass> CreateExpandIntegerPowerPass();
 std::unique_ptr<mlir::Pass> CreateLowerPdlWaitPass();

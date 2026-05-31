@@ -66,6 +66,11 @@ struct EmittersOptOptions
       *this, "gpu_device_info",
       llvm::cl::desc("Serialized GpuDeviceInfoProto text proto."),
       llvm::cl::init("")};
+  Option<int64_t> max_vector_elements{
+      *this, "max_vector_elements",
+      llvm::cl::desc(
+          "Maximum number of elements in vectorized loads and stores."),
+      llvm::cl::init(32)};
 
   // Parses the gpu_device_info flag and returns a DeviceDescription object. If
   // the flag is not set, returns the default DeviceDescription for RTXA6000.
@@ -140,7 +145,9 @@ int main(int argc, char** argv) {
         if (mlir::failed(options.parseFromString(options_str))) {
           return mlir::failure();
         }
-        xla::gpu::AddLoopTransformationPasses(pm, options.parseDeviceInfo());
+        xla::gpu::AddLoopTransformationPasses(
+            pm, options.parseDeviceInfo(), /*max_unroll_factor=*/0,
+            options.max_vector_elements);
         return mlir::success();
       },
       [](llvm::function_ref<void(const mlir::detail::PassOptions&)>) {});

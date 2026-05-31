@@ -562,7 +562,8 @@ IndexingMap MlirKernelEmitter::GetDefaultThreadIdIndexingMap(
 
 void AddLoopTransformationPasses(mlir::OpPassManager& pm,
                                  const se::DeviceDescription& device,
-                                 int max_unroll_factor) {
+                                 int max_unroll_factor,
+                                 int64_t max_vector_elements) {
   pm.addNestedPass<FuncOp>(CreateLowerXlaSharedPass());
   pm.addNestedPass<FuncOp>(
       emitters::CreateLowerXlaToScfPass(device.threads_per_warp()));
@@ -585,7 +586,8 @@ void AddLoopTransformationPasses(mlir::OpPassManager& pm,
   // opportunities for LICM. This would not be necessary if LICM also moved
   // instructions over ifs.
   pm.addPass(mlir::createLoopInvariantCodeMotionPass());
-  pm.addNestedPass<FuncOp>(emitters::CreateVectorizeLoadsAndStoresPass(device));
+  pm.addNestedPass<FuncOp>(
+      emitters::CreateVectorizeLoadsAndStoresPass(device, max_vector_elements));
   pm.addNestedPass<FuncOp>(CreateOptimizeLoopsPass(max_unroll_factor));
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(mlir::createCSEPass());
