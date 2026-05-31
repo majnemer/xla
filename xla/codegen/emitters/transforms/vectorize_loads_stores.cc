@@ -132,12 +132,13 @@ int64_t GetAlignmentOfRemainder(SymbolicExpr expr, SymbolicExpr dim_or_sym) {
 // Attempts to extract the vector type for the given loop. This means:
 // - checks that the lower bound is 0
 // - checks that the step is 1
-// - checks that the upper bound is a power of 2 between 2 and 32.
+// - checks that the upper bound is a power of 2 between 2 and
+//   `max_vector_elements`.
 // Returns a vector type with the given upper bound and the tensor's element
 // type.
 // All tensors are 1D after flatten-tensors pass.
 mlir::VectorType GetVectorType(mlir::RankedTensorType tensor_type,
-                               scf::ForOp loop) {
+                               scf::ForOp loop, int64_t max_vector_elements) {
   if (tensor_type.getEncoding()) {
     return nullptr;
   }
@@ -153,7 +154,7 @@ mlir::VectorType GetVectorType(mlir::RankedTensorType tensor_type,
   }
   std::optional<int64_t> vector_size =
       mlir::getConstantIntValue(loop.getUpperBound());
-  if (vector_size < 2 || vector_size > 32 ||
+  if (vector_size < 2 || vector_size > max_vector_elements ||
       !absl::has_single_bit(static_cast<unsigned int>(*vector_size))) {
     return nullptr;  // Unsupported vector size.
   }
@@ -264,9 +265,11 @@ bool IsConflictFree(mlir::tensor::ExtractOp op) {
 
 struct VectorizeLoad : mlir::OpRewritePattern<mlir::tensor::ExtractOp> {
  public:
-  VectorizeLoad(mlir::MLIRContext* context, const DeviceSpec& device_spec)
+  VectorizeLoad(mlir::MLIRContext* context, const DeviceSpec& device_spec,
+                int64_t max_vector_elements)
       : OpRewritePattern<mlir::tensor::ExtractOp>(context),
-        device_spec_(device_spec) {}
+        device_spec_(device_spec),
+        max_vector_elements_(max_vector_elements) {}
 
   mlir::LogicalResult matchAndRewrite(
       mlir::tensor::ExtractOp op,
@@ -280,7 +283,8 @@ struct VectorizeLoad : mlir::OpRewritePattern<mlir::tensor::ExtractOp> {
                                          "source may be written in the loop");
     }
 
-    auto vector_type = GetVectorType(op.getTensor().getType(), loop);
+    auto vector_type =
+        GetVectorType(op.getTensor().getType(), loop, max_vector_elements_);
     if (!vector_type) {
       return rewriter.notifyMatchFailure(op, "not a vectorizable loop");
     }
@@ -316,6 +320,7 @@ struct VectorizeLoad : mlir::OpRewritePattern<mlir::tensor::ExtractOp> {
 
  private:
   const DeviceSpec& device_spec_;
+  int64_t max_vector_elements_;
 };
 
 // Verifies that the insertions happening in the loop can all safely be batched
@@ -418,9 +423,11 @@ class VectorizeAtomicRMW : public mlir::OpRewritePattern<AtomicRMWOp> {
 
 struct VectorizeStore : mlir::OpRewritePattern<mlir::tensor::InsertOp> {
  public:
-  VectorizeStore(mlir::MLIRContext* context, const DeviceSpec& device_spec)
+  VectorizeStore(mlir::MLIRContext* context, const DeviceSpec& device_spec,
+                 int64_t max_vector_elements)
       : OpRewritePattern<mlir::tensor::InsertOp>(context),
-        device_spec_(device_spec) {}
+        device_spec_(device_spec),
+        max_vector_elements_(max_vector_elements) {}
 
   mlir::LogicalResult matchAndRewrite(
       mlir::tensor::InsertOp op,
@@ -432,7 +439,8 @@ struct VectorizeStore : mlir::OpRewritePattern<mlir::tensor::InsertOp> {
     if (!IsConflictFree(op, op.getDest())) {
       return rewriter.notifyMatchFailure(op, "write may be read back by loop");
     }
-    auto vector_type = GetVectorType(op.getDest().getType(), loop);
+    auto vector_type =
+        GetVectorType(op.getDest().getType(), loop, max_vector_elements_);
     if (!vector_type) {
       return rewriter.notifyMatchFailure(op, "loop is not vectorizable");
     }
@@ -490,6 +498,7 @@ struct VectorizeStore : mlir::OpRewritePattern<mlir::tensor::InsertOp> {
 
  private:
   const DeviceSpec& device_spec_;
+  int64_t max_vector_elements_;
 };
 
 struct FoldVectorInsertExtractPairs
@@ -597,6 +606,12 @@ class VectorizeLoadsAndStoresPass
       const se::DeviceDescription& device_description)
       : device_spec_(device_description) {}
 
+  VectorizeLoadsAndStoresPass(const se::DeviceDescription& device_description,
+                              int64_t max_vector_elements)
+      : device_spec_(device_description) {
+    max_vector_elements_ = max_vector_elements;
+  }
+
   void runOnOperation() override {
     if (target_type_ == "gpu" && !gpu_device_info_.empty()) {
       se::GpuDeviceInfoProto device_info;
@@ -612,7 +627,8 @@ class VectorizeLoadsAndStoresPass
     }
     mlir::MLIRContext* mlir_context = &getContext();
     mlir::RewritePatternSet patterns(mlir_context);
-    patterns.add<VectorizeLoad, VectorizeStore>(mlir_context, device_spec_);
+    patterns.add<VectorizeLoad, VectorizeStore>(mlir_context, device_spec_,
+                                                max_vector_elements_);
     patterns.add<FoldVectorInsertExtractPairs>(mlir_context);
     patterns.add<VectorizeAtomicRMW>(mlir_context, device_spec_);
     if (mlir::failed(
@@ -627,16 +643,20 @@ class VectorizeLoadsAndStoresPass
 }  // namespace
 
 std::unique_ptr<::mlir::Pass> CreateVectorizeLoadsAndStoresPass(
-    const std::string& target_type, const std::string& gpu_device_info) {
+    const std::string& target_type, const std::string& gpu_device_info,
+    int64_t max_vector_elements) {
   VectorizeLoadsAndStoresPassOptions options;
   options.gpu_device_info_ = gpu_device_info;
   options.target_type_ = target_type;
+  options.max_vector_elements_ = max_vector_elements;
   return std::make_unique<VectorizeLoadsAndStoresPass>(options);
 }
 
 std::unique_ptr<mlir::Pass> CreateVectorizeLoadsAndStoresPass(
-    const se::DeviceDescription& device_description) {
-  return std::make_unique<VectorizeLoadsAndStoresPass>(device_description);
+    const se::DeviceDescription& device_description,
+    int64_t max_vector_elements) {
+  return std::make_unique<VectorizeLoadsAndStoresPass>(device_description,
+                                                       max_vector_elements);
 }
 
 }  // namespace emitters

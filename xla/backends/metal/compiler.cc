@@ -266,7 +266,8 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
           mlir::PassManager pm(mlir_source.module().getContext());
           gpu::AddLoopTransformationPasses(
               pm, gpu_device_info,
-              mlir_fusion->mlir_kernel_emitter()->unroll_factor());
+              mlir_fusion->mlir_kernel_emitter()->unroll_factor(),
+              /*max_vector_elements=*/4);
           // The inliner inside AddLoopTransformationPasses leaves large /
           // multiply-called subcomputations as xla.pure_call; rewrite those to
           // func.call, which the MSL translator emits as device functions.

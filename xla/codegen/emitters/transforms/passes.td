@@ -307,6 +307,9 @@ def VectorizeLoadsAndStoresPass :
            "Serialized stream_executor::GPUDeviceInfo proto.">,
     Option<"target_type_", "target_type", "std::string", /*default=*/"\"gpu\"",
            "Whether the pass targets a 'cpu' or 'gpu'. If 'cpu', gpu_device_info_ must be empty.">,
+    Option<"max_vector_elements_", "max_vector_elements", "int64_t",
+           /*default=*/"32",
+           "Maximum number of elements in vectorized loads and stores.">,
   ];
 
   let constructor = "CreateVectorizeLoadsAndStoresPass()";

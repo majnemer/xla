@@ -10,6 +10,10 @@
 // RUN: -xla-vectorize-loads-stores="gpu_device_info='cuda_compute_capability {major: 9}'" -cse -canonicalize \
 // RUN: | FileCheck %s --check-prefix=CHECK-HOPPER
 
+// RUN: emitters_opt -allow-unregistered-dialect %s -split-input-file \
+// RUN: -xla-vectorize-loads-stores="gpu_device_info='cuda_compute_capability {major: 6}' max_vector_elements=4" -cse -canonicalize \
+// RUN: | FileCheck %s --check-prefix=CHECK-MAX4
+
 #map = #xla.indexing_map<"(d0)[s0] -> (d0 * 2 + s0),"
   "domain: d0 in [0, 63], s0 in [0, 1]">
 func.func @simple_read(%arg0: tensor<128xf32>) -> (f32) {
@@ -112,6 +116,10 @@ func.func @simple_read3(%arg0: tensor<512xi8>) -> (i8) {
 // CHECK-NEXT:    scf.for %[[J:.*]] = %[[C0]]
 // CHECK-NEXT:      vector.extract %[[V]][%[[J]]]
 // CHECK-NEXT:      addi
+// CHECK-MAX4-LABEL: @simple_read3
+// CHECK-MAX4-NOT: vector.transfer_read
+// CHECK-MAX4:     tensor.extract
+// CHECK-MAX4:     return
 
 // -----
 
