@@ -22,8 +22,6 @@ limitations under the License.
 #include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -131,7 +129,6 @@ struct RewriteShuffleReduce : mlir::OpRewritePattern<gpu::ShuffleReduceOp> {
     ImplicitLocOpBuilder b(op.getLoc(), rewriter);
     ValueRange values = op.getOperands();
     for (int distance = max_distance; distance > 0; distance /= 2) {
-      namespace ml = mlir::LLVM;
       auto shuffle_32 = [&](Value v) {
         return mlir::gpu::ShuffleOp::create(b, v, distance, warp_size,
                                             mlir::gpu::ShuffleMode::DOWN)
@@ -150,22 +147,29 @@ struct RewriteShuffleReduce : mlir::OpRewritePattern<gpu::ShuffleReduceOp> {
         value = mlir::arith::BitcastOp::create(b, int_ty, value);
         value = mlir::arith::ExtUIOp::create(b, padded_int_ty, value);
         if (n_shuffles > 1) {
-          // Don't generate vectors if the size is 1.
-          auto vector_type = ml::getVectorType(b.getI32Type(), n_shuffles);
-          value = ml::BitcastOp::create(b, vector_type, value);
-          Value result_vec = ml::UndefOp::create(b, vector_type);
+          auto scalar_vector_type = mlir::VectorType::get({1}, padded_int_ty);
+          auto shuffle_vector_type =
+              mlir::VectorType::get({n_shuffles}, b.getI32Type());
+          Value vector =
+              mlir::vector::FromElementsOp::create(b, scalar_vector_type, value);
+          vector = mlir::vector::BitCastOp::create(b, shuffle_vector_type,
+                                                   vector);
+          SmallVector<Value> shuffled_elements;
+          shuffled_elements.reserve(n_shuffles);
           for (int i = 0; i < n_shuffles; ++i) {
-            auto idx = mlir::arith::ConstantIntOp::create(b, i, 32);
-            result_vec = ml::InsertElementOp::create(
-                b, result_vec,
-                shuffle_32(ml::ExtractElementOp::create(b, value, idx)), idx);
+            Value chunk = mlir::vector::ExtractOp::create(b, vector, i);
+            shuffled_elements.push_back(shuffle_32(chunk));
           }
-          value = ml::BitcastOp::create(b, padded_int_ty, result_vec);
+          vector = mlir::vector::FromElementsOp::create(
+              b, shuffle_vector_type, shuffled_elements);
+          vector =
+              mlir::vector::BitCastOp::create(b, scalar_vector_type, vector);
+          value = mlir::vector::ExtractOp::create(b, vector, 0);
         } else {
           value = shuffle_32(value);
         }
         value = mlir::arith::TruncIOp::create(b, int_ty, value);
-        value = ml::BitcastOp::create(b, ty, value);
+        value = mlir::arith::BitcastOp::create(b, ty, value);
         return value;
       };
 
