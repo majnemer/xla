@@ -1164,21 +1164,10 @@ bool IsDotSupportedByClassicalEmitters(const HloInstruction& dot) {
 }
 
 PrimitiveType GetGemmAccumulatorType(const HloDotInstruction* dot) {
-  // Return the accumulator type if it is explicitly specified as dot algorithm.
-  auto accumulator_type = algorithm_util::GetDotAccumulatorType(
-      dot->precision_config().algorithm());
-  if (accumulator_type.ok()) {
-    return accumulator_type.value();
-  }
-
-  PrimitiveType shape_type = dot->shape().element_type();
-  // If the output type is a floating point type with less than or equal to 32
-  // bits, use f32 as the accumulator type.
-  if (primitive_util::IsFloatingPointType(shape_type) &&
-      primitive_util::BitWidth(shape_type) <= primitive_util::BitWidth(F32)) {
-    return F32;
-  }
-  return shape_type;
+  absl::StatusOr<PrimitiveType> accumulator_type =
+      algorithm_util::GetGemmAccumulatorType(*dot);
+  CHECK_OK(accumulator_type.status());
+  return *accumulator_type;
 }
 
 absl::StatusOr<HloInstruction*> MakeMultiplyForDotPrecisionAlgorithm(

@@ -33,13 +33,13 @@ limitations under the License.
 #include "absl/strings/str_replace.h"
 #include "absl/strings/string_view.h"
 #include "absl/strings/substitute.h"
-#include "Eigen/Core"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/TargetParser/Triple.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/PassManager.h"
+#include "Eigen/Core"
 #include "xla/autotuning.pb.h"
 #include "xla/backends/gpu/codegen/triton/support.h"
 #include "xla/backends/gpu/codegen/triton/test_utils.h"
@@ -1742,9 +1742,9 @@ class TritonEmitterTestWithAlgorithmParam
 
 // Regroups tests for dot algorithms that have no ambiguous type parameters as
 // per `algorithm_util::GetAllowedOperandsTypeForAlgorithm` and
-// `algorithm_util::GetDotAccumulatorType`, and do not decompose each tiled step
-// into multiple `dot` operations. We call these algorithms "basic" algorithms
-// here.
+// `algorithm_util::GetGemmAccumulatorType`, and do not decompose each tiled
+// step into multiple `dot` operations. We call these algorithms "basic"
+// algorithms here.
 using BasicDotAlgorithmEmitterTest = TritonEmitterTestWithAlgorithmParam;
 
 constexpr std::array kBasicAlgorithms = {
@@ -1764,7 +1764,7 @@ TEST_P(BasicDotAlgorithmEmitterTest, BasicAlgorithmIsEmittedCorrectly) {
   ASSERT_EQ(allowed_types.size(), 1);
   PrimitiveType in_ty = allowed_types.front();
   TF_ASSERT_OK_AND_ASSIGN(PrimitiveType out_ty,
-                          algorithm_util::GetDotAccumulatorType(algorithm));
+                          algorithm_util::GetGemmAccumulatorType(algorithm));
   const std::string kHloText = GetDotAlgorithmHlo(in_ty, out_ty, algorithm);
 
   TF_ASSERT_OK_AND_ASSIGN(
@@ -1817,7 +1817,7 @@ constexpr std::array kMultiDotAlgorithms = {
 TEST_P(MultiDotAlgorithmEmitterTest, MultiDotAlgorithmIsEmittedCorrectly) {
   auto algorithm = GetParam();
   TF_ASSERT_OK_AND_ASSIGN(PrimitiveType out_ty,
-                          algorithm_util::GetDotAccumulatorType(algorithm));
+                          algorithm_util::GetGemmAccumulatorType(algorithm));
   PrimitiveType in_ty =
       algorithm == PrecisionConfig::ALG_DOT_TF32_TF32_F32_X3 ? F32 : BF16;
   // Dummy value to ensure that the dot count is explicitly set.
@@ -1893,7 +1893,7 @@ TEST_P(TF32DotAlgorithmEmitterTest, TF32AlgorithmsUseTF32InputPrecision) {
   ASSERT_EQ(allowed_types.size(), 1);
   PrimitiveType in_ty = allowed_types.front();
   TF_ASSERT_OK_AND_ASSIGN(PrimitiveType out_ty,
-                          algorithm_util::GetDotAccumulatorType(algorithm));
+                          algorithm_util::GetGemmAccumulatorType(algorithm));
   const std::string kHloText = GetDotAlgorithmHlo(in_ty, out_ty, algorithm);
 
   std::string input_precision_string =

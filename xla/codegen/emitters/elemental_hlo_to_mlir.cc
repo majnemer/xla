@@ -498,19 +498,51 @@ absl::StatusOr<Value> EmitFloatCast(Value value, mlir::Type target_type,
   return value;
 }
 
-absl::StatusOr<Value> EmitMulAdd(Value lhs, Value rhs, Value accumulator,
-                                 PrimitiveType result_element_type,
-                                 mlir::Type accumulator_type,
-                                 ImplicitLocOpBuilder& b) {
-  if (primitive_util::IsFloatingPointType(result_element_type)) {
-    if (result_element_type == PrimitiveType::BF16) {
-      lhs = arith::ExtFOp::create(b, b.getF32Type(), lhs);
-      rhs = arith::ExtFOp::create(b, b.getF32Type(), rhs);
+absl::StatusOr<Value> EmitCast(Value value, PrimitiveType target_element_type,
+                               mlir::Type target_type,
+                               ImplicitLocOpBuilder& b) {
+  if (value.getType() == target_type) {
+    return value;
+  }
+  if (primitive_util::IsFloatingPointType(target_element_type)) {
+    return EmitFloatCast(value, target_type, b);
+  }
+  if (primitive_util::IsIntegralType(target_element_type)) {
+    int source_width = value.getType().getIntOrFloatBitWidth();
+    int target_width = target_type.getIntOrFloatBitWidth();
+    if (source_width < target_width) {
+      if (primitive_util::IsUnsignedIntegralType(target_element_type)) {
+        return arith::ExtUIOp::create(b, target_type, value);
+      }
+      return arith::ExtSIOp::create(b, target_type, value);
     }
-    TF_ASSIGN_OR_RETURN(
-        Value casted,
-        EmitFloatCast(arith::MulFOp::create(b, lhs, rhs), accumulator_type, b));
-    return arith::AddFOp::create(b, accumulator, casted);
+    if (source_width > target_width) {
+      return arith::TruncIOp::create(b, target_type, value);
+    }
+    return value;
+  }
+  return absl::UnimplementedError(absl::StrFormat(
+      "Unsupported cast to %s", PrimitiveType_Name(target_element_type)));
+}
+
+absl::StatusOr<Value> EmitMulAdd(
+    Value lhs, Value rhs, Value accumulator, PrimitiveType result_element_type,
+    std::optional<PrimitiveType> operand_element_type,
+    std::optional<mlir::Type> operand_type,
+    PrimitiveType accumulator_element_type, mlir::Type accumulator_type,
+    ImplicitLocOpBuilder& b) {
+  if (operand_type.has_value()) {
+    TF_RET_CHECK(operand_element_type.has_value());
+    TF_ASSIGN_OR_RETURN(lhs,
+                        EmitCast(lhs, *operand_element_type, *operand_type, b));
+    TF_ASSIGN_OR_RETURN(rhs,
+                        EmitCast(rhs, *operand_element_type, *operand_type, b));
+  }
+  if (primitive_util::IsFloatingPointType(result_element_type)) {
+    Value product = arith::MulFOp::create(b, lhs, rhs);
+    TF_ASSIGN_OR_RETURN(product, EmitCast(product, accumulator_element_type,
+                                          accumulator_type, b));
+    return arith::AddFOp::create(b, accumulator, product);
   }
   if (result_element_type == PrimitiveType::PRED) {
     return arith::OrIOp::create(b, accumulator,
@@ -521,16 +553,18 @@ absl::StatusOr<Value> EmitMulAdd(Value lhs, Value rhs, Value accumulator,
     Value mul = mlir::complex::MulOp::create(b, accumulator_type, lhs, rhs);
     return mlir::complex::AddOp::create(b, accumulator_type, accumulator, mul);
   }
-  return arith::AddIOp::create(b, accumulator,
-                               arith::MulIOp::create(b, lhs, rhs));
+  Value product = arith::MulIOp::create(b, lhs, rhs);
+  TF_ASSIGN_OR_RETURN(product, EmitCast(product, accumulator_element_type,
+                                        accumulator_type, b));
+  return arith::AddIOp::create(b, accumulator, product);
 }
 
 absl::StatusOr<SmallVector<Value, 1>> EmitDotLoop(
     const HloInstruction* instr, ValueRange indices,
     const OperandProvider& operand_provider, ImplicitLocOpBuilder& b,
     MLIRContext* mlir_context) {
-  auto result_element_type =
-      PrimitiveTypeToMlirType(instr->shape().element_type(), b);
+  const PrimitiveType result_primitive_type = instr->shape().element_type();
+  auto result_element_type = PrimitiveTypeToMlirType(result_primitive_type, b);
   HloInstructionIndexing indexing =
       ComputeOutputToInputIndexing(instr, /*output_id=*/0, mlir_context);
   const IndexingMap& lhs_indexing_map =
@@ -538,8 +572,16 @@ absl::StatusOr<SmallVector<Value, 1>> EmitDotLoop(
   const IndexingMap& rhs_indexing_map =
       indexing.indexing_maps.at(1).begin()->map();
 
+  std::optional<mlir::Type> operand_type;
+  TF_ASSIGN_OR_RETURN(std::optional<PrimitiveType> operand_primitive_type,
+                      algorithm_util::GetGemmOperandType(*instr));
+  if (operand_primitive_type.has_value()) {
+    operand_type = PrimitiveTypeToMlirType(*operand_primitive_type, b);
+  }
+  TF_ASSIGN_OR_RETURN(PrimitiveType accumulator_primitive_type,
+                      algorithm_util::GetGemmAccumulatorType(*instr));
   const mlir::Type accumulator_type =
-      result_element_type.isBF16() ? b.getF32Type() : result_element_type;
+      PrimitiveTypeToMlirType(accumulator_primitive_type, b);
   Value accum_init_value;
   if (auto complex_ty = mlir::dyn_cast<mlir::ComplexType>(accumulator_type)) {
     // For complex, build real-zero and imag-zero separately:
@@ -579,19 +621,20 @@ absl::StatusOr<SmallVector<Value, 1>> EmitDotLoop(
     Value accum = iter_args[0];
 
     TF_ASSIGN_OR_RETURN(
-        accum, EmitMulAdd(lhs_value, rhs_value, accum,
-                          instr->shape().element_type(), accumulator_type, b));
+        accum, EmitMulAdd(lhs_value, rhs_value, accum, result_primitive_type,
+                          operand_primitive_type, operand_type,
+                          accumulator_primitive_type, accumulator_type, b));
     return {{accum}};
   };
 
-  TF_ASSIGN_OR_RETURN(ValueRange results,
+  TF_ASSIGN_OR_RETURN(ValueRange loop_results,
                       EmitLoopNestWithStatus(b, indices, {accum_init_value},
                                              lhs_indexing_map, body));
-  TF_RET_CHECK(results.size() == 1);
-  if (result_element_type.isBF16()) {
-    return {{arith::TruncFOp::create(b, b.getBF16Type(), results.front())}};
-  }
-  return {{results.front()}};
+  TF_RET_CHECK(loop_results.size() == 1);
+  TF_ASSIGN_OR_RETURN(Value result,
+                      EmitCast(loop_results.front(), result_primitive_type,
+                               result_element_type, b));
+  return {{result}};
 }
 
 absl::StatusOr<SmallVector<Value, 1>> EmitDot(
