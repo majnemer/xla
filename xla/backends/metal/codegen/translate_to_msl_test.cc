@@ -534,6 +534,42 @@ TEST(TranslateToMSL, EmitsAtomicRMWF32AsCasLoop) {
             "}\n");
 }
 
+TEST(TranslateToMSL, EmitsAtomicRMWF16AsWordCasLoop) {
+  auto ctx = MakeMlirContext();
+  constexpr absl::string_view kInput = R"mlir(
+    module {
+      func.func @atomic_add_half(
+          %dst: tensor<4xf16> {xla.slice_index = 0 : i64},
+          %updates: tensor<4xf16> {xla.slice_index = 1 : i64})
+          -> tensor<4xf16> attributes {xla.entry} {
+        %i = arith.constant 1 : index
+        %u = tensor.extract %updates[%i] : tensor<4xf16>
+        %out = xla.atomic_rmw %dst[%i] : tensor<4xf16> {
+          ^bb0(%current : f16):
+            %sum = arith.addf %current, %u : f16
+            xla.yield %sum : f16
+        }
+        return %out : tensor<4xf16>
+      }
+    }
+  )mlir";
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(kInput, ctx.get());
+  ASSERT_TRUE(module);
+
+  TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
+  EXPECT_NE(result.source().find("device atomic_uint*"), std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find("ushort"), std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find("as_type<half>"), std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find("as_type<ushort>"), std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find("atomic_compare_exchange_weak_explicit"),
+            std::string::npos)
+      << result.source();
+}
+
 TEST(TranslateToMSL, EmitsAtomicRMWI8AsWordCasLoop) {
   auto ctx = MakeMlirContext();
   constexpr absl::string_view kInput = R"mlir(
