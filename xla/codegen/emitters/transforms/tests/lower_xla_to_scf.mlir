@@ -27,44 +27,83 @@ func.func @shuffler(%a: f32, %b: i32) -> (f32, i32) {
 
 // -----
 
-func.func @combiner(%a: f64, %b: f64) -> f64 {
+func.func @combiner_f64(%a: f64, %b: f64) -> f64 {
   return %a : f64
 }
 
-func.func @shuffler(%a: f64) -> f64 {
-  %ret = xla_gpu.shuffle_reduce(%a) to 1 combiner=@combiner : f64
+func.func @shuffler_f64(%a: f64) -> f64 {
+  %ret = xla_gpu.shuffle_reduce(%a) to 1 combiner=@combiner_f64 : f64
   return %ret : f64
 }
-// CHECK: @shuffler(%[[A:.*]]: f64
-// CHECK: gpu.shuffle down {{.*}}, %[[C1]]
-// CHECK: gpu.shuffle down {{.*}}, %[[C1]]
+// CHECK-LABEL: @shuffler_f64
+// CHECK-SAME: %[[A:.*]]: f64
+// CHECK-NOT: llvm.
+// CHECK: vector.bitcast {{.*}} : vector<1xi64> to vector<2xi32>
+// CHECK-COUNT-2: gpu.shuffle down
+// CHECK: vector.bitcast {{.*}} : vector<2xi32> to vector<1xi64>
+// CHECK-NOT: llvm.
+// CHECK: return
 
 // -----
 
-func.func @combiner(%a: complex<f64>, %b: complex<f64>) -> complex<f64> {
+func.func @combiner_complex(%a: complex<f64>, %b: complex<f64>) -> complex<f64> {
   return %a : complex<f64>
 }
 
-func.func @shuffler(%a: complex<f64>) -> complex<f64> {
-  %ret = xla_gpu.shuffle_reduce(%a) to 1 combiner=@combiner : complex<f64>
+func.func @shuffler_complex(%a: complex<f64>) -> complex<f64> {
+  %ret = xla_gpu.shuffle_reduce(%a) to 1 combiner=@combiner_complex : complex<f64>
   return %ret : complex<f64>
 }
-// CHECK: @shuffler
-// CHECK-COUNT-4: gpu.shuffle down {{.*}}, %[[C1]]
+// CHECK-LABEL: @shuffler_complex
+// CHECK-NOT: llvm.
+// CHECK: vector.bitcast {{.*}} : vector<1xi64> to vector<2xi32>
+// CHECK: gpu.shuffle down
+// CHECK: gpu.shuffle down
+// CHECK: vector.bitcast {{.*}} : vector<2xi32> to vector<1xi64>
+// CHECK: vector.bitcast {{.*}} : vector<1xi64> to vector<2xi32>
+// CHECK: gpu.shuffle down
+// CHECK: gpu.shuffle down
+// CHECK: vector.bitcast {{.*}} : vector<2xi32> to vector<1xi64>
+// CHECK-NOT: llvm.
+// CHECK: return
 
 // -----
 
-func.func @combiner(%a: ui64, %b: ui64) -> ui64 {
+func.func @combiner_f16(%a: f16, %b: f16) -> f16 {
+  return %a : f16
+}
+
+func.func @shuffler_f16(%a: f16) -> f16 {
+  %ret = xla_gpu.shuffle_reduce(%a) to 1 combiner=@combiner_f16 : f16
+  return %ret : f16
+}
+// CHECK-LABEL: @shuffler_f16
+// CHECK-SAME: %[[A:.*]]: f16
+// CHECK-NOT: llvm.
+// CHECK: arith.bitcast %[[A]] : f16 to i16
+// CHECK: gpu.shuffle down
+// CHECK: arith.bitcast {{.*}} : i16 to f16
+// CHECK-NOT: llvm.
+// CHECK: return
+
+// -----
+
+func.func @combiner_ui64(%a: ui64, %b: ui64) -> ui64 {
   return %a : ui64
 }
 
-func.func @shuffler(%a: ui64) -> ui64 {
-  %ret = xla_gpu.shuffle_reduce (%a) to 1 combiner=@combiner : ui64
+func.func @shuffler_ui64(%a: ui64) -> ui64 {
+  %ret = xla_gpu.shuffle_reduce (%a) to 1 combiner=@combiner_ui64 : ui64
   return %ret : ui64
 }
-// CHECK: @shuffler
+// CHECK-LABEL: @shuffler_ui64
+// CHECK-NOT: llvm.
 // CHECK: unrealized_conversion_cast
-// CHECK-COUNT-2: gpu.shuffle down {{.*}}, %[[C1]]
+// CHECK: vector.bitcast {{.*}} : vector<1xi64> to vector<2xi32>
+// CHECK-COUNT-2: gpu.shuffle down
+// CHECK: vector.bitcast {{.*}} : vector<2xi32> to vector<1xi64>
+// CHECK-NOT: llvm.
+// CHECK: return
 
 // -----
 
@@ -78,7 +117,7 @@ func.func @shuffler_i8(%a: i8) -> i8 {
 }
 // CHECK: @shuffler_i8(
 // CHECK-NOT: vector
-// CHECK-COUNT-1: gpu.shuffle down {{.*}}, %[[C1]]
+// CHECK-COUNT-1: gpu.shuffle down
 
 // -----
 
