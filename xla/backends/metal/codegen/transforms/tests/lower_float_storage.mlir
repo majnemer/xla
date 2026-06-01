@@ -187,3 +187,23 @@ func.func @poison_bf16() -> bf16 {
 }
 // CHECK:      %[[P:.*]] = ub.poison : i16
 // CHECK:      return %[[P]] : i16
+
+// CHECK-LABEL: func.func @callee_bf16(
+// CHECK-SAME:    %[[ARG:.*]]: tensor<4xi16>
+// CHECK-SAME:    %[[VALUE:.*]]: i16
+// CHECK-SAME:  ) -> i16
+func.func @callee_bf16(%arg0: tensor<4xbf16>, %value: bf16) -> bf16 {
+  return %value : bf16
+}
+// CHECK:      return %[[VALUE]] : i16
+
+// CHECK-LABEL: func.func @caller_bf16(
+// CHECK-SAME:    %[[ARG:.*]]: tensor<4xi16>
+// CHECK-SAME:    %[[VALUE:.*]]: i16
+// CHECK-SAME:  ) -> i16
+func.func @caller_bf16(%arg0: tensor<4xbf16>, %value: bf16) -> bf16 {
+  %out = func.call @callee_bf16(%arg0, %value) : (tensor<4xbf16>, bf16) -> bf16
+  return %out : bf16
+}
+// CHECK:      %[[OUT:.*]] = call @callee_bf16(%[[ARG]], %[[VALUE]]) : (tensor<4xi16>, i16) -> i16
+// CHECK:      return %[[OUT]] : i16

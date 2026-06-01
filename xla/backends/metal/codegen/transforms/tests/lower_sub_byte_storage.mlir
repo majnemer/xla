@@ -101,3 +101,25 @@ func.func @f4_extract_bits(%src: tensor<3xf4E2M1FN>, %i: index) -> i8 {
 // CHECK:      %[[F4SHIFTED:.*]] = arith.shrui %[[F4PACKED]]
 // CHECK:      %[[F4LOW:.*]] = arith.andi %[[F4SHIFTED]]
 // CHECK:      return %[[F4LOW]] : i8
+
+// -----
+
+// CHECK-LABEL: func.func @callee_i4(
+// CHECK-SAME:    %[[ARG:.*]]: tensor<2xi8>
+// CHECK-SAME:    %[[VALUE:.*]]: i8
+// CHECK-SAME:  ) -> i8
+func.func @callee_i4(%arg0: tensor<4xi4>, %value: i4) -> i4 {
+  return %value : i4
+}
+// CHECK:      return %[[VALUE]] : i8
+
+// CHECK-LABEL: func.func @caller_i4(
+// CHECK-SAME:    %[[ARG:.*]]: tensor<2xi8>
+// CHECK-SAME:    %[[VALUE:.*]]: i8
+// CHECK-SAME:  ) -> i8
+func.func @caller_i4(%arg0: tensor<4xi4>, %value: i4) -> i4 {
+  %out = func.call @callee_i4(%arg0, %value) : (tensor<4xi4>, i4) -> i4
+  return %out : i4
+}
+// CHECK:      %[[OUT:.*]] = call @callee_i4(%[[ARG]], %[[VALUE]]) : (tensor<2xi8>, i8) -> i8
+// CHECK:      return %[[OUT]] : i8

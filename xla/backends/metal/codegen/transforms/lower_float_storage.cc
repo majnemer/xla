@@ -541,6 +541,7 @@ class LowerFloatStoragePass
         converter, context);
     mlir::populateFunctionOpInterfaceTypeConversionPattern<mlir::func::FuncOp>(
         patterns, converter);
+    mlir::populateCallOpTypeConversionPattern(patterns, converter);
     mlir::populateReturnOpTypeConversionPattern(patterns, converter);
 
     mlir::ConversionTarget target(*context);
