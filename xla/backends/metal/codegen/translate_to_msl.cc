@@ -1603,11 +1603,12 @@ class MslEmitter {
         mlir::debugString(element_ty)));
   }
 
-  absl::Status EmitSmallIntegerAtomicRMW(::xla::AtomicRMWOp op,
-                                         int element_width) {
+  absl::Status EmitSub32BitAtomicRMW(::xla::AtomicRMWOp op, int element_width,
+                                     bool bitcast_through_storage) {
     if (element_width != 8 && element_width != 16) {
       return absl::UnimplementedError(absl::StrCat(
-          "xla.atomic_rmw: small integer atomics only support i8/i16 today; "
+          "xla.atomic_rmw: sub-32-bit atomics only support 8/16-bit values "
+          "today; "
           "got i",
           element_width));
     }
@@ -1616,6 +1617,7 @@ class MslEmitter {
         op.getInput().getType());
     mlir::Type element_ty = tensor_ty.getElementType();
     TF_ASSIGN_OR_RETURN(std::string element_msl, TypeToMSL(element_ty));
+    const std::string storage_msl = element_width == 8 ? "uchar" : "ushort";
     TF_ASSIGN_OR_RETURN(std::string buf, GetName(op.getInput()));
     TF_ASSIGN_OR_RETURN(std::string space, AddrSpaceOf(op.getInput()));
 
@@ -1656,9 +1658,18 @@ class MslEmitter {
     os_.indent();
 
     std::string current = CreateFreshName();
-    os_ << element_msl << " " << current << " = static_cast<" << element_msl
-        << ">((" << expected << " >> " << shift << ") & " << element_mask
-        << "u);\n";
+    if (bitcast_through_storage) {
+      std::string current_storage = CreateFreshName();
+      os_ << storage_msl << " " << current_storage << " = static_cast<"
+          << storage_msl << ">((" << expected << " >> " << shift << ") & "
+          << element_mask << "u);\n";
+      os_ << element_msl << " " << current << " = as_type<" << element_msl
+          << ">(" << current_storage << ");\n";
+    } else {
+      os_ << element_msl << " " << current << " = static_cast<" << element_msl
+          << ">((" << expected << " >> " << shift << ") & " << element_mask
+          << "u);\n";
+    }
     names_[op.getCurrentValue()] = current;
 
     for (mlir::Operation& body_op : op.getBody()->without_terminator()) {
@@ -1672,8 +1683,17 @@ class MslEmitter {
     TF_ASSIGN_OR_RETURN(std::string yielded, GetName(yield.getOperand(0)));
 
     std::string desired_field = CreateFreshName();
-    os_ << "uint " << desired_field << " = (static_cast<uint>(" << yielded
-        << ") & " << element_mask << "u) << " << shift << ";\n";
+    if (bitcast_through_storage) {
+      std::string desired_storage = CreateFreshName();
+      os_ << storage_msl << " " << desired_storage << " = as_type<"
+          << storage_msl << ">(" << yielded << ");\n";
+      os_ << "uint " << desired_field << " = (static_cast<uint>("
+          << desired_storage << ") & " << element_mask << "u) << " << shift
+          << ";\n";
+    } else {
+      os_ << "uint " << desired_field << " = (static_cast<uint>(" << yielded
+          << ") & " << element_mask << "u) << " << shift << ";\n";
+    }
     std::string desired = CreateFreshName();
     os_ << "uint " << desired << " = (" << expected << " & ~" << field_mask
         << ") | " << desired_field << ";\n";
@@ -1710,7 +1730,12 @@ class MslEmitter {
     }
     if (auto int_ty = mlir::dyn_cast<mlir::IntegerType>(element_ty);
         int_ty && int_ty.getWidth() < 32) {
-      return EmitSmallIntegerAtomicRMW(op, int_ty.getWidth());
+      return EmitSub32BitAtomicRMW(op, int_ty.getWidth(),
+                                   /*bitcast_through_storage=*/false);
+    }
+    if (element_ty.isF16()) {
+      return EmitSub32BitAtomicRMW(op, /*element_width=*/16,
+                                   /*bitcast_through_storage=*/true);
     }
     TF_ASSIGN_OR_RETURN(AtomicStorage atomic_storage,
                         GetAtomicStorage(element_ty));
