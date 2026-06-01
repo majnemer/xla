@@ -1155,22 +1155,23 @@ TEST_F(ElementalHloToMlirTest, ConvolutionWithBatchGroupCount) {
     // CHECK-DAG:  %[[INIT:.+]] = arith.constant 0.000000e+00 : f32
     // CHECK-DAG:  %[[C0:.+]] = arith.constant 0 : index
     // CHECK-DAG:  %[[C1:.+]] = arith.constant 1 : index
-    // CHECK-DAG:  %[[C2:.+]] = arith.constant 2 : index
     // CHECK-DAG:  %[[C3:.+]] = arith.constant 3 : index
     // CHECK-DAG:  %[[C4:.+]] = arith.constant 4 : index
     // CHECK-DAG:  %[[C5:.+]] = arith.constant 5 : index
     // CHECK:      %[[R0:.+]] = scf.for %[[X:.+]] = %[[C0]] to %[[C3]] step %[[C1]] iter_args(%[[A0:.+]] = %[[INIT]]) -> (f32) {
     // CHECK-NEXT: %[[R1:.+]] = scf.for %[[Y:.+]] = %[[C0]] to %[[C5]] step %[[C1]] iter_args(%[[A1:.+]] = %[[A0]]) -> (f32) {
-    // CHECK-NEXT: %[[R2:.+]] = scf.for %[[I:.+]] = %[[C0]] to %[[C4]] step %[[C1]] iter_args(%[[A2:.+]] = %[[A1]]) -> (f32) {
-    // CHECK-NEXT: %[[R3:.+]] = scf.for %[[G:.+]] = %[[C0]] to %[[C2]] step %[[C1]] iter_args(%[[ACC:.+]] = %[[A2]]) -> (f32) {
-    // CHECK:      %[[R4:.+]] = scf.if {{.+}} -> (f32) {
+    // CHECK-NEXT: %[[R2:.+]] = scf.for %[[I:.+]] = %[[C0]] to %[[C4]] step %[[C1]] iter_args(%[[ACC:.+]] = %[[A1]]) -> (f32) {
+    // CHECK:      %[[R3:.+]] = scf.if {{.+}} -> (f32) {
+    // CHECK:        %[[XX2:.+]] = xla.apply_indexing
+    // CHECK-SAME:     #xla.indexing_map<"(d0) -> (d0 floordiv 8),
+    // CHECK-SAME:     d0 in [0, 15]">(%[[O]])
     // CHECK:        %[[XX0:.+]] = xla.apply_indexing
     // CHECK-SAME:     #xla.indexing_map<"(d0, d1) -> (d0 + d1),
     // CHECK-SAME:     d0 in [0, 5], d1 in [0, 2]">(%[[W]], %[[X]])
     // CHECK:        %[[XX1:.+]] = xla.apply_indexing
     // CHECK-SAME:     #xla.indexing_map<"(d0, d1) -> (d0 + d1),
     // CHECK-SAME:     d0 in [0, 7], d1 in [0, 4]">(%[[H]], %[[Y]])
-    // CHECK-DAG:    %[[VL:.+]] = tensor.extract %[[LHS]][%[[G]], %[[XX0]], %[[XX1]], %[[I]]] : tensor<2x8x12x4xf32>
+    // CHECK-DAG:    %[[VL:.+]] = tensor.extract %[[LHS]][%[[XX2]], %[[XX0]], %[[XX1]], %[[I]]] : tensor<2x8x12x4xf32>
     // CHECK-DAG:    %[[VR:.+]] = tensor.extract %[[RHS]][%[[I]], %[[X]], %[[Y]], %[[O]]] : tensor<4x3x5x16xf32>
     // CHECK:        %[[MUL:.+]] = arith.mulf %[[VL]], %[[VR]] : f32
     // CHECK-NEXT:   %[[ADD:.+]] = arith.addf %[[ACC]], %[[MUL]] : f32
@@ -1178,8 +1179,7 @@ TEST_F(ElementalHloToMlirTest, ConvolutionWithBatchGroupCount) {
     // CHECK-NEXT: } else {
     // CHECK-NEXT:   scf.yield %[[ACC]] : f32
     // CHECK-NEXT: }
-    // CHECK-NEXT: scf.yield %[[R4]] : f32
-    // CHECK:      scf.yield %[[R3]] : f32
+    // CHECK-NEXT: scf.yield %[[R3]] : f32
     // CHECK:      scf.yield %[[R2]] : f32
     // CHECK:      scf.yield %[[R1]] : f32
     // CHECK:      return %[[R0]] : f32

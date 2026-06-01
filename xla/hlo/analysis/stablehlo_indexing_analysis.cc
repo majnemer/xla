@@ -239,9 +239,15 @@ Shape GetShape(Value value) {
 
   // Build symbolic expressions for kernel spatial and output dimensions.
   llvm::SmallVector<SymbolicExpr> kernel_exprs(rank);
+  auto window_reversal = conv.getWindowReversal();
   for (int i = 0; i < spatial_rank; ++i) {
-    kernel_exprs[dnums.getKernelSpatialDimensions()[i]] =
-        CreateSymbolExpr(i, rank, context);
+    SymbolicExpr window_symbol = CreateSymbolExpr(i, rank, context);
+    if (window_reversal && (*window_reversal)[i]) {
+      window_symbol =
+          CreateSymbolicConstant(kernel_spatial_sizes[i] - 1, context) -
+          window_symbol;
+    }
+    kernel_exprs[dnums.getKernelSpatialDimensions()[i]] = window_symbol;
   }
   SymbolicExpr dim_expr =
       CreateDimExpr(dnums.getOutputFeatureDimension(), context);
@@ -276,16 +282,18 @@ Shape GetShape(Value value) {
                     input_feature;
   }
 
-  // With multiple batch groups, the input batch dimension is equally split.
+  // With multiple batch groups, the input batch dimension is equally split and
+  // the output feature dimension is concatenated across the batch groups.
   SymbolicExpr batch_dim_expr =
       CreateDimExpr(dnums.getOutputBatchDimension(), context);
   if (conv.getBatchGroupCount() > 1) {
     int64_t batch_group_size =
         output_shape.dimensions(dnums.getOutputBatchDimension());
+    int64_t output_feature_group_size =
+        output_shape.dimensions(dnums.getOutputFeatureDimension()) /
+        static_cast<int64_t>(conv.getBatchGroupCount());
     SymbolicExpr batch_group_expr =
-        CreateSymbolExpr(input_symbols.size(), rank, context);
-    input_symbols.push_back(IndexingMap::Variable{
-        {0, static_cast<int64_t>(conv.getBatchGroupCount()) - 1}});
+        dim_expr.floorDiv(output_feature_group_size);
     input_exprs[dnums.getInputBatchDimension()] =
         batch_group_expr * batch_group_size + batch_dim_expr;
   } else {

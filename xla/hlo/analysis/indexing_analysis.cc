@@ -809,8 +809,13 @@ HloInstructionIndexing ComputeOutputToInputConvolutionOpIndexing(
   // Build symbolic expressions for kernel spatial and output dimensions.
   SmallVector<SymbolicExpr> kernel_exprs(rank);
   for (int i = 0; i < spatial_rank; ++i) {
-    kernel_exprs[dnums.kernel_spatial_dimensions(i)] =
-        CreateSymbolExpr(i, rank, mlir_context);
+    SymbolicExpr window_symbol = CreateSymbolExpr(i, rank, mlir_context);
+    if (convolution->window().dimensions(i).window_reversal()) {
+      window_symbol =
+          CreateSymbolicConstant(kernel_spatial_sizes[i] - 1, mlir_context) -
+          window_symbol;
+    }
+    kernel_exprs[dnums.kernel_spatial_dimensions(i)] = window_symbol;
   }
   SymbolicExpr dim_expr =
       CreateDimExpr(dnums.output_feature_dimension(), mlir_context);
@@ -845,16 +850,18 @@ HloInstructionIndexing ComputeOutputToInputConvolutionOpIndexing(
                     input_feature;
   }
 
-  // With multiple batch groups, the input batch dimension is equally split.
+  // With multiple batch groups, the input batch dimension is equally split and
+  // the output feature dimension is concatenated across the batch groups.
   SymbolicExpr batch_dim_expr =
       CreateDimExpr(dnums.output_batch_dimension(), mlir_context);
   if (convolution->batch_group_count() > 1) {
     int64_t batch_group_size =
         output_shape.dimensions(dnums.output_batch_dimension());
+    int64_t output_feature_group_size =
+        output_shape.dimensions(dnums.output_feature_dimension()) /
+        convolution->batch_group_count();
     SymbolicExpr batch_group_expr =
-        CreateSymbolExpr(input_symbols.size(), rank, mlir_context);
-    input_symbols.push_back(
-        IndexingMap::Variable{{0, convolution->batch_group_count() - 1}});
+        dim_expr.floorDiv(output_feature_group_size);
     input_exprs[dnums.input_batch_dimension()] =
         batch_group_expr * batch_group_size + batch_dim_expr;
   } else {
