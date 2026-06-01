@@ -257,6 +257,42 @@ TEST(TranslateToMSL, EmitsUsedGpuShuffleValidResult) {
   EXPECT_NE(result.source().find(" = true;"), std::string::npos);
 }
 
+TEST(TranslateToMSL, EmitsSingleElementVectorBitcastAsScalar) {
+  auto ctx = MakeMlirContext();
+  constexpr absl::string_view kInput = R"mlir(
+    module {
+      func.func @split_join_u64(
+          %src: tensor<1xi64> {xla.slice_index = 0 : i64},
+          %dst: tensor<1xi64> {xla.slice_index = 1 : i64})
+          -> tensor<1xi64> attributes {xla.entry} {
+        %i = arith.constant 0 : index
+        %x = tensor.extract %src[%i] : tensor<1xi64>
+        %v1 = vector.broadcast %x : i64 to vector<1xi64>
+        %v2 = vector.bitcast %v1 : vector<1xi64> to vector<2xi32>
+        %lo = vector.extract %v2[0] : i32 from vector<2xi32>
+        %hi = vector.extract %v2[1] : i32 from vector<2xi32>
+        %v3 = vector.from_elements %lo, %hi : vector<2xi32>
+        %v4 = vector.bitcast %v3 : vector<2xi32> to vector<1xi64>
+        %y = vector.extract %v4[0] : i64 from vector<1xi64>
+        %out = tensor.insert %y into %dst[%i] : tensor<1xi64>
+        return %out : tensor<1xi64>
+      }
+    }
+  )mlir";
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(kInput, ctx.get());
+  ASSERT_TRUE(module);
+
+  TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
+  EXPECT_EQ(result.source().find("long1"), std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find("int2"), std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find("as_type<int2>"), std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find("as_type<long>"), std::string::npos)
+      << result.source();
+}
+
 TEST(TranslateToMSL, RejectsMissingEntryAttribute) {
   auto ctx = MakeMlirContext();
   constexpr absl::string_view kInput = R"mlir(

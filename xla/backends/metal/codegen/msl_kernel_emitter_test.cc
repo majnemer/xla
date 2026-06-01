@@ -23,6 +23,7 @@ limitations under the License.
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -38,7 +39,8 @@ namespace {
 std::unique_ptr<mlir::MLIRContext> MakeMlirContext() {
   mlir::DialectRegistry registry;
   registry.insert<mlir::arith::ArithDialect, mlir::func::FuncDialect,
-                  mlir::math::MathDialect, mlir::tensor::TensorDialect>();
+                  mlir::math::MathDialect, mlir::tensor::TensorDialect,
+                  mlir::vector::VectorDialect>();
   return std::make_unique<mlir::MLIRContext>(registry);
 }
 
@@ -98,6 +100,40 @@ TEST(MslKernelEmitter, ExpandsLog1pBeforeTranslation) {
   EXPECT_EQ(result.source().find("__xla_log1p"), std::string::npos)
       << result.source();
   EXPECT_NE(result.source().find("metal::log("), std::string::npos)
+      << result.source();
+}
+
+TEST(MslKernelEmitter, EmitsSingleElementVectorTransfersAsScalars) {
+  auto ctx = MakeMlirContext();
+  constexpr absl::string_view kInput = R"mlir(
+    module {
+      func.func @v1(%a: tensor<1xi64> {xla.slice_index = 0 : i64},
+                    %b: tensor<1xi64> {xla.slice_index = 1 : i64})
+          -> tensor<1xi64> attributes {xla.entry} {
+        %c0 = arith.constant 0 : index
+        %pad = arith.constant 0 : i64
+        %one = arith.constant 1 : i64
+        %v = vector.transfer_read %a[%c0], %pad {in_bounds = [true]}
+            : tensor<1xi64>, vector<1xi64>
+        %x = vector.extract %v[0] : i64 from vector<1xi64>
+        %y = arith.addi %x, %one : i64
+        %out = vector.from_elements %y : vector<1xi64>
+        %r = vector.transfer_write %out, %b[%c0] {in_bounds = [true]}
+            : vector<1xi64>, tensor<1xi64>
+        return %r : tensor<1xi64>
+      }
+    }
+  )mlir";
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(kInput, ctx.get());
+  ASSERT_TRUE(module);
+
+  TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, EmitMslKernel(*module));
+  EXPECT_EQ(result.source().find("long1"), std::string::npos)
+      << result.source();
+  EXPECT_EQ(result.source().find("int2"), std::string::npos) << result.source();
+  EXPECT_NE(result.source().find("const device long*"), std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find("device long*"), std::string::npos)
       << result.source();
 }
 

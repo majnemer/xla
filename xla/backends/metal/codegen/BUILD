@@ -89,6 +89,7 @@ cc_test(
         "@llvm-project//mlir:MathDialect",
         "@llvm-project//mlir:Parser",
         "@llvm-project//mlir:TensorDialect",
+        "@llvm-project//mlir:VectorDialect",
     ],
 )
 
