@@ -17,17 +17,33 @@ limitations under the License.
 #define XLA_BACKENDS_METAL_CODEGEN_MSL_KERNEL_EMITTER_H_
 
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "xla/backends/metal/codegen/msl_kernel_source.h"
 #include "xla/backends/metal/codegen/translate_to_msl.h"
 
 namespace xla {
+
+class HloModule;
+class NameUniquer;
+
 namespace metal {
 
 // Runs the Metal-specific MLIR pass pipeline on `module`, then translates
 // the entry-point func.func to MSL via TranslateToMSL. The input module is
 // mutated in place by the pipeline.
 absl::StatusOr<MslKernelSource> EmitMslKernel(mlir::ModuleOp module);
+
+// Same as above, but uses `function_name_uniquer` for emitted MSL function
+// names. Share a uniquer across calls when concatenating the returned sources.
+absl::StatusOr<MslKernelSource> EmitMslKernel(
+    mlir::ModuleOp module, NameUniquer* function_name_uniquer);
+
+// Same as above, but enables CUDA-style MLIR pass dumps when requested by
+// XLA's dump flags.
+absl::StatusOr<MslKernelSource> EmitMslKernel(
+    mlir::ModuleOp module, NameUniquer* function_name_uniquer,
+    const HloModule& hlo_module, absl::string_view entry_function_name);
 
 }  // namespace metal
 }  // namespace xla
