@@ -638,10 +638,9 @@ TEST_F(ElementalHloToMlirTest, DotWithBF16Type) {
     // CHECK:          %[[IF0:.*]] = scf.if %[[I_J_IN_RANGE]] -> (f32) {
     // CHECK-DAG:        %[[A_I_K:.*]] = tensor.extract %[[A]][%[[I]], %[[K]]] : tensor<3x4xbf16>
     // CHECK-DAG:        %[[B_K_J:.*]] = tensor.extract %[[B]][%[[K]], %[[J]]] : tensor<4x5xbf16>
-    // CHECK-DAG:        %[[A_I_K_F32:.*]] = arith.extf %[[A_I_K]] :  bf16 to f32
-    // CHECK-DAG:        %[[B_K_J_F32:.*]] = arith.extf %[[B_K_J]] :  bf16 to f32
-    // CHECK-DAG:        %[[MULF0:.*]] = arith.mulf %[[A_I_K_F32]], %[[B_K_J_F32]] : f32
-    // CHECK-DAG:        %[[ADDF0:.*]] = arith.addf %[[ACCUM]], %[[MULF0]] : f32
+    // CHECK:            %[[MULF0:.*]] = arith.mulf %[[A_I_K]], %[[B_K_J]] : bf16
+    // CHECK-NEXT:       %[[MULF0_F32:.*]] = arith.extf %[[MULF0]] : bf16 to f32
+    // CHECK-NEXT:       %[[ADDF0:.*]] = arith.addf %[[ACCUM]], %[[MULF0_F32]] : f32
     // CHECK-DAG:        scf.yield %[[ADDF0]] : f32
     // CHECK:          } else {
     // CHECK:            scf.yield %[[ACCUM]] : f32
@@ -886,6 +885,36 @@ TEST_F(ElementalHloToMlirTest, ConvolutionSimple) {
     // CHECK:      scf.yield %[[R2]] : f32
     // CHECK:      scf.yield %[[R1]] : f32
     // CHECK:      return %[[R0]] : f32
+  )"));
+}
+
+TEST_F(ElementalHloToMlirTest, F16ConvolutionAccumulatesInF32ByDefault) {
+  TF_EXPECT_OK(Run(R"(
+    ENTRY main {
+      p0 = f16[1,4,4] parameter(0)
+      p1 = f16[4,4,1] parameter(1)
+      ROOT conv = f16[1,1,1] convolution(p0, p1), window={size=4}, dim_labels=b0f_0io->b0f
+    })",
+                   R"(
+    // CHECK:      @main_conv(
+    // CHECK-SAME: %[[LHS:.+]]: tensor<1x4x4xf16>, %[[RHS:.*]]: tensor<4x4x1xf16>
+    // CHECK-SAME: -> f16
+    // CHECK:      %[[INIT:.+]] = arith.constant 0.000000e+00 : f32
+    // CHECK:      %[[R0:.+]] = scf.for
+    // CHECK-SAME:   iter_args(%[[A0:.+]] = %[[INIT]]) -> (f32) {
+    // CHECK:      %[[R1:.+]] = scf.for
+    // CHECK-SAME:   iter_args(%[[ACC:.+]] = %[[A0]]) -> (f32) {
+    // CHECK:      %[[IF:.+]] = scf.if {{.+}} -> (f32) {
+    // CHECK-DAG:    %[[VL:.+]] = tensor.extract %[[LHS]]{{.*}} : tensor<1x4x4xf16>
+    // CHECK-DAG:    %[[VR:.+]] = tensor.extract %[[RHS]]{{.*}} : tensor<4x4x1xf16>
+    // CHECK:        %[[MUL:.+]] = arith.mulf %[[VL]], %[[VR]] : f16
+    // CHECK-NEXT:   %[[MUL_F32:.+]] = arith.extf %[[MUL]] : f16 to f32
+    // CHECK-NEXT:   %[[ADD:.+]] = arith.addf %[[ACC]], %[[MUL_F32]] : f32
+    // CHECK:        scf.yield %[[ADD]] : f32
+    // CHECK:      scf.yield %[[IF]] : f32
+    // CHECK:      scf.yield %[[R1]] : f32
+    // CHECK:      %[[TRUNC:.+]] = arith.truncf %[[R0]] : f32 to f16
+    // CHECK:      return %[[TRUNC]] : f16
   )"));
 }
 

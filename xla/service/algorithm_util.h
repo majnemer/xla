@@ -17,6 +17,7 @@ limitations under the License.
 #define XLA_SERVICE_ALGORITHM_UTIL_H_
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "absl/status/statusor.h"
@@ -38,8 +39,8 @@ namespace algorithm_util {
 absl::StatusOr<stream_executor::blas::ComputationType> GetBlasComputationType(
     PrecisionConfig::Algorithm algorithm);
 
-// Returns the list of types that are allowed for the dot operands of the given
-// algorithm. The expectation is always that both dot operands use the same
+// Returns the list of types that are allowed for the GEMM operands of the given
+// algorithm. The expectation is always that both GEMM operands use the same
 // type.
 //
 // Algorithms mostly expect that their input and output types correspond to
@@ -54,9 +55,20 @@ absl::StatusOr<stream_executor::blas::ComputationType> GetBlasComputationType(
 absl::StatusOr<std::vector<PrimitiveType>> GetAllowedOperandsTypeForAlgorithm(
     PrecisionConfig::Algorithm algorithm);
 
-// Get the accumulator type of an algorithm.
-absl::StatusOr<PrimitiveType> GetDotAccumulatorType(
+// Get the accumulator type of a GEMM algorithm.
+absl::StatusOr<PrimitiveType> GetGemmAccumulatorType(
     PrecisionConfig::Algorithm algorithm);
+
+// Returns the type that GEMM operands should be cast to before multiplication,
+// if the algorithm requires one.
+absl::StatusOr<std::optional<PrimitiveType>> GetGemmOperandType(
+    const HloInstruction& instr);
+
+// Gets the accumulator type for a GEMM operation. Uses the accumulator type
+// specified by `algorithm` when one is set; otherwise infers the default
+// accumulator from the instruction's operand and output types.
+absl::StatusOr<PrimitiveType> GetGemmAccumulatorType(
+    const HloInstruction& instr);
 
 // Are the AType & BType TF32?
 bool HasTf32InputType(PrecisionConfig::Algorithm algorithm);

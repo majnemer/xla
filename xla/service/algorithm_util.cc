@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/service/algorithm_util.h"
 
 #include <cstdint>
+#include <optional>
 #include <variant>
 #include <vector>
 
@@ -23,6 +24,7 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "xla/hlo/ir/hlo_instructions.h"
+#include "xla/hlo/ir/hlo_module.h"
 #include "xla/primitive_util.h"
 #include "xla/stream_executor/blas.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
@@ -35,6 +37,42 @@ namespace algorithm_util {
 
 namespace {
 namespace se = stream_executor;
+
+bool IsAllowedOperandType(PrimitiveType type,
+                          const std::vector<PrimitiveType>& allowed_types) {
+  for (PrimitiveType allowed_type : allowed_types) {
+    if (type == allowed_type) {
+      return true;
+    }
+  }
+  return false;
+}
+
+absl::StatusOr<PrimitiveType> GetAlgUnsetGemmAccumulatorType(
+    const HloInstruction& instr) {
+  const PrimitiveType lhs_type = instr.operand(0)->shape().element_type();
+  const PrimitiveType rhs_type = instr.operand(1)->shape().element_type();
+  const PrimitiveType output_type = instr.shape().element_type();
+
+  if (!primitive_util::IsFloatingPointType(output_type)) {
+    return output_type;
+  }
+
+  // NVIDIA GPUs support mixed f8 matmuls, e.g. e4m3 x e5m2, with f32
+  // accumulation.
+  if (primitive_util::IsF8Type(lhs_type) &&
+      primitive_util::IsF8Type(rhs_type)) {
+    return F32;
+  }
+
+  if (lhs_type != rhs_type) {
+    return absl::FailedPreconditionError(absl::StrFormat(
+        "Expected ALG_UNSET GEMM operands to have the same type, got %s and %s",
+        PrimitiveType_Name(lhs_type), PrimitiveType_Name(rhs_type)));
+  }
+
+  return output_type == F64 && lhs_type == F64 ? F64 : F32;
+}
 }  // namespace
 
 absl::StatusOr<se::blas::ComputationType> GetBlasComputationType(
@@ -108,12 +146,12 @@ absl::StatusOr<std::vector<PrimitiveType>> GetAllowedOperandsTypeForAlgorithm(
     default:
       break;
   }
-  return absl::InternalError(
-      absl::StrFormat("GetDotAccumulatorType: unsupported algorithm %s",
-                      xla::PrecisionConfig::Algorithm_Name(algorithm)));
+  return absl::InternalError(absl::StrFormat(
+      "GetAllowedOperandsTypeForAlgorithm: unsupported algorithm %s",
+      xla::PrecisionConfig::Algorithm_Name(algorithm)));
 }
 
-absl::StatusOr<PrimitiveType> GetDotAccumulatorType(
+absl::StatusOr<PrimitiveType> GetGemmAccumulatorType(
     PrecisionConfig::Algorithm algorithm) {
   // All dot algorithms should be listed here.
   switch (algorithm) {
@@ -137,9 +175,68 @@ absl::StatusOr<PrimitiveType> GetDotAccumulatorType(
     case PrecisionConfig::ALG_UNSET:
     default:
       return absl::InternalError(
-          absl::StrFormat("GetDotAccumulatorType: unsupported algorithm %s",
+          absl::StrFormat("GetGemmAccumulatorType: unsupported algorithm %s",
                           xla::PrecisionConfig::Algorithm_Name(algorithm)));
   }
+}
+
+absl::StatusOr<std::optional<PrimitiveType>> GetGemmOperandType(
+    const HloInstruction& instr) {
+  const PrecisionConfig::Algorithm algorithm =
+      instr.precision_config().algorithm();
+  const PrimitiveType lhs_type = instr.operand(0)->shape().element_type();
+  const PrimitiveType rhs_type = instr.operand(1)->shape().element_type();
+
+  if (algorithm == PrecisionConfig::ALG_UNSET) {
+    if (lhs_type != rhs_type) {
+      return std::nullopt;
+    }
+    if (lhs_type == F32 && instr.GetModule()
+                               ->config()
+                               .debug_options()
+                               .xla_gpu_default_to_alg_dot_bf16_bf16_f32()) {
+      return BF16;
+    }
+    return lhs_type;
+  }
+
+  absl::StatusOr<std::vector<PrimitiveType>> allowed_operand_types_or =
+      GetAllowedOperandsTypeForAlgorithm(algorithm);
+  if (!allowed_operand_types_or.ok()) {
+    return allowed_operand_types_or.status();
+  }
+  std::vector<PrimitiveType> allowed_operand_types =
+      *std::move(allowed_operand_types_or);
+  if (allowed_operand_types.empty()) {
+    return absl::InternalError(absl::StrFormat(
+        "GetGemmOperandType: no allowed operand types for algorithm %s",
+        PrecisionConfig::Algorithm_Name(algorithm)));
+  }
+
+  if (allowed_operand_types.size() == 1) {
+    return allowed_operand_types.front();
+  }
+
+  if (lhs_type != rhs_type ||
+      !IsAllowedOperandType(lhs_type, allowed_operand_types)) {
+    return absl::FailedPreconditionError(absl::StrFormat(
+        "Expected GEMM operands to both have the same type, and for this type "
+        "to be allowed by algorithm %s, but got %s and %s",
+        PrecisionConfig::Algorithm_Name(algorithm),
+        PrimitiveType_Name(lhs_type), PrimitiveType_Name(rhs_type)));
+  }
+
+  return std::nullopt;
+}
+
+absl::StatusOr<PrimitiveType> GetGemmAccumulatorType(
+    const HloInstruction& instr) {
+  const PrecisionConfig::Algorithm algorithm =
+      instr.precision_config().algorithm();
+  if (algorithm != PrecisionConfig::ALG_UNSET) {
+    return GetGemmAccumulatorType(algorithm);
+  }
+  return GetAlgUnsetGemmAccumulatorType(instr);
 }
 
 bool HasTf32InputType(PrecisionConfig::Algorithm algorithm) {

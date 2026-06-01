@@ -498,7 +498,7 @@ CodegenDecision AreDotAlgorithmInputAndOutputConversionsSupported(
   absl::StatusOr<std::vector<PrimitiveType>> allowed_operands_types_or =
       algorithm_util::GetAllowedOperandsTypeForAlgorithm(algorithm);
   absl::StatusOr<PrimitiveType> expected_accumulator_type =
-      algorithm_util::GetDotAccumulatorType(algorithm);
+      algorithm_util::GetGemmAccumulatorType(algorithm);
   if (!allowed_operands_types_or.ok() || !expected_accumulator_type.ok()) {
     return forbid("Failed to recover operands types or accumulator type");
   }

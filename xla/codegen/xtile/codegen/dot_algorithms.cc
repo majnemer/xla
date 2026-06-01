@@ -17,17 +17,12 @@ limitations under the License.
 
 #include <cstdint>
 #include <optional>
-#include <string>
 #include <utility>
 #include <vector>
 
-#include "absl/algorithm/container.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
-#include "absl/strings/str_cat.h"
-#include "absl/strings/str_join.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
@@ -40,7 +35,6 @@ limitations under the License.
 #include "xla/codegen/xtile/ir/xtile_ops.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
-#include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/translate/hlo_to_mhlo/attribute_importer.h"
 #include "xla/service/algorithm_util.h"
 #include "xla/tsl/platform/statusor.h"
@@ -142,124 +136,25 @@ Value EmitStableHloDotAndAdd(mlir::ImplicitLocOpBuilder& b, Value lhs,
 
 }  // namespace
 
-absl::StatusOr<Type> GetAlgUnsetAccumulatorType(mlir::ImplicitLocOpBuilder& b,
-                                                const HloDotInstruction& dot) {
-  ASSIGN_OR_RETURN(
-      Type lhs_type,
-      PrimitiveTypeToMlirType(b, dot.operand(0)->shape().element_type()));
-  ASSIGN_OR_RETURN(
-      Type rhs_type,
-      PrimitiveTypeToMlirType(b, dot.operand(1)->shape().element_type()));
-  ASSIGN_OR_RETURN(Type accumulator_type,
-                   PrimitiveTypeToMlirType(b, dot.shape().element_type()));
-
-  // The code below assumes that lhs and rhs have the same type. However
-  // this may not always be the case with f8 matmuls, e.g. e4m3×e5m2 is
-  // supported at the hardware level. NVIDIA GPUs currently only support f32
-  // accumulators for such matmuls.
-  if (lhs_type.isFloat(8) && rhs_type.isFloat(8)) {
-    return b.getF32Type();
-  }
-
-  CHECK(lhs_type == rhs_type);
-
-  // Currently allowing 8x8-bit ints -> i32.
-  if (lhs_type == b.getIntegerType(8) && accumulator_type.isInteger(32)) {
-    return b.getI32Type();
-  }
-  return (accumulator_type.isF64() && lhs_type.isF64()) ? b.getF64Type()
-                                                        : b.getF32Type();
-}
-
-absl::StatusOr<std::optional<Type>> DotDefaultOperandsType(
-    mlir::ImplicitLocOpBuilder& b, const HloDotInstruction& dot) {
-  ASSIGN_OR_RETURN(
-      Type lhs_type,
-      PrimitiveTypeToMlirType(b, dot.operand(0)->shape().element_type()));
-  ASSIGN_OR_RETURN(
-      Type rhs_type,
-      PrimitiveTypeToMlirType(b, dot.operand(1)->shape().element_type()));
-
-  if (lhs_type != rhs_type) {
-    return std::nullopt;
-  }
-  if (!lhs_type.isFloat(32)) {
-    return std::nullopt;
-  }
-  auto debug_options = dot.GetModule()->config().debug_options();
-  for (int p : dot.precision_config().operand_precision()) {
-    if (p != PrecisionConfig::DEFAULT) {
-      return lhs_type;
-    }
-  }
-  if (debug_options.xla_gpu_default_to_alg_dot_bf16_bf16_f32()) {
-    return b.getBF16Type();
-  }
-  return lhs_type;
-}
-
 // Returns the `Type` that the dot operands should be casted to if there is a
-// clear candidate. Raises an error if there are multiple allowed choices but
-// the operands do not already conform to any of them. Returns `std::nullopt` if
-// no casting is a priori needed.
+// clear candidate. Returns `std::nullopt` if no casting is a priori needed.
 absl::StatusOr<std::optional<Type>> GetForceOperandsType(
-    mlir::ImplicitLocOpBuilder& b, const HloDotInstruction& dot,
-    const DotOperands& dot_operands) {
-  PrecisionConfig::Algorithm algorithm = dot.precision_config().algorithm();
-  if (algorithm == PrecisionConfig::ALG_UNSET) {
-    return DotDefaultOperandsType(b, dot);
+    mlir::ImplicitLocOpBuilder& b, const HloDotInstruction& dot) {
+  TF_ASSIGN_OR_RETURN(std::optional<PrimitiveType> operands_type,
+                      algorithm_util::GetGemmOperandType(dot));
+  if (!operands_type.has_value()) {
+    return std::nullopt;
   }
-
-  ASSIGN_OR_RETURN(
-      std::vector<PrimitiveType> allowed_operands_primitive_types,
-      algorithm_util::GetAllowedOperandsTypeForAlgorithm(algorithm));
-  CHECK(!allowed_operands_primitive_types.empty());
-
-  std::vector<Type> allowed_operands_types;
-  allowed_operands_types.reserve(allowed_operands_primitive_types.size());
-  for (PrimitiveType primitive_type : allowed_operands_primitive_types) {
-    ASSIGN_OR_RETURN(Type type, PrimitiveTypeToMlirType(b, primitive_type));
-    allowed_operands_types.push_back(type);
-  }
-
-  Type lhs_type = ElementType(dot_operands.lhs);
-  Type rhs_type = ElementType(dot_operands.rhs);
-  if (allowed_operands_types.size() == 1) {
-    // If there is a single allowed operand type, we force the operands to use
-    // this type.
-    return allowed_operands_types.front();
-  }
-
-  // If there are several allowed operand types, we just check that the
-  // operands have the same type, and that this type is one of the allowed
-  // ones. Raise an error otherwise.
-  if (lhs_type != rhs_type ||
-      !absl::c_linear_search(allowed_operands_types, lhs_type)) {
-    std::string allowed_operands_types_str = absl::StrJoin(
-        allowed_operands_types, ", ",
-        [&](std::string* out, Type type) { absl::StrAppend(out, type); });
-    return absl::FailedPreconditionError(absl::StrCat(
-        "Expected dot operands to both have the same type, and for this type "
-        "to be one of the following types: ",
-        allowed_operands_types_str, " but got ", lhs_type, " and ", rhs_type));
-  }
-
-  return std::nullopt;
+  TF_ASSIGN_OR_RETURN(Type type, PrimitiveTypeToMlirType(b, *operands_type));
+  return type;
 }
 
 }  // namespace
 
 absl::StatusOr<Type> GetDotAccumulatorType(mlir::ImplicitLocOpBuilder& b,
                                            const HloDotInstruction& dot) {
-  const PrecisionConfig::Algorithm algorithm =
-      dot.precision_config().algorithm();
-
-  if (algorithm == PrecisionConfig::ALG_UNSET) {
-    return GetAlgUnsetAccumulatorType(b, dot);
-  }
-
-  ASSIGN_OR_RETURN(PrimitiveType accumulator_type,
-                   algorithm_util::GetDotAccumulatorType(algorithm));
+  TF_ASSIGN_OR_RETURN(PrimitiveType accumulator_type,
+                      algorithm_util::GetGemmAccumulatorType(dot));
   return PrimitiveTypeToMlirType(b, accumulator_type);
 }
 
@@ -274,10 +169,11 @@ absl::StatusOr<Value> EmitSingleTileDot(mlir::ImplicitLocOpBuilder& b,
       XlaPrecisionToStableHloPrecision(
           dot.precision_config().operand_precision(1))};
 
-  ASSIGN_OR_RETURN(std::optional<Type> force_operands_type,
-                   GetForceOperandsType(b, dot, dot_operands));
+  TF_ASSIGN_OR_RETURN(std::optional<Type> force_operands_type,
+                      GetForceOperandsType(b, dot));
 
-  ASSIGN_OR_RETURN(Type force_accumulator_type, GetDotAccumulatorType(b, dot));
+  TF_ASSIGN_OR_RETURN(Type force_accumulator_type,
+                      GetDotAccumulatorType(b, dot));
 
   if (force_operands_type.has_value()) {
     if (ElementType(dot_operands.lhs) != *force_operands_type) {
