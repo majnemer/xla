@@ -12,5 +12,6 @@ lit_test_suite(
     tools = [
         "//xla/codegen/tools:emitters_opt",
         "@llvm-project//llvm:FileCheck",
+        "@llvm-project//llvm:not",
     ],
 )
