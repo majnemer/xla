@@ -184,8 +184,11 @@ absl::StatusOr<id<MTLLibrary>> MetalExecutor::LoadLibraryFromMsl(
       return absl::InvalidArgumentError(
           "MetalExecutor::LoadLibraryFromMsl: MSL source is not valid UTF-8.");
     }
+    MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+    options.fastMathEnabled = NO;
     NSError* error = nil;
-    library = [device newLibraryWithSource:source_ns options:nil error:&error];
+    library =
+        [device newLibraryWithSource:source_ns options:options error:&error];
     if (library == nil) {
       NSString* msg = error == nil ? @"(no error info)" : [error description];
       return absl::InternalError(
