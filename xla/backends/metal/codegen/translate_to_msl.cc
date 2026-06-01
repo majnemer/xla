@@ -288,9 +288,11 @@ class MslEmitter {
  public:
   explicit MslEmitter(
       mlir::raw_indented_ostream& os,
-      llvm::StringMap<std::string> emitted_function_names = {})
+      llvm::StringMap<std::string> emitted_function_names = {},
+      llvm::StringMap<std::string> emitted_result_type_names = {})
       : os_(os),
-        emitted_function_names_(std::move(emitted_function_names)) {}
+        emitted_function_names_(std::move(emitted_function_names)),
+        emitted_result_type_names_(std::move(emitted_result_type_names)) {}
 
   // The entry: a `kernel void` whose results land in output buffers.
   absl::Status EmitFunction(mlir::func::FuncOp func) {
@@ -331,6 +333,20 @@ class MslEmitter {
     return absl::OkStatus();
   }
 
+  absl::Status EmitDeviceFunctionResultType(mlir::func::FuncOp func) {
+    auto results = func.getFunctionType().getResults();
+    if (results.size() < 2) return absl::OkStatus();
+    os_ << "struct " << EmittedFunctionResultTypeName(func) << " {\n";
+    os_.indent();
+    for (auto [i, result] : llvm::enumerate(results)) {
+      TF_ASSIGN_OR_RETURN(std::string ty, TypeToMSL(result));
+      os_ << ty << " result" << i << ";\n";
+    }
+    os_.unindent();
+    os_ << "};\n";
+    return absl::OkStatus();
+  }
+
   absl::Status EmitFuncCall(mlir::func::CallOp op) {
     std::string call = absl::StrCat(EmittedFunctionName(op.getCallee()), "(");
     for (unsigned i = 0; i < op.getNumOperands(); ++i) {
@@ -349,8 +365,15 @@ class MslEmitter {
       os_ << ty << " " << name << " = " << call << ";\n";
       return absl::OkStatus();
     }
-    return absl::UnimplementedError(
-        "func.call returning multiple values is not yet supported.");
+    std::string result_type = EmittedFunctionResultTypeName(op.getCallee());
+    std::string result = CreateFreshName();
+    os_ << result_type << " " << result << " = " << call << ";\n";
+    for (auto [i, value] : llvm::enumerate(op.getResults())) {
+      TF_ASSIGN_OR_RETURN(std::string ty, TypeToMSL(value.getType()));
+      std::string name = BindValueName(value);
+      os_ << ty << " " << name << " = " << result << ".result" << i << ";\n";
+    }
+    return absl::OkStatus();
   }
 
   absl::Status EmitFuncReturn(mlir::func::ReturnOp op) {
@@ -366,8 +389,16 @@ class MslEmitter {
       os_ << "return " << v << ";\n";
       return absl::OkStatus();
     }
-    return absl::UnimplementedError(
-        "device function returning multiple values is not yet supported.");
+    auto func = op->getParentOfType<mlir::func::FuncOp>();
+    CHECK(func != nullptr) << "func.return is not nested in func.func";
+    os_ << "return " << EmittedFunctionResultTypeName(func) << "{";
+    for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+      if (i > 0) os_ << ", ";
+      TF_ASSIGN_OR_RETURN(std::string v, GetName(op.getOperand(i)));
+      os_ << v;
+    }
+    os_ << "};\n";
+    return absl::OkStatus();
   }
 
  private:
@@ -446,8 +477,7 @@ class MslEmitter {
     } else if (results.size() == 1) {
       TF_ASSIGN_OR_RETURN(ret, TypeToMSL(results[0]));
     } else {
-      return absl::UnimplementedError(
-          "device function with multiple results is not yet supported.");
+      ret = EmittedFunctionResultTypeName(func);
     }
     os_ << ret << " " << EmittedFunctionName(func) << "(";
     for (unsigned i = 0; i < func.getNumArguments(); ++i) {
@@ -1350,10 +1380,6 @@ class MslEmitter {
                         VectorTypeToMSL(op.getResult().getType()));
     std::string name = BindValueName(op.getResult());
     if (IsSingleElementVector(op.getResult().getType())) {
-      if (op.getElements().size() != 1) {
-        return absl::InternalError(
-            "vector.from_elements vector<1xT> must have one element.");
-      }
       TF_ASSIGN_OR_RETURN(std::string elt_name, GetName(op.getElements()[0]));
       os_ << vec_ty << " " << name << " = " << elt_name << ";\n";
       return absl::OkStatus();
@@ -1781,6 +1807,17 @@ class MslEmitter {
     return it->second;
   }
 
+  std::string EmittedFunctionResultTypeName(mlir::func::FuncOp func) const {
+    return EmittedFunctionResultTypeName(func.getName());
+  }
+
+  std::string EmittedFunctionResultTypeName(llvm::StringRef name) const {
+    auto it = emitted_result_type_names_.find(name);
+    CHECK(it != emitted_result_type_names_.end())
+        << "Missing emitted result type name for " << name.str();
+    return it->second;
+  }
+
   mlir::raw_indented_ostream& os_;
   llvm::DenseMap<mlir::Value, std::string> names_;
   llvm::DenseMap<mlir::Value, std::string> addr_spaces_;
@@ -1789,6 +1826,7 @@ class MslEmitter {
   // false while emitting a device function (func.return yields a value).
   bool in_entry_ = false;
   llvm::StringMap<std::string> emitted_function_names_;
+  llvm::StringMap<std::string> emitted_result_type_names_;
 };
 
 }  // namespace
@@ -1835,10 +1873,24 @@ absl::StatusOr<MslKernelSource> TranslateToMSL(
     emitted_function_names[helper.getName()] = GetUniqueMslHelperName(
         entry.getName(), helper.getName(), function_name_uniquer);
   }
+  llvm::StringMap<std::string> emitted_result_type_names;
+  bool has_multi_result_helper = false;
+  for (mlir::func::FuncOp helper : helpers) {
+    if (helper.getFunctionType().getResults().size() < 2) continue;
+    has_multi_result_helper = true;
+    emitted_result_type_names[helper.getName()] = GetUniqueMslFunctionName(
+        absl::StrCat(emitted_function_names[helper.getName()], "_result"),
+        function_name_uniquer);
+  }
 
-  MslEmitter emitter(os, std::move(emitted_function_names));
-  // Forward-declare every device function first so they can call one another
-  // regardless of emission order, then define them, then the entry kernel.
+  MslEmitter emitter(os, std::move(emitted_function_names),
+                     std::move(emitted_result_type_names));
+  // Emit result structs and forward declarations first so device functions may
+  // call one another regardless of emission order.
+  for (mlir::func::FuncOp helper : helpers) {
+    TF_RETURN_IF_ERROR(emitter.EmitDeviceFunctionResultType(helper));
+  }
+  if (has_multi_result_helper) os << "\n";
   for (mlir::func::FuncOp helper : helpers) {
     TF_RETURN_IF_ERROR(emitter.EmitDeviceFunctionDecl(helper));
   }

@@ -142,6 +142,54 @@ TEST(TranslateToMSL, PicksEntryFuncAmongMultipleFuncs) {
   EXPECT_EQ(result.source().find("float helper(float"), std::string::npos);
 }
 
+TEST(TranslateToMSL, EmitsDeviceFunctionWithMultipleResults) {
+  auto ctx = MakeMlirContext();
+  constexpr absl::string_view kInput = R"mlir(
+    module {
+      func.func private @split(%x: i32) -> (i32, i32) {
+        %one = arith.constant 1 : i32
+        %y = arith.addi %x, %one : i32
+        return %x, %y : i32, i32
+      }
+      func.func @multi_return(
+          %src: tensor<1xi32> {xla.slice_index = 0 : i64},
+          %dst0: tensor<1xi32> {xla.slice_index = 1 : i64},
+          %dst1: tensor<1xi32> {xla.slice_index = 2 : i64})
+          -> (tensor<1xi32>, tensor<1xi32>) attributes {xla.entry} {
+        %i = arith.constant 0 : index
+        %x = tensor.extract %src[%i] : tensor<1xi32>
+        %y0, %y1 = func.call @split(%x) : (i32) -> (i32, i32)
+        %out0 = tensor.insert %y0 into %dst0[%i] : tensor<1xi32>
+        %out1 = tensor.insert %y1 into %dst1[%i] : tensor<1xi32>
+        return %out0, %out1 : tensor<1xi32>, tensor<1xi32>
+      }
+    }
+  )mlir";
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(kInput, ctx.get());
+  ASSERT_TRUE(module);
+
+  TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
+  EXPECT_NE(result.source().find("struct multi_return_split_result"),
+            std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find("int result0;"), std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find("int result1;"), std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find(
+                "multi_return_split_result multi_return_split(int"),
+            std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find(
+                "return multi_return_split_result{arg0,"),
+            std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find(".result0"), std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find(".result1"), std::string::npos)
+      << result.source();
+}
+
 TEST(TranslateToMSL, MangledHelperNamesDoNotAliasAcrossEntries) {
   auto ctx = MakeMlirContext();
   constexpr absl::string_view kFooInput = R"mlir(
