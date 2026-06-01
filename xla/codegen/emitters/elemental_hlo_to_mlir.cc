@@ -558,8 +558,7 @@ absl::StatusOr<SmallVector<Value, 1>> EmitDotLoop(
         arith::ConstantOp::create(b, b.getZeroAttr(accumulator_type));
   }
 
-  // For convolutions with `batch_group_count` > 1, there is an additional
-  // symbol for LHS (group id) - ignore it for RHS.
+  // LHS and RHS indexing maps can use different symbol counts.
   size_t rhs_symbol_count = rhs_indexing_map.GetSymbolCount();
 
   auto body =
