@@ -21,6 +21,9 @@ limitations under the License.
 #include "xla/backends/metal/codegen/msl_kernel_source.h"
 
 namespace xla {
+
+class NameUniquer;
+
 namespace metal {
 
 // Emits MSL source for the entry-point func.func in `module` (the one
@@ -28,6 +31,12 @@ namespace metal {
 // from the tensor types; `[[buffer(N)]]` indices come from each argument's
 // xla.slice_index attribute.
 absl::StatusOr<MslKernelSource> TranslateToMSL(mlir::ModuleOp module);
+
+// Emits MSL source, using `function_name_uniquer` to make emitted MSL function
+// names unique. Callers that concatenate multiple translated modules into one
+// MSL translation unit should share a single uniquer across those calls.
+absl::StatusOr<MslKernelSource> TranslateToMSL(
+    mlir::ModuleOp module, NameUniquer* function_name_uniquer);
 
 }  // namespace metal
 }  // namespace xla

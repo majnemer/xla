@@ -39,6 +39,7 @@ limitations under the License.
 #include "xla/backends/metal/codegen/transforms/passes.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/codegen/emitters/transforms/passes.h"
+#include "xla/codegen/ir_printing.h"
 #include "xla/codegen/mlir_kernel_source.h"
 #include "xla/hlo/analysis/hlo_ordering.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
@@ -54,6 +55,7 @@ limitations under the License.
 #include "xla/service/call_graph.h"
 #include "xla/service/compiler.h"
 #include "xla/service/computation_placer.h"
+#include "xla/service/dump.h"
 #include "xla/service/float_support.h"
 #include "xla/service/gpu/alias_info.h"
 #include "xla/service/gpu/gpu_constants.h"
@@ -64,6 +66,7 @@ limitations under the License.
 #include "xla/service/llvm_ir/buffer_assignment_util.h"
 #include "xla/service/llvm_ir/llvm_util.h"
 #include "xla/service/logical_buffer.h"
+#include "xla/service/name_uniquer.h"
 #include "xla/service/shaped_slice.h"
 #include "xla/stream_executor/metal/metal_platform_id.h"
 #include "xla/stream_executor/stream_executor.h"
@@ -186,6 +189,7 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
   gpu::ThunkSequence thunks;
   std::vector<gpu::GpuExecutable::ConstantInfo> constants;
   std::string msl_blob;
+  NameUniquer msl_function_name_uniquer;
   for (const HloInstruction* instr :
        hlo_module->schedule().sequence(entry).instructions()) {
     switch (instr->opcode()) {
@@ -286,6 +290,11 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
           pm.addPass(CreateLowerSubByteStoragePass());
           pm.addPass(CreateLowerFloatStoragePass());
           pm.addPass(mlir::createLowerAffinePass());
+          std::string dump_kernel_name =
+              absl::StrCat(entry_name, ".metal-lowering");
+          EnableIRPrintingIfRequested(pm, mlir_source.module().getContext(),
+                                      *hlo_module, dump_kernel_name,
+                                      "mlir-fusion");
           if (mlir::failed(pm.run(mlir_source.module()))) {
             return absl::InternalError(absl::StrCat(
                 "MetalCompiler::CompileToBackendResult: MLIR lowering "
@@ -294,7 +303,10 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
           }
         }
         TF_ASSIGN_OR_RETURN(metal::MslKernelSource msl_source,
-                            metal::EmitMslKernel(mlir_source.module()));
+                            metal::EmitMslKernel(
+                                mlir_source.module(),
+                                &msl_function_name_uniquer, *hlo_module,
+                                entry_name));
         const gpu::LaunchDimensions launch_dims =
             mlir_fusion->launch_dimensions();
         if (!msl_blob.empty()) {
@@ -326,6 +338,9 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
 
   gpu::GpuExecutable::Params params;
   params.executable = std::make_unique<gpu::ThunkExecutor>(std::move(thunks));
+  if (DumpingEnabledForHloModule(*hlo_module)) {
+    DumpToFileInDirOrStdout(*hlo_module, "", "msl", msl_blob);
+  }
   params.asm_text = std::move(msl_blob);
   params.constants = std::move(constants);
   params.buffer_assignment = std::move(buffer_assignment);

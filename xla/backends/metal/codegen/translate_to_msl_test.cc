@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -34,6 +35,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/emitters/ir/xla_gpu_ops.h"
 #include "xla/backends/metal/codegen/msl_kernel_source.h"
 #include "xla/codegen/emitters/ir/xla_ops.h"
+#include "xla/service/name_uniquer.h"
 #include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/tsl/platform/statusor.h"
 
@@ -118,7 +120,11 @@ TEST(TranslateToMSL, PicksEntryFuncAmongMultipleFuncs) {
       }
       func.func @entry_kernel(%a: tensor<8xf32> {xla.slice_index = 0 : i64})
           -> tensor<8xf32> attributes {xla.entry} {
-        return %a : tensor<8xf32>
+        %c0 = arith.constant 0 : index
+        %x = tensor.extract %a[%c0] : tensor<8xf32>
+        %y = func.call @helper(%x) : (f32) -> f32
+        %out = tensor.insert %y into %a[%c0] : tensor<8xf32>
+        return %out : tensor<8xf32>
       }
     }
   )mlir";
@@ -129,8 +135,126 @@ TEST(TranslateToMSL, PicksEntryFuncAmongMultipleFuncs) {
   EXPECT_EQ(result.entry_point(), "entry_kernel");
   EXPECT_NE(result.source().find("kernel void entry_kernel"),
             std::string::npos);
-  EXPECT_EQ(result.source().find("helper"), std::string::npos)
-      << "Helper func leaked into the kernel signature";
+  EXPECT_NE(result.source().find("float entry_kernel_helper(float"),
+            std::string::npos);
+  EXPECT_NE(result.source().find("entry_kernel_helper("),
+            std::string::npos);
+  EXPECT_EQ(result.source().find("float helper(float"), std::string::npos);
+}
+
+TEST(TranslateToMSL, MangledHelperNamesDoNotAliasAcrossEntries) {
+  auto ctx = MakeMlirContext();
+  constexpr absl::string_view kFooInput = R"mlir(
+    module {
+      func.func private @bar_baz(%x: f32) -> f32 {
+        return %x : f32
+      }
+      func.func @foo(%a: tensor<8xf32> {xla.slice_index = 0 : i64})
+          -> tensor<8xf32> attributes {xla.entry} {
+        %c0 = arith.constant 0 : index
+        %x = tensor.extract %a[%c0] : tensor<8xf32>
+        %y = func.call @bar_baz(%x) : (f32) -> f32
+        %out = tensor.insert %y into %a[%c0] : tensor<8xf32>
+        return %out : tensor<8xf32>
+      }
+    }
+  )mlir";
+  constexpr absl::string_view kFooBarInput = R"mlir(
+    module {
+      func.func private @baz(%x: f32) -> f32 {
+        return %x : f32
+      }
+      func.func @foo_bar(%a: tensor<8xf32> {xla.slice_index = 0 : i64})
+          -> tensor<8xf32> attributes {xla.entry} {
+        %c0 = arith.constant 0 : index
+        %x = tensor.extract %a[%c0] : tensor<8xf32>
+        %y = func.call @baz(%x) : (f32) -> f32
+        %out = tensor.insert %y into %a[%c0] : tensor<8xf32>
+        return %out : tensor<8xf32>
+      }
+    }
+  )mlir";
+  auto foo_module =
+      mlir::parseSourceString<mlir::ModuleOp>(kFooInput, ctx.get());
+  ASSERT_TRUE(foo_module);
+  auto foo_bar_module =
+      mlir::parseSourceString<mlir::ModuleOp>(kFooBarInput, ctx.get());
+  ASSERT_TRUE(foo_bar_module);
+
+  NameUniquer function_name_uniquer;
+  TF_ASSERT_OK_AND_ASSIGN(MslKernelSource foo_result,
+                          TranslateToMSL(*foo_module, &function_name_uniquer));
+  TF_ASSERT_OK_AND_ASSIGN(MslKernelSource foo_bar_result,
+                          TranslateToMSL(*foo_bar_module,
+                                         &function_name_uniquer));
+
+  constexpr absl::string_view kFooBarBazFromFoo = "foo_bar_baz";
+  constexpr absl::string_view kFooBarBazFromFooBar = "foo_bar_baz__1";
+  EXPECT_NE(foo_result.source().find(
+                absl::StrCat("float ", kFooBarBazFromFoo, "(float")),
+            std::string::npos);
+  EXPECT_EQ(foo_result.source().find(kFooBarBazFromFooBar), std::string::npos);
+  EXPECT_NE(foo_bar_result.source().find(
+                absl::StrCat("float ", kFooBarBazFromFooBar, "(float")),
+            std::string::npos);
+  EXPECT_EQ(foo_bar_result.source().find(
+                absl::StrCat(kFooBarBazFromFoo, "(")),
+            std::string::npos);
+}
+
+TEST(TranslateToMSL, OmitsUnusedGpuShuffleValidResult) {
+  auto ctx = MakeMlirContext();
+  constexpr absl::string_view kInput = R"mlir(
+    module {
+      func.func @shuffle_value_only(
+          %src: tensor<1xf32> {xla.slice_index = 0 : i64},
+          %dst: tensor<1xf32> {xla.slice_index = 1 : i64})
+          -> tensor<1xf32> attributes {xla.entry} {
+        %i = arith.constant 0 : index
+        %offset = arith.constant 1 : i32
+        %width = arith.constant 32 : i32
+        %x = tensor.extract %src[%i] : tensor<1xf32>
+        %shuf, %valid = gpu.shuffle down %x, %offset, %width : f32
+        %out = tensor.insert %shuf into %dst[%i] : tensor<1xf32>
+        return %out : tensor<1xf32>
+      }
+    }
+  )mlir";
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(kInput, ctx.get());
+  ASSERT_TRUE(module);
+
+  TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
+  EXPECT_NE(result.source().find("metal::simd_shuffle_down"),
+            std::string::npos);
+  EXPECT_EQ(result.source().find("bool v"), std::string::npos);
+}
+
+TEST(TranslateToMSL, EmitsUsedGpuShuffleValidResult) {
+  auto ctx = MakeMlirContext();
+  constexpr absl::string_view kInput = R"mlir(
+    module {
+      func.func @shuffle_valid_used(
+          %src: tensor<1xf32> {xla.slice_index = 0 : i64},
+          %dst: tensor<1xi1> {xla.slice_index = 1 : i64})
+          -> tensor<1xi1> attributes {xla.entry} {
+        %i = arith.constant 0 : index
+        %offset = arith.constant 1 : i32
+        %width = arith.constant 32 : i32
+        %x = tensor.extract %src[%i] : tensor<1xf32>
+        %shuf, %valid = gpu.shuffle down %x, %offset, %width : f32
+        %out = tensor.insert %valid into %dst[%i] : tensor<1xi1>
+        return %out : tensor<1xi1>
+      }
+    }
+  )mlir";
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(kInput, ctx.get());
+  ASSERT_TRUE(module);
+
+  TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
+  EXPECT_NE(result.source().find("metal::simd_shuffle_down"),
+            std::string::npos);
+  EXPECT_NE(result.source().find("bool v"), std::string::npos);
+  EXPECT_NE(result.source().find(" = true;"), std::string::npos);
 }
 
 TEST(TranslateToMSL, RejectsMissingEntryAttribute) {

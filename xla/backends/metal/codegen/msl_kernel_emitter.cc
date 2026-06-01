@@ -17,27 +17,63 @@ limitations under the License.
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "xla/backends/metal/codegen/msl_kernel_source.h"
 #include "xla/backends/metal/codegen/transforms/passes.h"
 #include "xla/backends/metal/codegen/translate_to_msl.h"
+#include "xla/codegen/ir_printing.h"
+#include "xla/hlo/ir/hlo_module.h"
+#include "xla/service/name_uniquer.h"
+#include "xla/tsl/platform/status_macros.h"
 
 namespace xla {
 namespace metal {
+namespace {
 
-absl::StatusOr<MslKernelSource> EmitMslKernel(mlir::ModuleOp module) {
+absl::Status RunPreTranslationPipeline(
+    mlir::ModuleOp module, const HloModule* hlo_module,
+    absl::string_view entry_function_name) {
   mlir::PassManager pm(module.getContext());
   pm.addPass(CreateConvertComplexToArithMathPass());
   pm.addPass(CreateExpandFloatOpsPass());
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(mlir::createCSEPass());
+  if (hlo_module != nullptr) {
+    std::string dump_kernel_name =
+        absl::StrCat(entry_function_name, ".msl-pretranslation");
+    EnableIRPrintingIfRequested(pm, module.getContext(), *hlo_module,
+                                dump_kernel_name, "mlir-fusion");
+  }
   if (mlir::failed(pm.run(module))) {
     return absl::InvalidArgumentError(
         "Pre-translation pass pipeline failed on the input module.");
   }
-  return TranslateToMSL(module);
+  return absl::OkStatus();
+}
+
+}  // namespace
+
+absl::StatusOr<MslKernelSource> EmitMslKernel(mlir::ModuleOp module) {
+  NameUniquer function_name_uniquer;
+  return EmitMslKernel(module, &function_name_uniquer);
+}
+
+absl::StatusOr<MslKernelSource> EmitMslKernel(
+    mlir::ModuleOp module, NameUniquer* function_name_uniquer) {
+  TF_RETURN_IF_ERROR(RunPreTranslationPipeline(
+      module, /*hlo_module=*/nullptr, /*entry_function_name=*/""));
+  return TranslateToMSL(module, function_name_uniquer);
+}
+
+absl::StatusOr<MslKernelSource> EmitMslKernel(
+    mlir::ModuleOp module, NameUniquer* function_name_uniquer,
+    const HloModule& hlo_module, absl::string_view entry_function_name) {
+  TF_RETURN_IF_ERROR(
+      RunPreTranslationPipeline(module, &hlo_module, entry_function_name));
+  return TranslateToMSL(module, function_name_uniquer);
 }
 
 }  // namespace metal

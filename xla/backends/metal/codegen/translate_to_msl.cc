@@ -21,6 +21,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -29,6 +30,7 @@ limitations under the License.
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -49,6 +51,8 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/emitters/ir/xla_gpu_ops.h"
 #include "xla/backends/metal/codegen/msl_kernel_source.h"
 #include "xla/codegen/emitters/ir/xla_ops.h"
+#include "xla/service/llvm_ir/llvm_util.h"
+#include "xla/service/name_uniquer.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
 
@@ -58,6 +62,21 @@ namespace {
 
 constexpr absl::string_view kEntryAttrName = "xla.entry";
 constexpr absl::string_view kSliceIndexAttrName = "xla.slice_index";
+
+std::string GetUniqueMslFunctionName(absl::string_view name,
+                                     NameUniquer* function_name_uniquer) {
+  CHECK(function_name_uniquer != nullptr);
+  return function_name_uniquer->GetUniqueName(
+      llvm_ir::SanitizeFunctionName(std::string(name)));
+}
+
+std::string GetUniqueMslHelperName(llvm::StringRef entry_name,
+                                   llvm::StringRef helper_name,
+                                   NameUniquer* function_name_uniquer) {
+  return GetUniqueMslFunctionName(
+      absl::StrCat(entry_name.str(), "_", helper_name.str()),
+      function_name_uniquer);
+}
 
 // Maps an MLIR element type to its MSL spelling.
 absl::StatusOr<std::string> EmitElementType(mlir::Type type) {
@@ -250,7 +269,11 @@ absl::StatusOr<std::string> FormatConstantLiteral(mlir::Type type,
 // from MLIR SSA values to MSL variable identifiers.
 class MslEmitter {
  public:
-  explicit MslEmitter(mlir::raw_indented_ostream& os) : os_(os) {}
+  explicit MslEmitter(
+      mlir::raw_indented_ostream& os,
+      llvm::StringMap<std::string> emitted_function_names = {})
+      : os_(os),
+        emitted_function_names_(std::move(emitted_function_names)) {}
 
   // The entry: a `kernel void` whose results land in output buffers.
   absl::Status EmitFunction(mlir::func::FuncOp func) {
@@ -292,7 +315,7 @@ class MslEmitter {
   }
 
   absl::Status EmitFuncCall(mlir::func::CallOp op) {
-    std::string call = absl::StrCat(op.getCallee().str(), "(");
+    std::string call = absl::StrCat(EmittedFunctionName(op.getCallee()), "(");
     for (unsigned i = 0; i < op.getNumOperands(); ++i) {
       if (i > 0) call += ", ";
       TF_ASSIGN_OR_RETURN(std::string a, GetName(op.getOperand(i)));
@@ -352,7 +375,7 @@ class MslEmitter {
   }
 
   absl::Status EmitSignature(mlir::func::FuncOp func, const GpuAttrs& attrs) {
-    os_ << "kernel void " << func.getName().str() << "(";
+    os_ << "kernel void " << EmittedFunctionName(func) << "(";
     bool first = true;
     auto emit_param = [&](absl::string_view decl) {
       if (!first) os_ << ",";
@@ -409,7 +432,7 @@ class MslEmitter {
       return absl::UnimplementedError(
           "device function with multiple results is not yet supported.");
     }
-    os_ << ret << " " << func.getName().str() << "(";
+    os_ << ret << " " << EmittedFunctionName(func) << "(";
     for (unsigned i = 0; i < func.getNumArguments(); ++i) {
       if (i > 0) os_ << ", ";
       mlir::Value arg = func.getArgument(i);
@@ -1125,8 +1148,10 @@ class MslEmitter {
     std::string shuf = BindValueName(op.getShuffleResult());
     os_ << ty << " " << shuf << " = " << fn << "(" << value << ", " << offset
         << ");\n";
-    std::string valid = BindValueName(op.getValid());
-    os_ << "bool " << valid << " = true;\n";
+    if (!op.getValid().use_empty()) {
+      std::string valid = BindValueName(op.getValid());
+      os_ << "bool " << valid << " = true;\n";
+    }
     return absl::OkStatus();
   }
 
@@ -1674,6 +1699,17 @@ class MslEmitter {
 
   std::string CreateFreshName() { return absl::StrCat("v", next_id_++); }
 
+  std::string EmittedFunctionName(mlir::func::FuncOp func) const {
+    return EmittedFunctionName(func.getName());
+  }
+
+  std::string EmittedFunctionName(llvm::StringRef name) const {
+    auto it = emitted_function_names_.find(name);
+    CHECK(it != emitted_function_names_.end())
+        << "Missing emitted function name for " << name.str();
+    return it->second;
+  }
+
   mlir::raw_indented_ostream& os_;
   llvm::DenseMap<mlir::Value, std::string> names_;
   llvm::DenseMap<mlir::Value, std::string> addr_spaces_;
@@ -1681,11 +1717,18 @@ class MslEmitter {
   // True while emitting the entry kernel (void; results land in buffers) and
   // false while emitting a device function (func.return yields a value).
   bool in_entry_ = false;
+  llvm::StringMap<std::string> emitted_function_names_;
 };
 
 }  // namespace
 
 absl::StatusOr<MslKernelSource> TranslateToMSL(mlir::ModuleOp module) {
+  NameUniquer function_name_uniquer;
+  return TranslateToMSL(module, &function_name_uniquer);
+}
+
+absl::StatusOr<MslKernelSource> TranslateToMSL(
+    mlir::ModuleOp module, NameUniquer* function_name_uniquer) {
   mlir::func::FuncOp entry;
   std::vector<mlir::func::FuncOp> helpers;
   for (mlir::func::FuncOp func : module.getOps<mlir::func::FuncOp>()) {
@@ -1713,7 +1756,16 @@ absl::StatusOr<MslKernelSource> TranslateToMSL(mlir::ModuleOp module) {
   os << "using namespace metal;\n";
   os << "\n";
 
-  MslEmitter emitter(os);
+  llvm::StringMap<std::string> emitted_function_names;
+  const std::string entry_point =
+      GetUniqueMslFunctionName(entry.getName(), function_name_uniquer);
+  emitted_function_names[entry.getName()] = entry_point;
+  for (mlir::func::FuncOp helper : helpers) {
+    emitted_function_names[helper.getName()] = GetUniqueMslHelperName(
+        entry.getName(), helper.getName(), function_name_uniquer);
+  }
+
+  MslEmitter emitter(os, std::move(emitted_function_names));
   // Forward-declare every device function first so they can call one another
   // regardless of emission order, then define them, then the entry kernel.
   for (mlir::func::FuncOp helper : helpers) {
@@ -1727,7 +1779,7 @@ absl::StatusOr<MslKernelSource> TranslateToMSL(mlir::ModuleOp module) {
   TF_RETURN_IF_ERROR(emitter.EmitFunction(entry));
 
   raw.flush();
-  return MslKernelSource(std::move(output), entry.getName().str());
+  return MslKernelSource(std::move(output), entry_point);
 }
 
 }  // namespace metal
