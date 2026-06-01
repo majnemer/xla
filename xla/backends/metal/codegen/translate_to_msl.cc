@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -76,6 +77,22 @@ std::string GetUniqueMslHelperName(llvm::StringRef entry_name,
   return GetUniqueMslFunctionName(
       absl::StrCat(entry_name.str(), "_", helper_name.str()),
       function_name_uniquer);
+}
+
+bool IsSingleElementVector(mlir::Type type) {
+  auto vector_type = mlir::dyn_cast<mlir::VectorType>(type);
+  return vector_type && vector_type.getRank() == 1 &&
+         vector_type.getDimSize(0) == 1;
+}
+
+std::optional<int64_t> GetStaticVectorIndex(
+    mlir::ArrayRef<mlir::OpFoldResult> position) {
+  if (position.size() != 1) return std::nullopt;
+  auto attr = mlir::dyn_cast<mlir::Attribute>(position[0]);
+  if (!attr) return std::nullopt;
+  auto integer_attr = mlir::dyn_cast<mlir::IntegerAttr>(attr);
+  if (!integer_attr) return std::nullopt;
+  return integer_attr.getInt();
 }
 
 // Maps an MLIR element type to its MSL spelling.
@@ -644,6 +661,9 @@ class MslEmitter {
     if (auto vw = mlir::dyn_cast<mlir::vector::TransferWriteOp>(op)) {
       return EmitVectorTransferWrite(vw);
     }
+    if (auto vb = mlir::dyn_cast<mlir::vector::BitCastOp>(op)) {
+      return EmitVectorBitcast(vb);
+    }
     if (auto ve = mlir::dyn_cast<mlir::vector::ExtractOp>(op)) {
       return EmitVectorExtract(ve);
     }
@@ -1186,6 +1206,9 @@ class MslEmitter {
           "Multi-rank vector types are not yet supported by the MSL emitter.");
     }
     const int64_t n = ty.getDimSize(0);
+    if (n == 1) {
+      return EmitElementType(ty.getElementType());
+    }
     if (n != 2 && n != 3 && n != 4) {
       return absl::UnimplementedError(
           absl::StrCat("MSL vector width must be 2, 3, or 4; got ", n));
@@ -1242,11 +1265,33 @@ class MslEmitter {
     return absl::OkStatus();
   }
 
+  absl::Status EmitVectorBitcast(mlir::vector::BitCastOp op) {
+    TF_ASSIGN_OR_RETURN(std::string dst,
+                        VectorTypeToMSL(op.getResultVectorType()));
+    TF_ASSIGN_OR_RETURN(std::string src, GetName(op.getSource()));
+    std::string name = BindValueName(op.getResult());
+    os_ << dst << " " << name << " = as_type<" << dst << ">(" << src
+        << ");\n";
+    return absl::OkStatus();
+  }
+
   absl::Status EmitVectorExtract(mlir::vector::ExtractOp op) {
     auto pos = op.getMixedPosition();
     if (pos.size() != 1) {
       return absl::UnimplementedError(
           "vector.extract: only single-index extracts are supported.");
+    }
+    if (IsSingleElementVector(op.getSource().getType())) {
+      std::optional<int64_t> index = GetStaticVectorIndex(pos);
+      if (!index || *index != 0) {
+        return absl::UnimplementedError(
+            "vector.extract from vector<1xT> requires static index 0.");
+      }
+      TF_ASSIGN_OR_RETURN(std::string ty, TypeToMSL(op.getType()));
+      TF_ASSIGN_OR_RETURN(std::string src, GetName(op.getSource()));
+      std::string name = BindValueName(op.getResult());
+      os_ << ty << " " << name << " = " << src << ";\n";
+      return absl::OkStatus();
     }
     // Index is a compile-time constant or a runtime value; MSL supports
     // dynamic subscripting of its vector types either way.
@@ -1268,6 +1313,19 @@ class MslEmitter {
     if (pos.size() != 1) {
       return absl::UnimplementedError(
           "vector.insert: only single-index inserts are supported.");
+    }
+    if (IsSingleElementVector(op.getResult().getType())) {
+      std::optional<int64_t> index = GetStaticVectorIndex(pos);
+      if (!index || *index != 0) {
+        return absl::UnimplementedError(
+            "vector.insert into vector<1xT> requires static index 0.");
+      }
+      TF_ASSIGN_OR_RETURN(std::string ty,
+                          VectorTypeToMSL(op.getDestVectorType()));
+      TF_ASSIGN_OR_RETURN(std::string val, GetName(op.getValueToStore()));
+      std::string name = BindValueName(op.getResult());
+      os_ << ty << " " << name << " = " << val << ";\n";
+      return absl::OkStatus();
     }
     // Value semantics: copy the destination, then overwrite one component.
     // The index is a compile-time constant or a runtime value; MSL supports
@@ -1291,6 +1349,15 @@ class MslEmitter {
     TF_ASSIGN_OR_RETURN(std::string vec_ty,
                         VectorTypeToMSL(op.getResult().getType()));
     std::string name = BindValueName(op.getResult());
+    if (IsSingleElementVector(op.getResult().getType())) {
+      if (op.getElements().size() != 1) {
+        return absl::InternalError(
+            "vector.from_elements vector<1xT> must have one element.");
+      }
+      TF_ASSIGN_OR_RETURN(std::string elt_name, GetName(op.getElements()[0]));
+      os_ << vec_ty << " " << name << " = " << elt_name << ";\n";
+      return absl::OkStatus();
+    }
     os_ << vec_ty << " " << name << " = " << vec_ty << "(";
     bool first = true;
     for (mlir::Value elt : op.getElements()) {
@@ -1314,13 +1381,17 @@ class MslEmitter {
       if (src_vec.getRank() != 1 ||
           src_vec.getDimSize(0) != dst_ty.getDimSize(0)) {
         return absl::UnimplementedError(
-            "vector.broadcast: vector-to-vector broadcast must preserve "
-            "shape (rank-1, equal width).");
+          "vector.broadcast: vector-to-vector broadcast must preserve "
+          "shape (rank-1, equal width).");
       }
     }
     TF_ASSIGN_OR_RETURN(std::string dst_msl, VectorTypeToMSL(dst_ty));
     TF_ASSIGN_OR_RETURN(std::string src, GetName(op.getSource()));
     std::string name = BindValueName(op.getResult());
+    if (IsSingleElementVector(dst_ty)) {
+      os_ << dst_msl << " " << name << " = " << src << ";\n";
+      return absl::OkStatus();
+    }
     // MSL's vector ctor splats a scalar argument and copy-constructs from a
     // same-shape vector.
     os_ << dst_msl << " " << name << " = " << dst_msl << "(" << src << ");\n";
