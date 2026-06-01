@@ -529,7 +529,7 @@ class MslEmitter {
       return EmitArithUnsignedBinary(op, "%");
     }
     if (mlir::isa<mlir::arith::RemFOp>(op)) {
-      return EmitMathCall(op, "metal::fmod");
+      return EmitMathCall(op, "metal::precise::fmod");
     }
     if (mlir::isa<mlir::arith::AndIOp>(op)) {
       return EmitBinary(op, "&");

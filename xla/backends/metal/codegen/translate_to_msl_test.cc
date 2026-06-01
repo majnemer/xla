@@ -1216,9 +1216,8 @@ TEST(TranslateToMSL, RejectsUnsupportedVectorWidth) {
       << status;
 }
 
-TEST(TranslateToMSL, RejectsUnsupportedOp) {
+TEST(TranslateToMSL, EmitsFloatingRemainder) {
   auto ctx = MakeMlirContext();
-  // arith.remf isn't in the v1 op list.
   constexpr absl::string_view kInput = R"mlir(
     module {
       func.func @mod(%a: tensor<1xf32> {xla.slice_index = 0 : i64},
@@ -1236,10 +1235,9 @@ TEST(TranslateToMSL, RejectsUnsupportedOp) {
   auto module = mlir::parseSourceString<mlir::ModuleOp>(kInput, ctx.get());
   ASSERT_TRUE(module);
 
-  auto status = TranslateToMSL(*module).status();
-  EXPECT_EQ(status.code(), absl::StatusCode::kUnimplemented);
-  EXPECT_NE(status.message().find("arith.remf"), absl::string_view::npos)
-      << status.message();
+  TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
+  EXPECT_NE(result.source().find("metal::precise::fmod"), std::string::npos)
+      << result.source();
 }
 
 TEST(TranslateToMSL, RejectsF64BecauseAppleSiliconHasNoFp64) {
