@@ -513,6 +513,17 @@ MetalStream::LaunchKernel(const ThreadDim &thread_dims,
     return absl::InvalidArgumentError(
         "MetalStream::LaunchKernel: null kernel or pipeline state.");
   }
+
+  const int64_t total_threads = thread_dims.x * thread_dims.y * thread_dims.z;
+  const int64_t pso_limit =
+      static_cast<int64_t>([kernel->pipeline_state() maxTotalThreadsPerThreadgroup]);
+  if (total_threads > pso_limit) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "MetalStream::LaunchKernel: kernel ", name, " block size ",
+        total_threads, " exceeds pipeline state maxTotalThreadsPerThreadgroup ",
+        pso_limit, "."));
+  }
+
   TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
   @autoreleasepool {
     absl::MutexLock lock(&submit_mu_);
