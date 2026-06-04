@@ -89,6 +89,16 @@ class GpuExecutable : public Executable {
         const GpuExecutableProto::ConstantInfoProto& proto);
   };
 
+  struct GlobalInfo {
+    std::string symbol_name;
+    DenseDataIntermediate initial_value;
+
+    GpuExecutableProto::GlobalInfoProto ToProto() const;
+
+    static GlobalInfo FromProto(
+        const GpuExecutableProto::GlobalInfoProto& proto);
+  };
+
   struct OutputInfo {
     // Corresponding allocation index.
     int allocation_index;
@@ -121,6 +131,7 @@ class GpuExecutable : public Executable {
     BinaryMap dnn_compiled_graphs;
     std::unique_ptr<ThunkExecutor> executable;
     std::vector<ConstantInfo> constants;
+    std::vector<GlobalInfo> globals;
     absl::flat_hash_map<ShapeIndex, OutputInfo> output_info;
     std::string module_name;
     ProgramShape program_shape;
@@ -202,6 +213,7 @@ class GpuExecutable : public Executable {
   }
 
   const std::vector<ConstantInfo>& constants() const { return constants_; }
+  const std::vector<GlobalInfo>& globals() const { return globals_; }
 
   // Only returns a non-null pointer if this executable was constructed with a
   // valid BufferAssignment. Deserialized executables do not have a valid
@@ -219,23 +231,31 @@ class GpuExecutable : public Executable {
 
   const ThunkExecutor& thunk_executor() const { return *thunk_executor_; }
 
-  absl::Status ExecuteThunks(const BufferAllocations& buffer_allocations,
-                             const ServiceExecutableRunOptions* run_options);
-
   using BufferAllocToDeviceMemoryMap =
       absl::flat_hash_map<BufferAllocation::Index, se::DeviceAddressBase>;
+  using NameToDeviceMemoryMap =
+      absl::flat_hash_map<std::string, se::DeviceAddressBase>;
+
+  absl::Status ExecuteThunks(const BufferAllocations& buffer_allocations,
+                             const NameToDeviceMemoryMap* globals,
+                             const ServiceExecutableRunOptions* run_options);
+
+  struct ResolvedGlobals {
+    BufferAllocToDeviceMemoryMap constants;
+    NameToDeviceMemoryMap globals;
+  };
 
   // Loads the PTX or CUBIN for this executable and initializes all
   // constants that haven't already been initialized by the CUDA driver. Loaded
   // modules are owned by this executable.
   //
-  // Returns a map from buffer allocation indices to device memory pointers
-  // (only for allocations that contain constants).
+  // Returns maps from buffer allocation indices / global names to device memory
+  // pointers.
   //
   // The returned map is cached. If the above process has already been run for
   // the given stream, it is skipped and the cached map is immediately returned
   // instead.
-  absl::StatusOr<const BufferAllocToDeviceMemoryMap*> ResolveConstantGlobals(
+  absl::StatusOr<const ResolvedGlobals*> ResolveConstantGlobals(
       stream_executor::Stream* stream);
 
   absl::Status VerboseAllocationError(absl::Status s);
@@ -295,7 +315,7 @@ class GpuExecutable : public Executable {
       std::unique_ptr<const BufferAssignment> buffer_assignment,
       std::deque<BufferAllocation> thunk_pass_allocations,
       std::unique_ptr<GpuAliasInfo> alias_info, DebugOptions debug_options,
-      std::vector<ConstantInfo> constants,
+      std::vector<ConstantInfo> constants, std::vector<GlobalInfo> globals,
       absl::flat_hash_map<ShapeIndex, OutputInfo> output_info,
       bool enable_debug_info_manager, ModuleStats module_stats,
       absl::StatusOr<std::vector<ThunkProto>> thunk_sequence_proto,
@@ -328,6 +348,7 @@ class GpuExecutable : public Executable {
   // ExecuteThunksImpl with the remapped BufferAllocations.
   absl::Status ExecuteThunksWithVaRemapping(
       const BufferAllocations& buffer_allocations,
+      const NameToDeviceMemoryMap* globals,
       const ServiceExecutableRunOptions* run_options,
       stream_executor::StreamExecutor* executor, int64_t unique_id,
       Thunk::ExecutableSource executable_source, bool block_host_until_done,
@@ -422,9 +443,10 @@ class GpuExecutable : public Executable {
   // executable is destroyed.
   absl::flat_hash_map<stream_executor::StreamExecutor*, se::ScopedModuleHandle>
       module_handles_ ABSL_GUARDED_BY(module_handle_mutex_);
-  // Cache of constant buffer allocation maps used by `ResolveConstantGlobals`.
+  // Cache of resolved constant/global symbol maps used by
+  // `ResolveConstantGlobals`.
   absl::flat_hash_map<stream_executor::StreamExecutor*,
-                      std::unique_ptr<BufferAllocToDeviceMemoryMap>>
+                      std::unique_ptr<ResolvedGlobals>>
       module_globals_ ABSL_GUARDED_BY(module_handle_mutex_);
 
   // Cache previous memory allocations for current module, this is used to help
@@ -434,6 +456,7 @@ class GpuExecutable : public Executable {
       module_allocations_ ABSL_GUARDED_BY(module_handle_mutex_);
 
   std::vector<ConstantInfo> constants_;
+  std::vector<GlobalInfo> globals_;
   const absl::flat_hash_map<ShapeIndex, OutputInfo> output_info_;
   bool enable_debug_info_manager_;
 

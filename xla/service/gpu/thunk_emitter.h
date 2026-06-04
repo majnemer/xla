@@ -48,8 +48,54 @@ limitations under the License.
 
 namespace xla::gpu {
 
-// Emits Thunks for the given HLO module.
-class ThunkEmitter {
+// Target-specific hooks used by ThunkSequenceEmitter. This interface keeps the
+// scheduled-computation traversal, control-flow thunk construction, and copy
+// thunk construction independent from any particular kernel source format.
+class ThunkEmissionBackend {
+ public:
+  virtual ~ThunkEmissionBackend() = default;
+
+  virtual const BufferAssignment& buffer_assignment() const = 0;
+  virtual Thunk::ThunkInfo GetThunkInfo(const HloInstruction* instr) = 0;
+  virtual AsyncThunkSequence EmitTargetElement(
+      const HloInstruction* hlo, bool emit_group_thunks) = 0;
+};
+
+// Emits target-independent Thunks for scheduled HLO computations and delegates
+// target-specific HLOs (kernels, constants, collectives, custom calls, etc.) to
+// ThunkEmissionBackend.
+class ThunkSequenceEmitter {
+ public:
+  explicit ThunkSequenceEmitter(ThunkEmissionBackend* absl_nonnull backend);
+  ThunkSequenceEmitter(const ThunkSequenceEmitter&) = delete;
+  ThunkSequenceEmitter& operator=(const ThunkSequenceEmitter&) = delete;
+
+  absl::StatusOr<std::unique_ptr<SequentialThunk>> EmitHloEntryComputation(
+      const HloModule* module);
+  AsyncThunkSequence EmitHloComputation(const HloComputation* computation);
+  AsyncThunkSequence EmitHloInstruction(const HloInstruction* hlo,
+                                        bool emit_group_thunks = false);
+
+ private:
+  AsyncThunkSequence EmitCallComputation(const HloInstruction* hlo);
+  AsyncThunkSequence EmitConditional(const HloInstruction* instr);
+  absl::StatusOr<ThunkSequence> EmitCopy(const HloInstruction* hlo);
+  AsyncThunkSequence EmitWhile(const HloInstruction* instr);
+
+  absl::StatusOr<BufferAllocation::Slice> GetAllocationSliceForHlo(
+      const HloInstruction* instr, const ShapeIndex& index = {}) const;
+
+  ThunkEmissionBackend* backend_;
+
+  // TODO(tjoerg): Attach the HloOrdering to the HloSchedule instead of
+  // re-creating it here.
+  absl::flat_hash_map<const HloModule*,
+                      std::unique_ptr<ConcurrentRegionsHloOrdering>>
+      concurrent_regions_ordering_;
+};
+
+// LLVM-backed GPU thunk emission for CUDA/ROCm.
+class ThunkEmitter : public ThunkEmissionBackend {
  public:
   absl::string_view platform_name() const {
     return ir_emitter_context_->platform_name();
@@ -74,17 +120,23 @@ class ThunkEmitter {
   }
 
  private:
-  // Emits code for the given HLO computation.
-  //
-  // Also populates related information to 'ir_emitter_context_' for
-  // large-constant initializations. Large constants don't get initializers in
-  // the generated code and so must be initialized by XLA. The value of these
-  // constants will be stored in 'content'. Constants with initializers in the
-  // generated code will have empty 'content'.
-  AsyncThunkSequence EmitHloComputation(const HloComputation* computation);
+  const BufferAssignment& buffer_assignment() const override {
+    return ir_emitter_context_->buffer_assignment();
+  }
+  Thunk::ThunkInfo GetThunkInfo(const HloInstruction* instr) override {
+    return Thunk::ThunkInfo::WithProfileAnnotation(
+        instr, ir_emitter_context_->GetNextThunkId());
+  }
+  AsyncThunkSequence EmitTargetElement(const HloInstruction* hlo,
+                                       bool emit_group_thunks) override;
 
+  AsyncThunkSequence EmitHloComputation(const HloComputation* computation) {
+    return thunk_sequence_emitter_.EmitHloComputation(computation);
+  }
   AsyncThunkSequence EmitHloInstruction(const HloInstruction* hlo,
-                                        bool emit_group_thunks = false);
+                                        bool emit_group_thunks = false) {
+    return thunk_sequence_emitter_.EmitHloInstruction(hlo, emit_group_thunks);
+  }
 
   // Calls the right function to emit the custom call thunk for `hlo`.
   AsyncThunkSequence EmitCustomCallSwitch(const HloInstruction* hlo);
@@ -112,8 +164,6 @@ class ThunkEmitter {
       Thunk::Kind kind, const HloInstruction* async_start,
       const HloInstType* inst, std::optional<bool> use_global_device_ids);
 
-  AsyncThunkSequence EmitConditional(const HloInstruction* instr);
-
   absl::StatusOr<ThunkSequence> EmitConstant(const HloConstantInstruction* hlo);
 
   absl::StatusOr<ThunkSequence> EmitConvolutionReorderThunk(
@@ -121,8 +171,6 @@ class ThunkEmitter {
 
   absl::StatusOr<ThunkSequence> EmitConvolutionThunk(
       const HloCustomCallInstruction* hlo);
-
-  absl::StatusOr<ThunkSequence> EmitCopy(const HloInstruction* hlo);
 
   absl::StatusOr<ThunkSequence> EmitCopyStartThunk(
       const HloCopyStartInstruction* hlo);
@@ -212,8 +260,6 @@ class ThunkEmitter {
   absl::StatusOr<ThunkSequence> EmitTritonCustomCall(
       const HloCustomCallInstruction* instr);
 
-  AsyncThunkSequence EmitWhile(const HloInstruction* instr);
-
   absl::Status AssertNonDeterminismIsOkay(const std::string& op_name);
 
   absl::StatusOr<BufferAllocation::Slice> GetAllocationSliceForHlo(
@@ -226,6 +272,7 @@ class ThunkEmitter {
     return ir_emitter_context_->instruction_to_host_execute_async_events();
   }
   IrEmitterContext* ir_emitter_context_;
+  ThunkSequenceEmitter thunk_sequence_emitter_;
 
   // Container for async host send/recv events shared by host send/recv thunks.
   std::shared_ptr<HostSendRecvAsyncEvents> send_recv_events_;
@@ -248,12 +295,6 @@ class ThunkEmitter {
 
   // Modules for each emitted kernel.
   std::vector<std::unique_ptr<llvm::Module>> kernel_modules_;
-
-  // TODO(tjoerg): Attach the HloOrdering to the HloSchedule instead of
-  // re-creating it here.
-  absl::flat_hash_map<const HloModule*,
-                      std::unique_ptr<ConcurrentRegionsHloOrdering>>
-      concurrent_regions_ordering_;
 
   // Releasable lock for LLVM options. Most of the thunks are emitted under the
   // lock, however some thunks (e.g. custom calls) temporarily release the lock

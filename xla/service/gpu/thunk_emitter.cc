@@ -316,17 +316,27 @@ ThunkSequence FlattenThunkSequence(std::vector<ThunkSequence>&& sequences) {
 
 }  // namespace
 
+ThunkSequenceEmitter::ThunkSequenceEmitter(
+    ThunkEmissionBackend* absl_nonnull backend)
+    : backend_(backend) {}
+
 ThunkEmitter::ThunkEmitter(
     IrEmitterContext* absl_nonnull ir_emitter_context,
     llvm_ir::LLVMCommandLineOptionsReleasableLock* absl_nonnull
         llvm_options_lock)
     : ir_emitter_context_(ir_emitter_context),
+      thunk_sequence_emitter_(this),
       send_recv_events_(std::make_shared<HostSendRecvAsyncEvents>()),
       nvshmem_buffer_addresses_(std::make_shared<NvshmemBufferAddresses>()),
       call_graph_(CallGraph::Build(&ir_emitter_context->hlo_module())),
       constants_module_(ir_emitter_context_->CreateLLVMModule(
           absl::StrCat(ir_emitter_context_->hlo_module().name(), "_consts"))),
       llvm_options_lock_(llvm_options_lock) {}
+
+absl::StatusOr<std::unique_ptr<SequentialThunk>>
+ThunkEmitter::EmitHloEntryComputation(const HloModule* module) {
+  return thunk_sequence_emitter_.EmitHloEntryComputation(module);
+}
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitConstant(
     const HloConstantInstruction* instr) {
@@ -369,7 +379,8 @@ ThunkSequence GetThunkSequence(std::unique_ptr<Thunk> ir_emitter) {
   return thunk_sequence;
 }
 
-AsyncThunkSequence ThunkEmitter::EmitConditional(const HloInstruction* instr) {
+AsyncThunkSequence ThunkSequenceEmitter::EmitConditional(
+    const HloInstruction* instr) {
   std::vector<AsyncThunkSequence> branch_thunks;
   branch_thunks.reserve(instr->branch_count());
   for (HloComputation* comp : instr->branch_computations()) {
@@ -378,8 +389,7 @@ AsyncThunkSequence ThunkEmitter::EmitConditional(const HloInstruction* instr) {
   ASSIGN_OR_RETURN(BufferAllocation::Slice slice,
                    GetAllocationSliceForHlo(instr->operand(0), {}));
 
-  Thunk::ThunkInfo thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(
-      instr, ir_emitter_context_->GetNextThunkId());
+  Thunk::ThunkInfo thunk_info = backend_->GetThunkInfo(instr);
   ShapedSlice shaped_slice{slice, instr->operand(0)->shape()};
   return tsl::JoinFutures(absl::MakeSpan(branch_thunks))
       .Map([thunk_info = std::move(thunk_info),
@@ -1377,7 +1387,7 @@ AsyncThunkSequence ThunkEmitter::EmitFusion(const HloFusionInstruction* instr) {
   return std::move(result.thunks);
 }
 
-absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCopy(
+absl::StatusOr<ThunkSequence> ThunkSequenceEmitter::EmitCopy(
     const HloInstruction* instr) {
   TF_RET_CHECK(LayoutUtil::LayoutsInShapesEqual(
       instr->operand(0)->shape(), instr->shape(),
@@ -1387,8 +1397,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCopy(
   TF_ASSIGN_OR_RETURN(BufferAllocation::Slice dst_buffer,
                       GetAllocationSliceForHlo(instr));
   return GetThunkSequence(std::make_unique<DeviceToDeviceCopyThunk>(
-      Thunk::ThunkInfo::WithProfileAnnotation(
-          instr, ir_emitter_context_->GetNextThunkId()),
+      backend_->GetThunkInfo(instr),
       /*source_buffer=*/ShapedSlice{src_buffer, instr->operand(0)->shape()},
       /*destination_buffer=*/ShapedSlice{dst_buffer, instr->shape()},
       /*mem_size=*/src_buffer.size()));
@@ -1438,7 +1447,7 @@ absl::Status ThunkEmitter::AssertNonDeterminismIsOkay(
   return absl::OkStatus();
 }
 
-AsyncThunkSequence ThunkEmitter::EmitWhile(const HloInstruction* instr) {
+AsyncThunkSequence ThunkSequenceEmitter::EmitWhile(const HloInstruction* instr) {
   ASSIGN_OR_RETURN(auto config,
                    instr->backend_config<xla::WhileLoopBackendConfig>());
 
@@ -1453,8 +1462,7 @@ AsyncThunkSequence ThunkEmitter::EmitWhile(const HloInstruction* instr) {
   // Buffer slice holding while loop predicate.
   ASSIGN_OR_RETURN(BufferAllocation::Slice pred,
                    GetAllocationSliceForHlo(condition->root_instruction(), {}));
-  Thunk::ThunkInfo info = Thunk::ThunkInfo::WithProfileAnnotation(
-      instr, ir_emitter_context_->GetNextThunkId());
+  Thunk::ThunkInfo info = backend_->GetThunkInfo(instr);
 
   return std::move(tsl::JoinFutures(EmitHloComputation(condition),
                                     EmitHloComputation(body)))
@@ -1467,7 +1475,7 @@ AsyncThunkSequence ThunkEmitter::EmitWhile(const HloInstruction* instr) {
       });
 }
 
-AsyncThunkSequence ThunkEmitter::EmitCallComputation(
+AsyncThunkSequence ThunkSequenceEmitter::EmitCallComputation(
     const HloInstruction* instr) {
   DCHECK_EQ(instr->called_computations().size(), 1);
   const HloComputation* computation = instr->called_computations().front();
@@ -1498,6 +1506,40 @@ AsyncThunkSequence ThunkEmitter::EmitRngGetAndUpdateState(
       .Map([](std::unique_ptr<Thunk> thunk) {
         return ThunkSequence::Of(std::move(thunk));
       });
+}
+
+absl::StatusOr<BufferAllocation::Slice>
+ThunkSequenceEmitter::GetAllocationSliceForHlo(const HloInstruction* instr,
+                                               const ShapeIndex& index) const {
+  return backend_->buffer_assignment().GetUniqueSlice(instr, index);
+}
+
+AsyncThunkSequence ThunkSequenceEmitter::EmitHloInstruction(
+    const HloInstruction* hlo, bool emit_group_thunks) {
+  switch (hlo->opcode()) {
+    case HloOpcode::kCall:
+      return EmitCallComputation(hlo);
+    case HloOpcode::kConditional:
+      return EmitConditional(hlo);
+    case HloOpcode::kCopy:
+      return EmitCopy(hlo);
+    case HloOpcode::kWhile:
+      return EmitWhile(hlo);
+
+    // HLO module is already scheduled, so instructions for ordering are noops.
+    case HloOpcode::kAddDependency:
+    case HloOpcode::kAfterAll:
+    // We don't need to emit thunks for these operations because their semantics
+    // are encoded by buffers.
+    case HloOpcode::kBitcast:
+    case HloOpcode::kGetTupleElement:
+    case HloOpcode::kParameter:
+    case HloOpcode::kTuple:
+      return ThunkSequence{};
+
+    default:
+      return backend_->EmitTargetElement(hlo, emit_group_thunks);
+  }
 }
 
 AsyncThunkSequence ThunkEmitter::EmitSort(const HloSortInstruction* sort) {
@@ -2713,8 +2755,8 @@ AsyncThunkSequence ThunkEmitter::EmitCustomCallSwitch(
   return EmitCustomCallThunk(custom_call);
 }
 
-AsyncThunkSequence ThunkEmitter::EmitHloInstruction(const HloInstruction* hlo,
-                                                    bool emit_group_thunks) {
+AsyncThunkSequence ThunkEmitter::EmitTargetElement(
+    const HloInstruction* hlo, bool emit_group_thunks) {
   switch (hlo->opcode()) {
     case HloOpcode::kAllGatherDone:
       return EmitCollectiveAsyncDone(hlo);
@@ -2742,23 +2784,17 @@ AsyncThunkSequence ThunkEmitter::EmitHloInstruction(const HloInstruction* hlo,
       return EmitAsyncDone(hlo);
     case HloOpcode::kAsyncStart:
       return EmitAsyncStart(hlo);
-    case HloOpcode::kCall:
-      return EmitCallComputation(hlo);
     case HloOpcode::kCollectivePermuteDone:
       return IsNvshmemCollective(hlo) ? EmitNvshmemAsyncDone(hlo)
                                       : EmitCollectiveAsyncDone(hlo);
     case HloOpcode::kCollectivePermuteStart:
       return EmitCollectivePermute(Cast<HloCollectivePermuteInstruction>(hlo));
-    case HloOpcode::kConditional:
-      return EmitConditional(hlo);
     case HloOpcode::kConstant:
       return EmitConstant(Cast<HloConstantInstruction>(hlo));
     case HloOpcode::kCustomCall:
       return EmitCustomCallSwitch(hlo);
     case HloOpcode::kFusion:
       return EmitFusion(Cast<HloFusionInstruction>(hlo));
-    case HloOpcode::kCopy:
-      return EmitCopy(hlo);
     case HloOpcode::kInfeed:
       return EmitInfeed(Cast<HloInfeedInstruction>(hlo));
     case HloOpcode::kOutfeed:
@@ -2786,8 +2822,6 @@ AsyncThunkSequence ThunkEmitter::EmitHloInstruction(const HloInstruction* hlo,
 
     case HloOpcode::kSort:
       return EmitSort(Cast<HloSortInstruction>(hlo));
-    case HloOpcode::kWhile:
-      return EmitWhile(hlo);
     case HloOpcode::kCopyStart:
       return EmitCopyStartThunk(Cast<HloCopyStartInstruction>(hlo));
     case HloOpcode::kCopyDone:
@@ -2804,6 +2838,12 @@ AsyncThunkSequence ThunkEmitter::EmitHloInstruction(const HloInstruction* hlo,
     case HloOpcode::kParameter:
     case HloOpcode::kTuple:
       return ThunkSequence{};
+    case HloOpcode::kCall:
+    case HloOpcode::kConditional:
+    case HloOpcode::kCopy:
+    case HloOpcode::kWhile:
+      return Internal("Target-independent opcode unexpectedly reached %s",
+                      HloOpcodeString(hlo->opcode()));
     default:
       return Internal("Unsupported instruction opcode: %s",
                       HloOpcodeString(hlo->opcode()));
@@ -2812,7 +2852,7 @@ AsyncThunkSequence ThunkEmitter::EmitHloInstruction(const HloInstruction* hlo,
 }
 
 absl::StatusOr<std::unique_ptr<SequentialThunk>>
-ThunkEmitter::EmitHloEntryComputation(const HloModule* module) {
+ThunkSequenceEmitter::EmitHloEntryComputation(const HloModule* module) {
   ASSIGN_OR_RETURN(
       ThunkSequence thunks,
       std::move(EmitHloComputation(module->entry_computation())).Await());
@@ -2820,7 +2860,7 @@ ThunkEmitter::EmitHloEntryComputation(const HloModule* module) {
                                            std::move(thunks));
 }
 
-AsyncThunkSequence ThunkEmitter::EmitHloComputation(
+AsyncThunkSequence ThunkSequenceEmitter::EmitHloComputation(
     const HloComputation* computation) {
   const HloSchedule& schedule = computation->parent()->schedule();
   const HloModule* hlo_module = schedule.module();

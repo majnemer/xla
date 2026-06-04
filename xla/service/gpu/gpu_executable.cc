@@ -352,8 +352,9 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::Create(
       std::move(params.mlir_allocations), std::move(params.buffer_assignment),
       std::move(allocator.MutableAllocations()), std::move(params.alias_info),
       std::move(params.debug_options), std::move(params.constants),
-      std::move(params.output_info), params.enable_debug_info_manager,
-      std::move(params.module_stats), std::move(thunk_sequence_proto),
+      std::move(params.globals), std::move(params.output_info),
+      params.enable_debug_info_manager, std::move(params.module_stats),
+      std::move(thunk_sequence_proto),
       std::move(params.executable_abi_version),
       std::move(params.cpu_target_machine_options),
       std::move(params.buffer_assignment_proto)));
@@ -371,7 +372,7 @@ GpuExecutable::GpuExecutable(
     std::unique_ptr<const BufferAssignment> buffer_assignment,
     std::deque<BufferAllocation> thunk_pass_allocations,
     std::unique_ptr<GpuAliasInfo> alias_info, DebugOptions debug_options,
-    std::vector<ConstantInfo> constants,
+    std::vector<ConstantInfo> constants, std::vector<GlobalInfo> globals,
     absl::flat_hash_map<ShapeIndex, OutputInfo> output_info,
     bool enable_debug_info_manager, ModuleStats module_stats,
     absl::StatusOr<std::vector<ThunkProto>> thunk_sequence_proto,
@@ -398,6 +399,7 @@ GpuExecutable::GpuExecutable(
       debug_buffer_assignment_show_max_(
           debug_options.xla_debug_buffer_assignment_show_max()),
       constants_(std::move(constants)),
+      globals_(std::move(globals)),
       output_info_(std::move(output_info)),
       enable_debug_info_manager_(enable_debug_info_manager),
       thunk_sequence_proto_(std::move(thunk_sequence_proto)),
@@ -525,6 +527,8 @@ absl::Status ExecuteThunksImpl(const DebugOptions* debug_options,
                                Thunk::ExecutableSource executable_source,
                                const ServiceExecutableRunOptions* run_options,
                                const BufferAllocations& buffer_allocations,
+                               const GpuExecutable::NameToDeviceMemoryMap*
+                                   globals,
                                bool block_host_until_done,
                                int64_t num_additional_compute_streams,
                                CollectiveMemoryCache& collective_memory_cache,
@@ -770,6 +774,7 @@ absl::Status ExecuteThunksImpl(const DebugOptions* debug_options,
         executor,
         executable_source,
         &buffer_allocations,
+        globals,
         main_stream,
         command_buffer_trace_stream,
         &collective_params,
@@ -993,7 +998,7 @@ absl::Status BarrierAfterExecutable(
 
 }  // namespace
 
-absl::StatusOr<const GpuExecutable::BufferAllocToDeviceMemoryMap*>
+absl::StatusOr<const GpuExecutable::ResolvedGlobals*>
 GpuExecutable::ResolveConstantGlobals(se::Stream* stream) {
   se::StreamExecutor* executor = stream->parent();
 
@@ -1009,13 +1014,16 @@ GpuExecutable::ResolveConstantGlobals(se::Stream* stream) {
   }
   module_spec.AddCudaPtxInMemory(text().c_str());
 
-  auto globals = std::make_unique<BufferAllocToDeviceMemoryMap>();
+  auto globals = std::make_unique<ResolvedGlobals>();
   se::ModuleHandle module_handle;
-  // Backends without implicit constant allocation (Metal) use this list to
-  // allocate device backing per constant; CUDA pulls constants from PTX in
-  // LoadModule and ignores it.
+  // Backends without implicit constant/global allocation (Metal) use these
+  // lists to allocate device backing. CUDA pulls constants and globals from PTX
+  // in LoadModule and ignores them.
   for (const ConstantInfo& info : constants_) {
     module_spec.AddConstant(info.symbol_name, info.content.span());
+  }
+  for (const GlobalInfo& info : globals_) {
+    module_spec.AddConstant(info.symbol_name, info.initial_value.span());
   }
   // The CUDA driver rejects loading an empty PTX/cubin combo; skip in that
   // case. Symbol lookups will fail as they should for an empty module.
@@ -1051,8 +1059,27 @@ GpuExecutable::ResolveConstantGlobals(se::Stream* stream) {
     }
 
     if (info.allocation_index != -1) {
-      InsertOrDie(globals.get(), info.allocation_index, global);
+      InsertOrDie(&globals->constants, info.allocation_index, global);
     }
+  }
+  for (const GlobalInfo& info : globals_) {
+    se::DeviceAddressBase global;
+    absl::StatusOr<stream_executor::DeviceAddressBase> global_status;
+    if (static_cast<bool>(module_handle)) {
+      global_status = executor->GetSymbol(info.symbol_name, module_handle);
+    }
+    CHECK(static_cast<bool>(module_handle) && global_status.ok());
+    global = *global_status;
+    XLA_VLOG_DEVICE(3, executor->device_ordinal()) << absl::StreamFormat(
+        "Resolved global %s to %p", info.symbol_name, global.opaque());
+
+    if (!info.initial_value.span().empty()) {
+      RETURN_IF_ERROR(stream->Memcpy(&global, info.initial_value.span().data(),
+                                     info.initial_value.span().size()));
+      submitted_mem_copies = true;
+    }
+
+    InsertOrDie(&globals->globals, info.symbol_name, global);
   }
 
   // Wait for the completion of all host->device transfers, to guarantee that
@@ -1257,7 +1284,7 @@ absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
     gpu_lock.emplace<1>(&GetGpuMutex(executor));
   }
 
-  const GpuExecutable::BufferAllocToDeviceMemoryMap* globals;
+  const GpuExecutable::ResolvedGlobals* globals;
   {
     tsl::profiler::TraceMe hlo_module_activity(
         [&] { return std::string("Resolve constant globals"); },
@@ -1277,7 +1304,8 @@ absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
                          executor->device_ordinal());
 
   ASSIGN_OR_RETURN(BufferAllocations buffer_allocations,
-                   GenerateBufferAllocations(run_options, arguments, globals,
+                   GenerateBufferAllocations(run_options, arguments,
+                                             &globals->constants,
                                              memory_allocator, device_ordinal));
   XLA_VLOG_DEVICE(3, device_ordinal) << buffer_allocations.ToString();
   absl::Span<const BufferAllocation* const> allocations = GetAllocations();
@@ -1396,7 +1424,8 @@ absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
     buffers_in_result.insert(result_buffer);
   }
 
-  absl::Status execute_status = ExecuteThunks(buffer_allocations, run_options);
+  absl::Status execute_status =
+      ExecuteThunks(buffer_allocations, &globals->globals, run_options);
 
   absl::Status teardown_status =
       buffer_allocations.TearDown(buffers_in_result, GetAllocations());
@@ -1432,6 +1461,7 @@ absl::Status GpuExecutable::VerboseAllocationError(absl::Status s) {
 // clang-format on
 absl::Status GpuExecutable::ExecuteThunksWithVaRemapping(
     const BufferAllocations& buffer_allocations,
+    const NameToDeviceMemoryMap* globals,
     const ServiceExecutableRunOptions* run_options,
     se::StreamExecutor* executor, int64_t unique_id,
     Thunk::ExecutableSource executable_source, bool block_host_until_done,
@@ -1637,7 +1667,7 @@ absl::Status GpuExecutable::ExecuteThunksWithVaRemapping(
   TF_RETURN_IF_ERROR(ExecuteThunksImpl(
       has_module() ? &module_config().debug_options() : nullptr, module_name_,
       unique_id, *thunk_executor_, executable_source, run_options,
-      remapped_buffer_allocations, block_host_until_done,
+      remapped_buffer_allocations, globals, block_host_until_done,
       num_additional_compute_streams_, collective_memory_cache_,
       collective_use_minimal_resource));
 
@@ -1657,6 +1687,7 @@ std::optional<BufferAssignmentProto> GpuExecutable::buffer_assignment_proto()
 }
 absl::Status GpuExecutable::ExecuteThunks(
     const BufferAllocations& buffer_allocations,
+    const NameToDeviceMemoryMap* globals,
     const ServiceExecutableRunOptions* run_options) {
   tsl::profiler::TraceMe trace([&] {
     return tsl::profiler::TraceMeEncode(
@@ -1747,13 +1778,14 @@ absl::Status GpuExecutable::ExecuteThunks(
   }
   if (use_command_buffer_va_remapping) {
     TF_RETURN_IF_ERROR(ExecuteThunksWithVaRemapping(
-        buffer_allocations, run_options, executor, unique_id, executable_source,
-        block_host_until_done, collective_use_minimal_resource));
+        buffer_allocations, globals, run_options, executor, unique_id,
+        executable_source, block_host_until_done,
+        collective_use_minimal_resource));
   } else {
     TF_RETURN_IF_ERROR(ExecuteThunksImpl(
         has_module() ? &module_config().debug_options() : nullptr, module_name_,
         unique_id, *thunk_executor_, executable_source, run_options,
-        buffer_allocations, block_host_until_done,
+        buffer_allocations, globals, block_host_until_done,
         num_additional_compute_streams_, collective_memory_cache_,
         collective_use_minimal_resource));
   }
@@ -1885,6 +1917,20 @@ GpuExecutable::ConstantInfo GpuExecutable::ConstantInfo::FromProto(
       /*allocation_index=*/static_cast<int>(proto.allocation_index())};
 }
 
+GpuExecutableProto::GlobalInfoProto GpuExecutable::GlobalInfo::ToProto() const {
+  GpuExecutableProto::GlobalInfoProto proto;
+  proto.set_symbol_name(symbol_name);
+  *proto.mutable_initial_value() = initial_value.ToProto();
+  return proto;
+}
+
+GpuExecutable::GlobalInfo GpuExecutable::GlobalInfo::FromProto(
+    const GpuExecutableProto::GlobalInfoProto& proto) {
+  return GlobalInfo{
+      /*symbol_name=*/proto.symbol_name(),
+      /*initial_value=*/DenseDataIntermediate::FromProto(proto.initial_value())};
+}
+
 absl::StatusOr<GpuExecutableProto> GpuExecutable::ToProto() const {
   GpuExecutableProto proto;
   proto.set_binary(binary_.data(), binary_.size());
@@ -1935,6 +1981,11 @@ absl::StatusOr<GpuExecutableProto> GpuExecutable::ToProto() const {
   proto.mutable_constants()->Reserve(constants_.size());
   for (const auto& constant : constants_) {
     *proto.add_constants() = constant.ToProto();
+  }
+
+  proto.mutable_globals()->Reserve(globals_.size());
+  for (const auto& global : globals_) {
+    *proto.add_globals() = global.ToProto();
   }
 
   *proto.mutable_executable_abi_version() = executable_abi_version_.proto();
@@ -2025,6 +2076,11 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::FromProto(
   params.constants.reserve(proto.constants().size());
   for (const auto& constant_proto : proto.constants()) {
     params.constants.push_back(ConstantInfo::FromProto(constant_proto));
+  }
+
+  params.globals.reserve(proto.globals().size());
+  for (const auto& global_proto : proto.globals()) {
+    params.globals.push_back(GlobalInfo::FromProto(global_proto));
   }
 
   params.output_info.reserve(proto.output_info_map().size());

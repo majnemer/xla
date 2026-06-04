@@ -96,6 +96,17 @@ message GpuExecutableProto {
   // The constants used by the executable.
   repeated ConstantInfoProto constants = 12;
 
+  message GlobalInfoProto {
+    // The name of the executable-owned global symbol.
+    string symbol_name = 1;
+
+    // The initial value copied into the global symbol at module load time.
+    DenseDataIntermediateProto initial_value = 2;
+  }
+
+  // Mutable executable-owned global symbols used by backend-specific thunks.
+  repeated GlobalInfoProto globals = 16;
+
   // The ABI version of the executable.
   stream_executor.ExecutableAbiVersionProto executable_abi_version = 14;
 

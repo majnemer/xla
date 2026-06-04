@@ -740,6 +740,7 @@ GpuLLVMCompiler::CompileToBackendResult(
           std::make_unique<ThunkExecutor>(
               std::move(res.compile_module_results.executable->thunks())),
           /*constants=*/std::move(res.compile_module_results.constants),
+          /*globals=*/{},
           /*output_info=*/std::move(res.compile_module_results.output_info),
           /*module_name=*/std::move(res.compile_module_results.module_name),
           /*program_shape=*/
@@ -962,6 +963,7 @@ GpuLLVMCompiler::LoadExecutableFromAotResult(
         /*executable=*/
         std::make_unique<ThunkExecutor>(std::move(sequential_thunk->thunks())),
         /*constants=*/std::move(constants),
+        /*globals=*/{},
         /*output_info=*/std::move(output_info),
         /*module_name=*/std::move(hlo_module_name),
         /*program_shape=*/std::move(program_shape),

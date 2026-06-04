@@ -56,6 +56,7 @@ limitations under the License.
 #include "xla/service/gpu/buffer_allocations.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/service_executable_run_options.h"
+#include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/concurrency/future.h"
@@ -239,6 +240,9 @@ class Thunk {
     ExecutableSource src;
 
     const BufferAllocations* buffer_allocations = nullptr;
+    // Executable-owned global symbols resolved for this executor.
+    const absl::flat_hash_map<std::string, se::DeviceAddressBase>* globals =
+        nullptr;
 
     // Main compute stream that will be used, passed via `ExecuteParams` to
     // `ExecuteOnStream`. It can be used to initialize on-device "state" (i.e.
