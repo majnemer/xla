@@ -80,9 +80,9 @@ void MatMul(const Eigen::ThreadPoolDevice* device, OutType* out, LhsType* lhs,
 
   if (device != nullptr) {
     c.device(*device, std::move(done)) =
-        a.contract(b, dims).template cast<OutType>();
+        a.template cast<OutType>().contract(b.template cast<OutType>(), dims);
   } else {
-    c = a.contract(b, dims).template cast<OutType>();
+    c = a.template cast<OutType>().contract(b.template cast<OutType>(), dims);
     done();
   }
 }
