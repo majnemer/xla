@@ -15,10 +15,6 @@ limitations under the License.
 
 // Tests the select-and-scatter XLA operation.
 
-// b/194424657: On macs, the compiler hangs when trying to compile this file
-
-#if !defined(__APPLE__)
-
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -600,5 +596,3 @@ TEST_F(SelectAndScatterTest, R1F32OverlappingWindowMinScatter) {
 
 }  // namespace
 }  // namespace xla
-
-#endif  // !defined(__APPLE__)
