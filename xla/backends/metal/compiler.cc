@@ -48,6 +48,8 @@ limitations under the License.
 #include "xla/backends/metal/codegen/msl_kernel_emitter.h"
 #include "xla/backends/metal/codegen/msl_kernel_source.h"
 #include "xla/backends/metal/codegen/transforms/passes.h"
+#include "xla/backends/metal/runtime/metal_kernel_artifact.h"
+#include "xla/backends/metal/runtime/metal_kernel_thunk.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/codegen/emitters/transforms/passes.h"
 #include "xla/codegen/ir_printing.h"
@@ -84,7 +86,9 @@ limitations under the License.
 #include "xla/stream_executor/device_memory.h"
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/kernel_args.h"
+#include "xla/stream_executor/metal/metal_device_handle.h"
 #include "xla/stream_executor/metal/metal_platform_id.h"
+#include "xla/stream_executor/metal/metal_pso_probe.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/platform/env.h"
@@ -131,17 +135,17 @@ MaybeOwningThreadPool CreateMaybeOwningThreadPool(
   }
 }
 
-// Per-fusion state captured by the serial HLO walk. The MLIR module is built
-// in `context` (owned per-fusion so the parallel phase can run passes without
-// any cross-fusion MLIRContext contention). The MSL string is filled in by
-// the parallel lower+translate phase.
+// Per-fusion state captured by the serial HLO walk. Phase 1 records only the
+// bookkeeping (entry name, kernel arguments, the source HloFusionInstruction);
+// MLIR emission, lowering, MSL translation, PSO compile and PSO retry all run
+// in Phase 2 inside `BuildArtifact`. The MetalKernelThunk pointer lets Phase 2
+// install the resulting artifact once compilation settles.
 struct DeferredFusion {
-  std::string fusion_name;          // for diagnostics
-  std::unique_ptr<mlir::MLIRContext> context;
-  MlirKernelSource mlir_source;     // module is in `context`
-  std::string entry_name;           // globally unique; reused as MSL entry.
-  int unroll_factor;                // captured from the kernel emitter.
-  std::string msl;                  // filled by Phase 2.
+  std::string fusion_name;
+  const HloFusionInstruction* fusion_instr;
+  std::string entry_name;                  // globally unique.
+  emitters::KernelArguments kernel_args;
+  xla::metal::MetalKernelThunk* thunk;     // owned by SequentialThunk.
 };
 
 class RngGetAndUpdateStateThunk final : public gpu::Thunk {
@@ -304,66 +308,31 @@ class MetalThunkEmissionBackend final : public gpu::ThunkEmissionBackend {
 
   absl::StatusOr<gpu::ThunkSequence> EmitFusion(
       const HloFusionInstruction* fusion_instr) {
-    // Per-fusion MLIRContext so the parallel lower+translate phase (run later
-    // in CompileToBackendResult) can mutate each module without serializing
-    // on a shared context. Mirrors gpu_llvm_compiler.cc's per-thread fresh
-    // LLVMContext + CopyToContext pattern, but we construct directly in the
-    // per-fusion context instead of cloning.
-    auto context = std::make_unique<mlir::MLIRContext>();
-    context->appendDialectRegistry(
-        gpu::MlirKernelEmitter::GetDialectRegistry());
-    context->loadAllAvailableDialects();
-
-    gpu::HloFusionAnalysis fusion_analysis =
-        gpu::HloFusionAnalysis::Create(*fusion_instr, gpu_device_info_);
-    gpu::HloFusionInfo fusion_info(fusion_analysis, fusion_instr,
-                                   buffer_assignment_, *call_graph_);
-    std::unique_ptr<gpu::FusionInterface> emitter =
-        gpu::GetFusionEmitter(fusion_info, context.get());
-    auto* mlir_fusion = dynamic_cast<gpu::MlirKernelFusion*>(emitter.get());
-    if (mlir_fusion == nullptr) {
-      return Unimplemented(
-          "MetalCompiler::CompileToBackendResult: fusion '%s' uses a "
-          "non-MLIR emitter (e.g. Triton / CustomFusion); only MLIR-"
-          "kernel fusions are supported on Metal.",
-          fusion_instr->name());
-    }
     TF_ASSIGN_OR_RETURN(
         emitters::KernelArguments kernel_args,
         emitters::KernelArguments::Create(*buffer_assignment_,
                                           gpu::GetDefaultBufferAlignment(),
                                           fusion_instr));
     // Reserve the MSL entry name on the shared NameUniquer up front, while
-    // we're still serial. The translator in the parallel phase will see this
-    // exact name as the MLIR function name and (via a fusion-local
-    // NameUniquer) accept it as-is. Helpers inside the fusion's MSL are
-    // prefixed with this entry name (see GetUniqueMslHelperName), so they
-    // can't collide across fusions either.
+    // we're still serial. The translator (run in Phase 2) is told to treat
+    // this as the MLIR function name; helpers inside the fusion's MSL are
+    // prefixed with it so they can't collide across fusions either.
     std::string entry_name = msl_function_name_uniquer_->GetUniqueName(
         llvm_ir::SanitizeFunctionName(std::string(fusion_instr->name())));
-    TF_ASSIGN_OR_RETURN(MlirKernelSource mlir_source,
-                        mlir_fusion->mlir_kernel_emitter()->Emit(
-                            context.get(), *fusion_instr, entry_name,
-                            buffer_assignment_));
 
-    const gpu::LaunchDimensions launch_dims = mlir_fusion->launch_dimensions();
-    int unroll_factor = mlir_fusion->mlir_kernel_emitter()->unroll_factor();
+    auto thunk = std::make_unique<xla::metal::MetalKernelThunk>(
+        GetThunkInfo(fusion_instr), kernel_args);
+    auto* thunk_ptr = thunk.get();
+    gpu::ThunkSequence thunks;
+    thunks.push_back(std::move(thunk));
 
     deferred_fusions_->push_back(DeferredFusion{
         /*fusion_name=*/std::string(fusion_instr->name()),
-        /*context=*/std::move(context),
-        /*mlir_source=*/std::move(mlir_source),
-        /*entry_name=*/entry_name,
-        /*unroll_factor=*/unroll_factor,
-        /*msl=*/{},
+        /*fusion_instr=*/fusion_instr,
+        /*entry_name=*/std::move(entry_name),
+        /*kernel_args=*/std::move(kernel_args),
+        /*thunk=*/thunk_ptr,
     });
-
-    gpu::ThunkSequence thunks;
-    thunks.push_back(std::make_unique<gpu::KernelThunk>(
-        GetThunkInfo(fusion_instr), entry_name, std::move(kernel_args),
-        launch_dims,
-        /*cluster_dim=*/std::nullopt, /*shmem_bytes=*/0,
-        se::gpu::TmaMetadata{}));
     return thunks;
   }
 
@@ -566,9 +535,24 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
       std::unique_ptr<gpu::SequentialThunk> sequential_thunk,
       thunk_emitter.EmitHloEntryComputation(hlo_module.get()));
 
-  // Phase 2: lower each deferred fusion's MLIR and translate to MSL in
-  // parallel. Each fusion owns its own MLIRContext (constructed in Phase 1),
-  // so the PassManager and translator can run without cross-fusion locking.
+  // Phase 2: per-fusion retry loop. Each worker emits MLIR (with a derived
+  // device description that caps threads_per_block_limit at the current
+  // hint), lowers, translates to MSL, compiles + probes the PSO. If the PSO
+  // reports a ceiling below the launch's requested threads, we drop the hint
+  // and re-emit. The loop floors at the device's SIMD width — if the kernel
+  // can't fit even one SIMD group's worth of threads, we surface a
+  // ResourceExhaustedError naming the fusion.
+  //
+  // PSO compilation requires a live id<MTLDevice>; MetalCompiler already
+  // rejects null stream_exec at entry so this is always available here.
+  void* metal_device =
+      stream_executor::metal::GetMetalDeviceOpaque(stream_exec);
+  if (metal_device == nullptr) {
+    return absl::FailedPreconditionError(
+        "MetalCompiler::CompileToBackendResult: stream executor is not a "
+        "MetalExecutor or device handle is unavailable.");
+  }
+
   // Thread-pool sourcing follows gpu_llvm_compiler's pattern: explicit caller
   // pool > `--xla_gpu_force_compilation_parallelism` flag > serial.
   MaybeOwningThreadPool thread_pool = CreateMaybeOwningThreadPool(
@@ -578,79 +562,186 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
       /*default_thread_pool=*/options.thread_pool,
       /*default_parallelism=*/1);
 
-  auto lower_and_translate = [&](DeferredFusion& deferred) -> absl::Status {
-    mlir::ModuleOp module = deferred.mlir_source.module();
-    mlir::PassManager pm(module.getContext());
-    gpu::AddLoopTransformationPasses(pm, gpu_device_info,
-                                     deferred.unroll_factor,
-                                     /*max_vector_elements=*/4);
-    // The inliner inside AddLoopTransformationPasses leaves large /
-    // multiply-called subcomputations as xla.pure_call; rewrite those to
-    // func.call, which the MSL translator emits as device functions.
-    pm.addNestedPass<mlir::func::FuncOp>(
-        emitters::CreateConvertPureCallOpsPass());
-    pm.addNestedPass<mlir::func::FuncOp>(
-        emitters::CreateSimplifyArithPass());
-    pm.addPass(emitters::CreateSimplifyAffinePass());
-    pm.addPass(gpu::CreateConvertIndexTypePass());
-    pm.addPass(mlir::createLowerAffinePass());
-    pm.addPass(mlir::createLoopInvariantCodeMotionPass());
-    pm.addPass(mlir::createSymbolDCEPass());
-    pm.addPass(mlir::createCSEPass());
-    pm.addPass(CreateConvertComplexToArithMathPass());
-    pm.addPass(emitters::CreateExpandFloatOpsPass());
-    pm.addPass(CreateExpandFloatOpsPass());
-    pm.addPass(CreateLowerSubByteStoragePass());
-    pm.addPass(CreateLowerFloatStoragePass());
-    pm.addPass(mlir::createLowerAffinePass());
-    std::string dump_kernel_name =
-        absl::StrCat(deferred.entry_name, ".metal-lowering");
-    EnableIRPrintingIfRequested(pm, module.getContext(), *hlo_module,
-                                dump_kernel_name, "mlir-fusion");
-    if (mlir::failed(pm.run(module))) {
-      return absl::InternalError(absl::StrCat(
-          "MetalCompiler::CompileToBackendResult: MLIR lowering pipeline "
-          "failed on fusion '",
-          deferred.fusion_name, "'."));
+  // Per-fusion artifact build: emit MLIR, lower, translate, compile PSO,
+  // probe + retry. On success returns the artifact (PSO + launch dims) and
+  // the MSL string (for `asm_text` dump consumers). On failure returns a
+  // status naming the fusion.
+  struct BuildResult {
+    std::unique_ptr<MetalKernelArtifact> artifact;
+    std::string msl;
+  };
+  auto build_artifact = [&](const DeferredFusion& deferred,
+                            int64_t initial_max_threads_per_block)
+      -> absl::StatusOr<BuildResult> {
+    const int64_t simd_width = gpu_device_info.threads_per_warp();
+    int64_t hint = initial_max_threads_per_block;
+    int64_t last_requested = -1;
+    std::string last_msl;
+    for (;;) {
+      if (hint < simd_width) {
+        return absl::ResourceExhaustedError(absl::StrCat(
+            "Fusion '", deferred.fusion_name,
+            "': cannot satisfy PSO maxTotalThreadsPerThreadgroup at any "
+            "threadgroup size >= ",
+            simd_width,
+            " (SIMD width). Per-kernel register pressure too high on this "
+            "device."));
+      }
+      // Build a derived device description with the current cap; pass it to
+      // HloFusionAnalysis so the reduction emitter (and any other emitter
+      // that consults threads_per_block_limit) shapes num_threads_
+      // accordingly.
+      se::DeviceDescription dev = gpu_device_info;
+      dev.set_threads_per_block_limit(hint);
+
+      // Per-fusion MLIRContext: no cross-fusion contention, no cross-attempt
+      // contamination (each retry starts fresh).
+      auto context = std::make_unique<mlir::MLIRContext>();
+      context->appendDialectRegistry(
+          gpu::MlirKernelEmitter::GetDialectRegistry());
+      context->loadAllAvailableDialects();
+
+      gpu::HloFusionAnalysis fusion_analysis =
+          gpu::HloFusionAnalysis::Create(*deferred.fusion_instr, dev);
+      gpu::HloFusionInfo fusion_info(fusion_analysis, deferred.fusion_instr,
+                                     buffer_assignment.get(), *call_graph);
+      std::unique_ptr<gpu::FusionInterface> emitter =
+          gpu::GetFusionEmitter(fusion_info, context.get());
+      auto* mlir_fusion =
+          dynamic_cast<gpu::MlirKernelFusion*>(emitter.get());
+      if (mlir_fusion == nullptr) {
+        return Unimplemented(
+            "MetalCompiler::CompileToBackendResult: fusion '%s' uses a "
+            "non-MLIR emitter (e.g. Triton / CustomFusion); only MLIR-"
+            "kernel fusions are supported on Metal.",
+            deferred.fusion_name);
+      }
+      TF_ASSIGN_OR_RETURN(MlirKernelSource mlir_source,
+                          mlir_fusion->mlir_kernel_emitter()->Emit(
+                              context.get(), *deferred.fusion_instr,
+                              deferred.entry_name, buffer_assignment.get()));
+      gpu::LaunchDimensions launch_dims = mlir_fusion->launch_dimensions();
+      int unroll_factor =
+          mlir_fusion->mlir_kernel_emitter()->unroll_factor();
+
+      mlir::ModuleOp module = mlir_source.module();
+      mlir::PassManager pm(module.getContext());
+      gpu::AddLoopTransformationPasses(pm, dev, unroll_factor,
+                                       /*max_vector_elements=*/4);
+      pm.addNestedPass<mlir::func::FuncOp>(
+          emitters::CreateConvertPureCallOpsPass());
+      pm.addNestedPass<mlir::func::FuncOp>(
+          emitters::CreateSimplifyArithPass());
+      pm.addPass(emitters::CreateSimplifyAffinePass());
+      pm.addPass(gpu::CreateConvertIndexTypePass());
+      pm.addPass(mlir::createLowerAffinePass());
+      pm.addPass(mlir::createLoopInvariantCodeMotionPass());
+      pm.addPass(mlir::createSymbolDCEPass());
+      pm.addPass(mlir::createCSEPass());
+      pm.addPass(CreateConvertComplexToArithMathPass());
+      pm.addPass(emitters::CreateExpandFloatOpsPass());
+      pm.addPass(CreateExpandFloatOpsPass());
+      pm.addPass(CreateLowerSubByteStoragePass());
+      pm.addPass(CreateLowerFloatStoragePass());
+      pm.addPass(mlir::createLowerAffinePass());
+      std::string dump_kernel_name =
+          absl::StrCat(deferred.entry_name, ".metal-lowering");
+      EnableIRPrintingIfRequested(pm, module.getContext(), *hlo_module,
+                                  dump_kernel_name, "mlir-fusion");
+      if (mlir::failed(pm.run(module))) {
+        return absl::InternalError(absl::StrCat(
+            "MetalCompiler::CompileToBackendResult: MLIR lowering pipeline "
+            "failed on fusion '",
+            deferred.fusion_name, "'."));
+      }
+      NameUniquer per_fusion_uniquer;
+      TF_ASSIGN_OR_RETURN(metal::MslKernelSource msl_source,
+                          metal::EmitMslKernel(module, &per_fusion_uniquer,
+                                               *hlo_module,
+                                               deferred.entry_name));
+      last_msl = std::move(msl_source).source();
+
+      // Compile + probe the PSO with the same hint we used to constrain the
+      // emitter. The descriptor hint also tells Metal "you can spend up to
+      // this many threads' worth of registers per thread," which usually
+      // raises pso.maxTotalThreadsPerThreadgroup back up to the hint.
+      TF_ASSIGN_OR_RETURN(
+          stream_executor::metal::CompiledPipeline compiled,
+          stream_executor::metal::CompileAndProbe(metal_device, last_msl,
+                                                  deferred.entry_name, hint));
+      int64_t requested = launch_dims.num_threads_per_block();
+      // If the emitter can't honor a smaller cap (i.e., launch dims didn't
+      // shrink despite a lower hint), retry is hopeless. Surface a
+      // ResourceExhausted instead of spinning. This is the expected path for
+      // emitters like ColumnReductionFusion whose num_threads_ is hard-wired
+      // to 1024 by the indexing-map algebra.
+      if (last_requested == requested && requested > compiled.pso_max_threads) {
+        return absl::ResourceExhaustedError(absl::StrCat(
+            "Fusion '", deferred.fusion_name, "': emitter requires ",
+            requested,
+            " threads per threadgroup, but the device's PSO grants only ",
+            compiled.pso_max_threads,
+            " (register pressure). The emitter for this fusion does not "
+            "honor the threads_per_block_limit soft cap, so retry cannot "
+            "shrink the threadgroup."));
+      }
+      last_requested = requested;
+      if (compiled.pso_max_threads >= requested) {
+        const unsigned arity =
+            static_cast<unsigned>(deferred.kernel_args.args().size());
+        auto artifact = std::make_unique<MetalKernelArtifact>(
+            deferred.entry_name, arity, launch_dims,
+            std::move(compiled.pso));
+        return BuildResult{std::move(artifact), std::move(last_msl)};
+      }
+      // PSO won't host the launch. Drop the hint to a multiple of SIMD width
+      // at or below the PSO's reported ceiling and retry. Using a SIMD
+      // multiple keeps the threadgroup from leaving partial warps unused.
+      int64_t next = (compiled.pso_max_threads / simd_width) * simd_width;
+      if (next >= hint) {
+        // Metal contradicted itself — don't spin.
+        next = hint - simd_width;
+      }
+      VLOG(1) << "Fusion '" << deferred.fusion_name << "': requested "
+              << requested << " threads, PSO ceiling "
+              << compiled.pso_max_threads << "; retrying with hint " << next;
+      hint = next;
     }
-    // Per-fusion NameUniquer for helper-name allocation. The entry name was
-    // pre-reserved on the shared uniquer in Phase 1 and is globally unique;
-    // helper names are prefixed with the entry name so they can't collide
-    // across fusions either.
-    NameUniquer per_fusion_uniquer;
-    TF_ASSIGN_OR_RETURN(metal::MslKernelSource msl_source,
-                        metal::EmitMslKernel(module, &per_fusion_uniquer,
-                                             *hlo_module, deferred.entry_name));
-    deferred.msl = std::move(msl_source).source();
-    return absl::OkStatus();
   };
 
-  std::vector<absl::Status> statuses(deferred_fusions.size(), absl::OkStatus());
+  std::vector<absl::StatusOr<BuildResult>> results(deferred_fusions.size());
   if (thread_pool) {
     absl::BlockingCounter counter(deferred_fusions.size());
     for (size_t i = 0; i < deferred_fusions.size(); ++i) {
       thread_pool.get_mutable()->Schedule([&, i] {
-        statuses[i] = lower_and_translate(deferred_fusions[i]);
+        results[i] = build_artifact(
+            deferred_fusions[i],
+            /*initial_max_threads_per_block=*/
+            gpu_device_info.threads_per_block_limit());
         counter.DecrementCount();
       });
     }
     counter.Wait();
   } else {
     for (size_t i = 0; i < deferred_fusions.size(); ++i) {
-      statuses[i] = lower_and_translate(deferred_fusions[i]);
+      results[i] = build_artifact(
+          deferred_fusions[i],
+          /*initial_max_threads_per_block=*/
+          gpu_device_info.threads_per_block_limit());
     }
   }
-  for (const absl::Status& status : statuses) {
-    TF_RETURN_IF_ERROR(status);
+  for (size_t i = 0; i < deferred_fusions.size(); ++i) {
+    TF_RETURN_IF_ERROR(results[i].status());
   }
 
-  // Phase 3: concatenate per-fusion MSL into the shared blob in HLO order.
-  // RNG / constants are already in `msl_blob` from Phase 1.
-  for (DeferredFusion& deferred : deferred_fusions) {
-    if (!msl_blob.empty()) {
-      msl_blob.append("\n");
-    }
-    msl_blob.append(deferred.msl);
+  // Phase 3: install artifacts on their thunks and concatenate MSL into
+  // `asm_text` for debug-dump consumers. The runtime no longer reads the
+  // MSL — MetalKernelThunk dispatches via the artifact's precompiled PSO.
+  for (size_t i = 0; i < deferred_fusions.size(); ++i) {
+    BuildResult build_result = *std::move(results[i]);
+    deferred_fusions[i].thunk->SetArtifact(std::move(build_result.artifact));
+    if (!msl_blob.empty()) msl_blob.append("\n");
+    msl_blob.append(build_result.msl);
   }
 
   TF_ASSIGN_OR_RETURN(auto output_info,

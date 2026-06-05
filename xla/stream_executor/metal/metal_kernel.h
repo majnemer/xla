@@ -49,6 +49,17 @@ class MetalKernel : public Kernel {
   static absl::StatusOr<std::unique_ptr<MetalKernel>> Create(
       MetalExecutor* executor, id<MTLLibrary> library,
       absl::string_view entry_point, unsigned arity);
+
+  // Constructs a MetalKernel from an externally-built (and CFRetained)
+  // MTLComputePipelineState. Used by MetalKernelThunk to wrap a precompiled
+  // PSO produced by xla::metal::CompileAndProbe at compile time, bypassing
+  // both MSL compilation and PSO creation at runtime.
+  //
+  // `pso` must already be retained; this factory takes a +1 reference. The
+  // resulting MetalKernel holds no MTLFunction (function() returns nil).
+  static absl::StatusOr<std::unique_ptr<MetalKernel>> CreateFromPSO(
+      MetalExecutor* executor, id<MTLComputePipelineState> pso, unsigned arity);
+
   ~MetalKernel() override;
 
   unsigned Arity() const override { return arity_; }

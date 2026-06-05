@@ -125,6 +125,29 @@ absl::StatusOr<std::unique_ptr<MetalKernel>> MetalKernel::Create(
       new MetalKernel(executor, pso, function, arity));
 }
 
+absl::StatusOr<std::unique_ptr<MetalKernel>> MetalKernel::CreateFromPSO(
+    MetalExecutor* executor, id<MTLComputePipelineState> pso, unsigned arity) {
+  if (executor == nullptr) {
+    return absl::InvalidArgumentError(
+        "MetalKernel::CreateFromPSO: executor is null.");
+  }
+  if (pso == nil) {
+    return absl::InvalidArgumentError(
+        "MetalKernel::CreateFromPSO: pso is nil.");
+  }
+  const auto pso_simd = static_cast<int64_t>([pso threadExecutionWidth]);
+  const int64_t expected_simd =
+      executor->GetDeviceDescription().threads_per_warp();
+  if (pso_simd != expected_simd) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "MetalKernel::CreateFromPSO: PSO threadExecutionWidth (", pso_simd,
+        ") differs from DeviceDescription threads_per_warp (", expected_simd,
+        ")."));
+  }
+  return std::unique_ptr<MetalKernel>(
+      new MetalKernel(executor, pso, /*function=*/nil, arity));
+}
+
 absl::StatusOr<int32_t> MetalKernel::GetMaxOccupiedBlocksPerCore(
     ThreadDim /*threads*/, size_t /*dynamic_shared_memory_bytes*/) const {
   // Metal has no per-SM occupancy query; return 1 to keep callers

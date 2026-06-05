@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "xla/stream_executor/metal/metal_executor.h"
 
+#include "xla/stream_executor/metal/metal_device_handle.h"
+
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -525,6 +527,15 @@ bool MetalExecutor::DeviceMemoryUsage(int64_t* free, int64_t* total) const {
   *total = total_bytes;
   *free = std::max<int64_t>(0, total_bytes - allocated);
   return true;
+}
+
+void* GetMetalDeviceOpaque(StreamExecutor* stream_exec) {
+  if (stream_exec == nullptr) return nullptr;
+  auto* metal_executor = dynamic_cast<MetalExecutor*>(stream_exec);
+  if (metal_executor == nullptr) return nullptr;
+  id<MTLDevice> device = metal_executor->device();
+  if (device == nil) return nullptr;
+  return (__bridge void*)device;
 }
 
 }  // namespace metal
