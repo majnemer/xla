@@ -185,9 +185,12 @@ class MultiRowReductionFusion : public ReductionFusion {
 
  protected:
   // Returns the number of {kept, reduced} threads for the given reduction and
-  // vector size.
+  // vector size. `max_threads_per_block` caps the total threads per block so
+  // backends can shrink the threadgroup during retry (e.g., Metal under
+  // register pressure).
   static absl::InlinedVector<int64_t, 4> GetNumThreads(
-      const ReductionDimensions& reduction_dimensions, int vector_size);
+      const ReductionDimensions& reduction_dimensions, int vector_size,
+      int64_t max_threads_per_block);
   static int64_t GetNumBlocks(
       const ReductionDimensions& reduction_dimensions,
       const absl::InlinedVector<int64_t, 4>& num_threads);
