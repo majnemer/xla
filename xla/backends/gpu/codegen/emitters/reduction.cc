@@ -735,7 +735,11 @@ SmallColumnReductionFusion::SmallColumnReductionFusion(
   // size when computing the vector size.
   vector_size_ = GetVectorSizeForMlir(
       analysis, /*minor_dim=*/input_shape_[1] * input_shape_[2], kTileSize);
-  num_threads_ = {128};
+  // Honor the device's threads-per-block soft cap. Targets the design max of
+  // 128 unless the device reports a lower ceiling (e.g., Metal lowering the
+  // cap during the per-fusion PSO retry loop).
+  num_threads_ = {std::min<int64_t>(
+      128, analysis.device_info().threads_per_block_limit())};
   shared_rows_ = vector_size_ * num_threads_[0] / input_shape_[kColMinorKept];
 
   // If we have more than 32 shared rows, we'd have to go through shared
@@ -858,7 +862,10 @@ RowReductionFusion::RowReductionFusion(const HloFusionAnalysis& analysis)
   // parallelizing the z dimension (major reduced dimensions). The general
   // recommendation is to use between 128 and 512 threads, so we just go for
   // 256. See https://forums.developer.nvidia.com/t/55529
-  constexpr int64_t kThreadsPerBlockTarget = 256;
+  // Capped at the device's threads-per-block soft cap so backends can shrink
+  // the threadgroup during retry (e.g., Metal under register pressure).
+  const int64_t kThreadsPerBlockTarget =
+      std::min<int64_t>(256, analysis.device_info().threads_per_block_limit());
   if (num_threads_reduced * 2 <= kThreadsPerBlockTarget) {
     int64_t kept_size = reduction_dimensions_.dimensions[kRowKept];
     // Increase the size of the y dimension as long as there's remaining
@@ -996,7 +1003,8 @@ MultiRowReductionFusion::MultiRowReductionFusion(
   CHECK(reduction_dimensions_.is_row_reduction);
   Vector3 shape = reduction_dimensions_.dimensions;
   input_shape_ = {shape[0], shape[1], shape[2]};
-  num_threads_ = GetNumThreads(reduction_dimensions_, vector_size);
+  num_threads_ = GetNumThreads(reduction_dimensions_, vector_size,
+                               analysis.device_info().threads_per_block_limit());
   num_blocks_ = {GetNumBlocks(reduction_dimensions_, num_threads_)};
   tile_sizes_per_thread_ = {shape[0], vector_size};
   gpu_blocks_ = MaybeSplitGridDimensionX(
@@ -1074,10 +1082,13 @@ std::unique_ptr<ReductionFusion> MultiRowReductionFusion::TryCreate(
   // as SMs, we'll only run about 8 warps per SM, so occupancy will be very low.
   // Further measurements are needed to refine this heuristic.
   int64_t min_desired_blocks = analysis.device_info().core_count();
+  const int64_t max_threads_per_block =
+      analysis.device_info().threads_per_block_limit();
   while (vector_size > 1 &&
-         GetNumBlocks(reduction_dimensions,
-                      GetNumThreads(reduction_dimensions, vector_size)) <
-             min_desired_blocks) {
+         GetNumBlocks(
+             reduction_dimensions,
+             GetNumThreads(reduction_dimensions, vector_size,
+                           max_threads_per_block)) < min_desired_blocks) {
     vector_size /= 2;
   }
   // Check again that the reduced dimension fits after potentially reducing the
@@ -1096,11 +1107,15 @@ std::unique_ptr<ReductionFusion> MultiRowReductionFusion::TryCreate(
 }
 
 absl::InlinedVector<int64_t, 4> MultiRowReductionFusion::GetNumThreads(
-    const ReductionDimensions& reduction_dimensions, int vector_size) {
+    const ReductionDimensions& reduction_dimensions, int vector_size,
+    int64_t max_threads_per_block) {
   int64_t num_threads_reduced =
       reduction_dimensions.dimensions[kRowMinorReduced] / vector_size;
 
-  constexpr int64_t kThreadsPerBlockTarget = 256;
+  // Same 256-thread target as the single-row path, capped at the device's
+  // threads-per-block soft cap so backends can shrink during retry.
+  const int64_t kThreadsPerBlockTarget =
+      std::min<int64_t>(256, max_threads_per_block);
   int64_t kept_size = reduction_dimensions.dimensions[kRowKept];
   int64_t num_threads_kept = 1;
   if (kept_size * num_threads_reduced <= kThreadsPerBlockTarget) {
