@@ -40,9 +40,10 @@ struct MetalTriangularSolveKernel;
 // in, then encodes that kernel onto the stream's command buffer at run time
 // under a per-thunk mutex.
 //
-// XLA's transpose_a == ADJOINT must be lowered upstream — this thunk only
-// understands NO_TRANSPOSE / TRANSPOSE. Metal's pipeline runs the
-// MetalLowerAdjointTriangularSolve pass for that.
+// XLA's transpose_a == ADJOINT on complex inputs is handled upstream by
+// MetalExpandComplexTriangularSolve, which rewrites the entire trsm into
+// matmul+select. Real ADJOINT reaches this thunk and is folded into
+// TRANSPOSE, since A^H == A^T for real A.
 class MetalTriangularSolveThunk : public gpu::Thunk {
  public:
   MetalTriangularSolveThunk(ThunkInfo thunk_info,

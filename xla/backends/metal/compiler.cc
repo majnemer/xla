@@ -173,10 +173,6 @@ absl::Status MetalCompiler::OptimizeHloPostLayoutAssignment(
   // running a target-specific FloatNormalization pre-pipeline before
   // delegating to the base.
   HloPassPipeline pre("metal_pre_normalization", compilation_stats);
-  // MPSMatrixSolveTriangular has no conjugate flag; rewrite ADJOINT trsms
-  // into (conj(A), TRANSPOSE) pairs so the thunk emitter only ever sees
-  // NO_TRANSPOSE / TRANSPOSE.
-  pre.AddPass<MetalLowerAdjointTriangularSolve>();
   FloatSupport bf16(BF16);
   FloatSupport f8e5m2(F8E5M2, F16);
   FloatSupport f8e4m3(F8E4M3, F16);
@@ -320,17 +316,13 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
       }
 
       case HloOpcode::kTriangularSolve: {
-        // MetalLowerAdjointTriangularSolve runs in OptimizeHloPostLayout-
-        // Assignment, so the thunk only ever sees NO_TRANSPOSE / TRANSPOSE.
+        // MetalExpandComplexTriangularSolve runs in
+        // OptimizeHloConvolutionCanonicalization and rewrites complex trsms
+        // into matmul+select. Real ADJOINT reaches the thunk and is folded
+        // into TRANSPOSE there (A^H == A^T for real A).
         const auto* trsm = Cast<HloTriangularSolveInstruction>(instr);
         const TriangularSolveOptions& opts =
             trsm->triangular_solve_options();
-        if (opts.transpose_a() == TriangularSolveOptions::ADJOINT) {
-          return Internal(
-              "Metal: kTriangularSolve with transpose_a=ADJOINT should have "
-              "been lowered by MetalLowerAdjointTriangularSolve. Got '%s'.",
-              trsm->name());
-        }
         const HloInstruction* a = trsm->operand(0);
         const HloInstruction* b = trsm->operand(1);
         const Shape& a_shape = a->shape();
