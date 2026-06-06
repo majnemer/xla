@@ -114,18 +114,16 @@ gpu::Thunk::BufferUses MetalTriangularSolveThunk::buffer_uses() const {
 absl::Status MetalTriangularSolveThunk::EnsureKernel(
     stream_executor::StreamExecutor* executor) {
   if (kernel_ != nullptr) return absl::OkStatus();
-  if (options_.transpose_a() == TriangularSolveOptions::ADJOINT) {
-    return absl::InternalError(
-        "MetalTriangularSolveThunk: transpose_a == ADJOINT must be lowered "
-        "to (conj, TRANSPOSE) by MetalLowerAdjointTriangularSolve before "
-        "reaching this thunk.");
-  }
   MPSDataType dtype = ToMpsDataType(element_type_);
   if (dtype == MPSDataTypeInvalid) {
+    // Complex trsms should have been expanded into matmul+select sequences
+    // by MetalExpandComplexTriangularSolve before reaching here; if one
+    // slips through, fail loudly rather than crash inside MPS.
     return absl::UnimplementedError(absl::StrCat(
         "MetalTriangularSolveThunk: unsupported element type ",
         static_cast<int>(element_type_),
-        " (Metal supports F32 and C64 only)"));
+        " (MPSMatrixSolveTriangular asserts F32-only; complex trsms must "
+        "be expanded upstream)"));
   }
 
   // Layout swap: XLA's Fortran-laid-out (column-major) operands are
@@ -133,11 +131,14 @@ absl::Status MetalTriangularSolveThunk::EnsureKernel(
   // the BLAS layout-flip identity gives:
   //   right     = options.left_side    (XLA A·X=B becomes X^T·A^T=B^T)
   //   upper     = options.lower        (A's transpose flips uplo)
-  //   transpose = (options.transpose_a == TRANSPOSE)
+  //   transpose = (TRANSPOSE or ADJOINT)  — for real types, A^H == A^T,
+  //               so ADJOINT folds in cleanly; complex ADJOINT can't reach
+  //               here because MPS rejected complex above.
   const bool right = options_.left_side();
   const bool upper = options_.lower();
   const bool mps_transpose =
-      options_.transpose_a() == TriangularSolveOptions::TRANSPOSE;
+      options_.transpose_a() == TriangularSolveOptions::TRANSPOSE ||
+      options_.transpose_a() == TriangularSolveOptions::ADJOINT;
   const bool unit = options_.unit_diagonal();
 
   auto* metal_executor =
