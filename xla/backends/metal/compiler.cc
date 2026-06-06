@@ -57,6 +57,8 @@ limitations under the License.
 #include "xla/backends/metal/codegen/sort_emitter.h"
 #include "xla/backends/metal/runtime/metal_kernel_artifact.h"
 #include "xla/backends/metal/runtime/metal_kernel_thunk.h"
+#include "xla/backends/metal/runtime/metal_triangular_solve_thunk.h"
+#include "xla/backends/metal/transforms/lower_adjoint_triangular_solve.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/codegen/emitters/transforms/passes.h"
 #include "xla/codegen/ir_printing.h"
@@ -302,6 +304,9 @@ class MetalThunkEmissionBackend final : public gpu::ThunkEmissionBackend {
         return EmitSort(Cast<HloSortInstruction>(instr));
       case HloOpcode::kFft:
         return EmitFft(Cast<HloFftInstruction>(instr));
+      case HloOpcode::kTriangularSolve:
+        return EmitTriangularSolve(
+            Cast<HloTriangularSolveInstruction>(instr));
       default:
         return Unimplemented(
             "MetalCompiler::CompileToBackendResult: post-scheduling HLO "
@@ -404,6 +409,58 @@ class MetalThunkEmissionBackend final : public gpu::ThunkEmissionBackend {
     gpu::ThunkSequence thunks;
     thunks.push_back(std::make_unique<gpu::OutfeedThunk>(
         GetThunkInfo(outfeed), std::move(source_slices)));
+    return thunks;
+  }
+
+  absl::StatusOr<gpu::ThunkSequence> EmitTriangularSolve(
+      const HloTriangularSolveInstruction* trsm) {
+    const TriangularSolveOptions& opts = trsm->triangular_solve_options();
+    // The lowering pass should have eliminated ADJOINT; assert defensively.
+    if (opts.transpose_a() == TriangularSolveOptions::ADJOINT) {
+      return Internal(
+          "Metal: kTriangularSolve with transpose_a=ADJOINT should have been "
+          "lowered by MetalLowerAdjointTriangularSolve. Got '%s'.",
+          trsm->name());
+    }
+    const HloInstruction* a = trsm->operand(0);
+    const HloInstruction* b = trsm->operand(1);
+    const Shape& a_shape = a->shape();
+    const Shape& b_shape = b->shape();
+    TF_RET_CHECK(a_shape.dimensions().size() >= 2);
+    TF_RET_CHECK(a_shape.dimensions(a_shape.dimensions().size() - 2) ==
+                 a_shape.dimensions(a_shape.dimensions().size() - 1))
+        << "Triangular solve: A must be square";
+    const int64_t rank = b_shape.dimensions().size();
+    const int64_t m = a_shape.dimensions(a_shape.dimensions().size() - 1);
+    const int64_t num_rhs =
+        b_shape.dimensions(opts.left_side() ? rank - 1 : rank - 2);
+    int64_t batch_size = 1;
+    for (int64_t i = 0; i < rank - 2; ++i) {
+      batch_size *= b_shape.dimensions(i);
+    }
+
+    TF_ASSIGN_OR_RETURN(BufferAllocation::Slice a_slice,
+                        buffer_assignment_->GetUniqueSlice(a, {}));
+    TF_ASSIGN_OR_RETURN(BufferAllocation::Slice b_slice,
+                        buffer_assignment_->GetUniqueSlice(b, {}));
+    TF_ASSIGN_OR_RETURN(BufferAllocation::Slice result_slice,
+                        buffer_assignment_->GetUniqueSlice(trsm, {}));
+
+    gpu::ThunkSequence thunks;
+    // XLA's contract: B is read-only, the solve writes X into the result
+    // buffer. MPS solves in-place; if buffer assignment didn't alias B with
+    // result, emit a D2D copy first so the trsm's RHS == solution buffer is
+    // already populated with B's data.
+    if (b_slice != result_slice) {
+      thunks.push_back(std::make_unique<gpu::DeviceToDeviceCopyThunk>(
+          GetThunkInfo(trsm),
+          /*source_buffer=*/ShapedSlice{b_slice, b_shape},
+          /*destination_buffer=*/ShapedSlice{result_slice, b_shape},
+          /*mem_size=*/b_slice.size()));
+    }
+    thunks.push_back(std::make_unique<MetalTriangularSolveThunk>(
+        GetThunkInfo(trsm), opts, a_shape.element_type(), a_slice, a_shape,
+        result_slice, b_shape, batch_size, m, num_rhs));
     return thunks;
   }
 
@@ -592,6 +649,10 @@ absl::Status MetalCompiler::OptimizeHloPostLayoutAssignment(
   pre.AddPass<FloatNormalization>(&f8e4m3b11fnuz);
   pre.AddPass<FloatNormalization>(&f4e2m1fn);
   pre.AddPass<FloatNormalization>(&f8e8m0fnu);
+  // MPSMatrixSolveTriangular has no conjugate flag; rewrite ADJOINT trsms
+  // into (conj(A), TRANSPOSE) pairs so the thunk emitter only ever sees
+  // NO_TRANSPOSE / TRANSPOSE.
+  pre.AddPass<MetalLowerAdjointTriangularSolve>();
   TF_RETURN_IF_ERROR(
       pre.Run(hlo_module,
               /*execution_threads=*/{HloInstruction::kMainExecutionThread})

@@ -58,3 +58,39 @@ objc_library(
         "@com_google_absl//absl/synchronization",
     ],
 )
+
+# MPSMatrixSolveTriangular-backed thunk for kTriangularSolve. The thunk
+# constructs the kernel lazily on first execute (needs the executor's
+# MTLDevice) with all options baked in, then re-encodes it per call under
+# a thunk-local mutex.
+objc_library(
+    name = "metal_triangular_solve_thunk",
+    srcs = ["metal_triangular_solve_thunk.mm"],
+    hdrs = ["metal_triangular_solve_thunk.h"],
+    sdk_frameworks = [
+        "Foundation",
+        "Metal",
+        "MetalPerformanceShaders",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/backends/gpu/runtime:thunk",
+        "//xla/runtime:buffer_use",
+        "//xla/service:buffer_assignment",
+        "//xla/service/gpu:buffer_allocations",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/metal:metal_allocator",
+        "//xla/stream_executor/metal:metal_executor_header",
+        "//xla/stream_executor/metal:metal_stream",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+    ],
+)
