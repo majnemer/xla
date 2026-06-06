@@ -46,6 +46,8 @@ limitations under the License.
 #include "xla/stream_executor/metal/metal_event.h"
 #include "xla/stream_executor/metal/metal_kernel.h"
 #include "xla/stream_executor/metal/metal_stream.h"
+#include "xla/stream_executor/metal/metal_timer.h"
+#include "xla/stream_executor/event_based_timer.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream.h"
 
@@ -161,6 +163,18 @@ absl::StatusOr<std::unique_ptr<Stream>> MetalExecutor::CreateStream(
 
 absl::StatusOr<std::unique_ptr<Event>> MetalExecutor::CreateEvent() {
   return MetalEvent::Create(this);
+}
+
+absl::StatusOr<std::unique_ptr<EventBasedTimer>>
+MetalExecutor::CreateEventBasedTimer(Stream* stream,
+                                     bool /*use_delay_kernel*/) {
+  auto* metal_stream = dynamic_cast<MetalStream*>(stream);
+  if (metal_stream == nullptr) {
+    return absl::InvalidArgumentError(
+        "MetalExecutor::CreateEventBasedTimer: stream is not a MetalStream.");
+  }
+  TF_ASSIGN_OR_RETURN(MetalTimer timer, MetalTimer::Create(this, metal_stream));
+  return std::make_unique<MetalTimer>(std::move(timer));
 }
 
 absl::StatusOr<id<MTLLibrary>> MetalExecutor::LoadLibraryFromMsl(

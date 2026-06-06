@@ -184,8 +184,10 @@ MetalStream::RecordEventAndReturnValue(MetalEvent *metal_event) {
     [cmd_buf commit];
     tail_buffer_ = cmd_buf;
     // Publish only after the signal cmd_buf is submitted — waiters cannot see
-    // a value they're not guaranteed an in-flight signal for.
-    metal_event->PublishRecordedValue(value);
+    // a value they're not guaranteed an in-flight signal for. Timing events
+    // capture the cmd_buf here so MetalTimer can read GPUStart/EndTime after
+    // completion.
+    metal_event->PublishRecordedValue(value, cmd_buf);
   }
   return value;
 }
