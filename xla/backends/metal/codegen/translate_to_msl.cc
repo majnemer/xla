@@ -543,6 +543,11 @@ class MslEmitter {
     if (mlir::isa<mlir::arith::ShRUIOp>(op)) {
       return EmitArithShrUI(op);
     }
+    if (mlir::isa<mlir::arith::ShRSIOp>(op)) {
+      // EmitElementType maps signless MLIR ints to signed MSL types, so bare
+      // `>>` is already arithmetic (sign-preserving) right shift.
+      return EmitBinary(op, ">>");
+    }
     if (mlir::isa<mlir::arith::ShLIOp>(op)) {
       return EmitBinary(op, "<<");
     }
@@ -626,6 +631,9 @@ class MslEmitter {
     }
     if (auto clz = mlir::dyn_cast<mlir::math::CountLeadingZerosOp>(op)) {
       return EmitMathCtlz(clz);
+    }
+    if (auto ctpop = mlir::dyn_cast<mlir::math::CtPopOp>(op)) {
+      return EmitMathCtpop(ctpop);
     }
     if (auto ic = mlir::dyn_cast<mlir::arith::IndexCastOp>(op)) {
       return EmitArithCast(ic.getOperation());
@@ -845,6 +853,18 @@ class MslEmitter {
     std::string name = BindValueName(op->getResult(0));
     os_ << ty << " " << name << " = (static_cast<" << u_ty << ">(" << a
         << ") >> " << b << ");\n";
+    return absl::OkStatus();
+  }
+
+  absl::Status EmitMathCtpop(mlir::math::CtPopOp op) {
+    TF_ASSIGN_OR_RETURN(std::string src_ty,
+                        UnsignedMslType(op.getOperand().getType()));
+    TF_ASSIGN_OR_RETURN(std::string dst_ty, TypeToMSL(op.getType()));
+    TF_ASSIGN_OR_RETURN(std::string src, GetName(op.getOperand()));
+    std::string name = BindValueName(op.getResult());
+    os_ << dst_ty << " " << name << " = static_cast<" << dst_ty
+        << ">(metal::popcount(static_cast<" << src_ty << ">(" << src
+        << ")));\n";
     return absl::OkStatus();
   }
 
