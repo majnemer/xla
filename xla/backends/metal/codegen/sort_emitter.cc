@@ -67,8 +67,12 @@ namespace {
 // (each thread copies 4 adjacent elements into shared memory and runs 2
 // pair-compares). The first-pass MLIR kernel does one element pair per
 // thread per stage; set the unroll factor to 1 so PlanBitonicSort's launch
-// dimensions match. Bumping this requires emitting an inner unrolled loop
-// in EmitSortStageModule.
+// dimensions match.
+//
+// TODO(majnemer): bump to 4 to match CUDA. Requires emitting an inner
+// `unroll_factor`-trip loop in EmitSortStageModule that adds `i` to the
+// element_pair_index for i in [0, unroll), with optional bank-conflict-
+// aware indexing when num_threads % kNumShmemBanks == 0.
 constexpr uint64_t kBitonicSortUnrollFactor = 1;
 
 uint64_t Pow2Floor(uint64_t value) {
@@ -155,10 +159,20 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
        uint64_t{1} << num_stages});
   tile_size = Pow2Floor(std::max<uint64_t>(tile_size, 1));
 
-  // The MLIR sort kernel only supports single-mask global-memory stages
-  // today; the tiled threadgroup-memory path lands in a follow-up. Forcing
-  // tile_size to 1 makes every xor_mask >= tile_size, so the bundling loop
-  // below flushes each mask into its own SortStageDescription.
+  // TODO(majnemer): the MLIR sort kernel only supports single-mask
+  // global-memory stages today; the tiled threadgroup-memory path is not
+  // yet implemented. Forcing tile_size to 1 here makes every xor_mask >=
+  // tile_size, so the bundling loop flushes each mask into its own
+  // single-mask SortStageDescription. Drop this line once
+  // EmitSortStageModule learns to emit:
+  //   * per-operand xla::gpu::AllocateSharedOp tiles of size tile_size
+  //   * a copy-into-tile loop, xla::gpu::SyncThreadsOp barrier
+  //   * inner xor-mask loop performing tile-local compare-and-swap
+  //   * a copy-back loop
+  // EmitTiledCompareLoop in sort_util.cc:253 is the LLVM reference.
+  // The Phase-2 retry path in compiler.cc already calls
+  // ShrinkSortStageTile when the PSO grants fewer threads than requested,
+  // so tile_size becomes a retry knob for tiled stages automatically.
   tile_size = 1;
 
   // Standard (non-tiled) launch covers ceil(2^(num_stages-1)/unroll) element
@@ -313,10 +327,10 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
   mlir::func::FuncOp comparator_func =
       comparator_call_targets(comparator->root_instruction());
 
-  // Tiled stages are not yet supported by this kernel body; the planner
-  // queues them via tile_size > 0. The phase-2 retry loop reduces the tile
-  // by halving so eventually only single-mask global-memory stages remain,
-  // but for now reject tiled stages explicitly.
+  // TODO(majnemer): emit the tiled threadgroup-memory body when
+  // desc.tile_size != 0. Today PlanBitonicSort forces tile_size to 1 so
+  // this branch is unreachable from compiler.cc; the guard stays in case a
+  // future change re-enables tiling before this kernel learns to handle it.
   if (desc.tile_size != 0 || desc.xor_masks.size() != 1) {
     return absl::UnimplementedError(absl::StrCat(
         "MetalCompiler::EmitSortStageModule: tiled sort stages are not yet "
@@ -324,8 +338,11 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
         desc.entry_name, "'); only single-mask global-memory passes work."));
   }
 
-  // Iota operands need the kernel to synthesise their values on first
-  // touch; the bitonic body below reads from output tensors only.
+  // TODO(majnemer): emit iota inline. EmitCompareLoopBody (sort_util.cc)
+  // checks `emit_iota_operands && operand is kIota` and calls EmitIota
+  // instead of reading from the buffer. The MLIR version would inline an
+  // iota_op_from_index call on the first stage that touches each iota
+  // operand and then read from the output buffer on subsequent stages.
   for (int64_t i = 0; i < operand_count; ++i) {
     if (HloPredicateIsOp<HloOpcode::kIota>(desc.sort->operand(i))) {
       return absl::UnimplementedError(absl::StrCat(
