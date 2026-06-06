@@ -74,7 +74,8 @@ struct SortStageDescription {
 // emitted entry; the planner appends a stage suffix to make each name unique.
 absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
     const HloSortInstruction* sort, const BufferAssignment& buffer_assignment,
-    const se::DeviceDescription& device, int64_t buffer_alignment,
+    const se::DeviceDescription& device,
+    const emitters::KernelArguments::BufferAlignment& buffer_alignment,
     const std::string& entry_name_prefix);
 
 // Re-plans `desc` with a halved tile_size (rounded down to the next power of

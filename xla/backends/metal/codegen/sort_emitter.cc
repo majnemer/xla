@@ -31,6 +31,7 @@ limitations under the License.
 #include "mlir/IR/OwningOpRef.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/hlo/ir/hlo_instructions.h"
+#include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/gpu/launch_dimensions.h"
@@ -55,9 +56,46 @@ uint64_t Pow2Floor(uint64_t value) {
 
 }  // namespace
 
+namespace {
+
+gpu::LaunchDimensions ComputeStandardLaunchDimensions(
+    const Shape& keys_shape, int64_t dimension_to_sort,
+    int64_t standard_num_iterations_in_sort_dim,
+    const se::DeviceDescription& device) {
+  Shape standard_iteration_shape = keys_shape;
+  standard_iteration_shape.set_dimensions(
+      dimension_to_sort,
+      CeilOfRatio<int64_t>(standard_num_iterations_in_sort_dim,
+                           kBitonicSortUnrollFactor));
+  return gpu::CalculateLaunchDimensions(standard_iteration_shape, device);
+}
+
+gpu::LaunchDimensions ComputeTiledLaunchDimensions(
+    const Shape& keys_shape, int64_t dimension_to_sort,
+    int64_t dimension_to_sort_bound, int64_t tile_size,
+    int64_t* num_iterations_in_sort_dim_out) {
+  uint64_t rounded_bound = RoundUpTo<uint64_t>(dimension_to_sort_bound,
+                                               tile_size);
+  Shape iteration_shape = keys_shape;
+  uint64_t num_iterations_in_sort_dim =
+      CeilOfRatio<uint64_t>(rounded_bound, kBitonicSortUnrollFactor);
+  iteration_shape.set_dimensions(dimension_to_sort,
+                                 num_iterations_in_sort_dim);
+  uint64_t num_iterations = ShapeUtil::ElementsIn(iteration_shape);
+  uint64_t threads_per_block =
+      std::max<uint64_t>(1, tile_size / kBitonicSortUnrollFactor);
+  uint64_t num_blocks = CeilOfRatio<uint64_t>(num_iterations,
+                                              threads_per_block);
+  *num_iterations_in_sort_dim_out = num_iterations_in_sort_dim;
+  return gpu::LaunchDimensions(num_blocks, threads_per_block);
+}
+
+}  // namespace
+
 absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
     const HloSortInstruction* sort, const BufferAssignment& buffer_assignment,
-    const se::DeviceDescription& device, int64_t buffer_alignment,
+    const se::DeviceDescription& device,
+    const emitters::KernelArguments::BufferAlignment& buffer_alignment,
     const std::string& entry_name_prefix) {
   // Layout invariant: all operands and results share the keys-shape layout
   // (the bitonic sort scans one logical dimension in-place across all of
@@ -86,8 +124,8 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
         sort->operand(i)->shape().element_type());
   }
   const uint64_t max_tile_in_shmem =
-      device.shared_memory_per_block() / std::max<uint64_t>(total_element_size,
-                                                            1);
+      device.shared_memory_per_block() /
+      std::max<uint64_t>(total_element_size, 1);
   const uint64_t max_threads_per_block = device.threads_per_block_limit();
 
   uint64_t tile_size = std::min(
@@ -95,16 +133,67 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
        uint64_t{1} << num_stages});
   tile_size = Pow2Floor(std::max<uint64_t>(tile_size, 1));
 
-  // TODO(majnemer): build SortStageDescription entries by walking the
-  // (stage, mask) tree the same way EmitBitonicSortLLVMIR does, choosing
-  // tiled vs global per mask group, computing launch_dimensions per stage,
-  // resolving kernel_args from buffer_assignment.
-  (void)buffer_assignment;
-  (void)buffer_alignment;
-  (void)entry_name_prefix;
-  (void)tile_size;
-  return absl::UnimplementedError(
-      "MetalCompiler::PlanBitonicSort: stage planning not yet implemented.");
+  // Standard (non-tiled) launch covers ceil(2^(num_stages-1)/unroll) element
+  // pairs per thread along the sort dimension; one element pair compared per
+  // iteration. Tiled launch processes one tile_size-wide tile per block, so
+  // threads_per_block = tile_size / unroll_factor.
+  const uint64_t standard_num_iterations_in_sort_dim =
+      uint64_t{1} << (num_stages - 1);
+  gpu::LaunchDimensions standard_launch = ComputeStandardLaunchDimensions(
+      keys_shape, dimension_to_sort, standard_num_iterations_in_sort_dim,
+      device);
+  int64_t tiled_num_iterations_in_sort_dim = 0;
+  gpu::LaunchDimensions tiled_launch = ComputeTiledLaunchDimensions(
+      keys_shape, dimension_to_sort, dimension_to_sort_bound, tile_size,
+      &tiled_num_iterations_in_sort_dim);
+
+  TF_ASSIGN_OR_RETURN(
+      emitters::KernelArguments kernel_args,
+      emitters::KernelArguments::Create(buffer_assignment, buffer_alignment,
+                                        sort));
+
+  std::vector<SortStageDescription> stages;
+  bool emit_iota_operands = true;
+  auto emit_stage = [&](std::vector<int64_t> xor_masks) {
+    bool tiled = xor_masks.size() > 1;
+    SortStageDescription stage{
+        /*sort=*/sort,
+        /*xor_masks=*/std::move(xor_masks),
+        /*tile_size=*/tiled ? static_cast<int64_t>(tile_size) : 0,
+        /*num_iterations_in_sort_dim=*/
+        tiled ? tiled_num_iterations_in_sort_dim
+              : static_cast<int64_t>(standard_num_iterations_in_sort_dim),
+        /*launch_dimensions=*/tiled ? tiled_launch : standard_launch,
+        /*emit_iota_operands=*/emit_iota_operands,
+        /*kernel_args=*/kernel_args,
+        /*entry_name=*/
+        absl::StrCat(entry_name_prefix, "_stage", stages.size()),
+    };
+    stages.push_back(std::move(stage));
+    emit_iota_operands = false;
+  };
+
+  // Mirror EmitBitonicSortLLVMIR's stage/mask loop. Masks smaller than
+  // tile_size pile up into one tiled kernel; once we hit a mask >= tile_size
+  // we flush the pile and emit the big mask standalone.
+  std::vector<int64_t> pending;
+  for (int64_t stage_idx = 0; stage_idx < num_stages; ++stage_idx) {
+    for (int64_t mask = stage_idx; mask >= 0; --mask) {
+      int64_t xor_mask = (mask == stage_idx) ? ((int64_t{1} << (stage_idx + 1)) - 1)
+                                             : (int64_t{1} << mask);
+      if (static_cast<uint64_t>(xor_mask) >= tile_size) {
+        if (!pending.empty()) {
+          emit_stage(std::move(pending));
+          pending.clear();
+        }
+        emit_stage({xor_mask});
+      } else {
+        pending.push_back(xor_mask);
+      }
+    }
+  }
+  if (!pending.empty()) emit_stage(std::move(pending));
+  return stages;
 }
 
 bool ShrinkSortStageTile(SortStageDescription& desc,
