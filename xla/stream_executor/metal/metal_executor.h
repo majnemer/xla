@@ -126,6 +126,10 @@ class MetalExecutor : public gpu::GpuExecutor {
   // model. Consumed by GPU PJRT's BFC allocator sizing.
   bool DeviceMemoryUsage(int64_t* free, int64_t* total) const override;
 
+  // Lazily creates the FFT plugin from the registered MetalFft factory.
+  // Returns nullptr if no factory is registered for the Metal platform.
+  fft::FftSupport* AsFft() override;
+
   // Static helper used by both the virtual override above and by
   // MetalPlatform::DescriptionForDevice (which is const and therefore can't
   // construct a transient executor).
@@ -153,6 +157,10 @@ class MetalExecutor : public gpu::GpuExecutor {
 
   // The Metal device handle. Populated by Init() and immutable thereafter.
   id<MTLDevice> device_;
+
+  // Lazy-initialised FFT plugin.
+  absl::Mutex fft_mu_;
+  std::unique_ptr<fft::FftSupport> fft_ ABSL_GUARDED_BY(fft_mu_);
 
   // Per-device allocator. Created in Init() once `device_` is set.
   std::unique_ptr<MetalAllocator> allocator_;

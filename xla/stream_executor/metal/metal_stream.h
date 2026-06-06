@@ -25,6 +25,7 @@ limitations under the License.
 
 #include "absl/base/thread_annotations.h"
 #include "absl/functional/any_invocable.h"
+#include "absl/functional/function_ref.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -93,6 +94,24 @@ class MetalStream : public StreamCommon {
 
   // Underlying MTLCommandQueue. Available only inside .mm consumers.
   id<MTLCommandQueue> command_queue() const { return command_queue_; }
+
+  // Runs `encode` on a fresh MTLCommandBuffer created from this stream's
+  // queue, under the stream's submission lock so ordering with concurrent
+  // LaunchKernel calls is preserved.
+  //
+  // The callback's job is to encode work (and, for wrappers like
+  // MPSCommandBuffer, run any internal commitAndContinue) and return the
+  // command buffer the stream should track as the new tail — which may
+  // differ from the input cmd_buf if MPSGraph or similar split the encoded
+  // work across buffers. The callback must NOT commit the returned buffer:
+  // the stream installs the async-error completion handler and then commits
+  // it once. `label` is applied to the initial cmd_buf for diagnostics;
+  // `op_name` flows into the async-error tracker.
+  absl::StatusOr<id<MTLCommandBuffer>> EncodeWithCommandBuffer(
+      absl::string_view label, absl::string_view op_name,
+      absl::FunctionRef<absl::StatusOr<id<MTLCommandBuffer>>(
+          id<MTLCommandBuffer> cmd_buf)>
+          encode);
 
  private:
   MetalStream(MetalExecutor* executor, id<MTLCommandQueue> command_queue,

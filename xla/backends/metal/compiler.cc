@@ -36,6 +36,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/emitters/mlir_kernel_emitter.h"
 #include "xla/backends/gpu/codegen/fusions.h"
 #include "xla/backends/gpu/runtime/device_to_device_copy_thunk.h"
+#include "xla/backends/gpu/runtime/fft_thunk.h"
 #include "xla/backends/gpu/runtime/kernel_thunk.h"
 #include "xla/backends/gpu/runtime/outfeed_thunk.h"
 #include "xla/backends/gpu/codegen/emitters/transforms/passes.h"
@@ -288,6 +289,25 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
             /*source_buffer=*/ShapedSlice{src, instr->operand(0)->shape()},
             /*destination_buffer=*/ShapedSlice{dst, instr->shape()},
             /*mem_size=*/src.size()));
+        break;
+      }
+
+      case HloOpcode::kFft: {
+        // The MPSGraph-backed MetalFft plugin is registered against
+        // kMetalPlatformId, so gpu::FftThunk's runtime resolves AsFft()
+        // and executes through the shared runtime path used by CUDA.
+        const auto* fft = Cast<HloFftInstruction>(instr);
+        TF_ASSIGN_OR_RETURN(
+            BufferAllocation::Slice arg_slice,
+            buffer_assignment->GetUniqueSlice(fft->operand(0), {}));
+        TF_ASSIGN_OR_RETURN(BufferAllocation::Slice dest_slice,
+                            buffer_assignment->GetUniqueSlice(fft, {}));
+        thunks.push_back(std::make_unique<gpu::FftThunk>(
+            gpu::Thunk::ThunkInfo{}, fft->fft_type(), fft->fft_length(),
+            /*input_buffer=*/arg_slice,
+            /*output_buffer=*/dest_slice,
+            /*input_shape=*/fft->operand(0)->shape(),
+            /*output_shape=*/fft->shape()));
         break;
       }
 
