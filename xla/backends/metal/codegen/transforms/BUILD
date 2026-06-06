@@ -30,6 +30,7 @@ cc_library(
     hdrs = ["passes.h"],
     deps = [
         ":passes_inc_gen",
+        "//xla/backends/gpu/codegen/emitters/ir:xla_gpu",
         "//xla/codegen/emitters/ir:xla",
         "@com_google_absl//absl/numeric:bits",
         "@llvm-project//llvm:Support",
