@@ -48,6 +48,8 @@ limitations under the License.
 #include "xla/backends/metal/codegen/transforms/passes.h"
 #include "xla/backends/metal/runtime/metal_kernel_artifact.h"
 #include "xla/backends/metal/runtime/metal_kernel_thunk.h"
+#include "xla/backends/metal/runtime/metal_triangular_solve_thunk.h"
+#include "xla/backends/metal/transforms/lower_adjoint_triangular_solve.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/codegen/emitters/transforms/passes.h"
 #include "xla/codegen/ir_printing.h"
@@ -154,6 +156,10 @@ absl::Status MetalCompiler::OptimizeHloPostLayoutAssignment(
   // running a target-specific FloatNormalization pre-pipeline before
   // delegating to the base.
   HloPassPipeline pre("metal_pre_normalization", compilation_stats);
+  // MPSMatrixSolveTriangular has no conjugate flag; rewrite ADJOINT trsms
+  // into (conj(A), TRANSPOSE) pairs so the thunk emitter only ever sees
+  // NO_TRANSPOSE / TRANSPOSE.
+  pre.AddPass<MetalLowerAdjointTriangularSolve>();
   FloatSupport bf16(BF16);
   FloatSupport f8e5m2(F8E5M2, F16);
   FloatSupport f8e4m3(F8E4M3, F16);
@@ -174,6 +180,10 @@ absl::Status MetalCompiler::OptimizeHloPostLayoutAssignment(
   pre.AddPass<FloatNormalization>(&f8e4m3b11fnuz);
   pre.AddPass<FloatNormalization>(&f4e2m1fn);
   pre.AddPass<FloatNormalization>(&f8e8m0fnu);
+  // MPSMatrixSolveTriangular has no conjugate flag; rewrite ADJOINT trsms
+  // into (conj(A), TRANSPOSE) pairs so the thunk emitter only ever sees
+  // NO_TRANSPOSE / TRANSPOSE.
+  pre.AddPass<MetalLowerAdjointTriangularSolve>();
   TF_RETURN_IF_ERROR(
       pre.Run(hlo_module,
               /*execution_threads=*/{HloInstruction::kMainExecutionThread})
@@ -293,6 +303,55 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
             /*source_buffer=*/ShapedSlice{src, instr->operand(0)->shape()},
             /*destination_buffer=*/ShapedSlice{dst, instr->shape()},
             /*mem_size=*/src.size()));
+        break;
+      }
+
+      case HloOpcode::kTriangularSolve: {
+        // MetalLowerAdjointTriangularSolve runs in OptimizeHloPostLayout-
+        // Assignment, so the thunk only ever sees NO_TRANSPOSE / TRANSPOSE.
+        const auto* trsm = Cast<HloTriangularSolveInstruction>(instr);
+        const TriangularSolveOptions& opts =
+            trsm->triangular_solve_options();
+        if (opts.transpose_a() == TriangularSolveOptions::ADJOINT) {
+          return Internal(
+              "Metal: kTriangularSolve with transpose_a=ADJOINT should have "
+              "been lowered by MetalLowerAdjointTriangularSolve. Got '%s'.",
+              trsm->name());
+        }
+        const HloInstruction* a = trsm->operand(0);
+        const HloInstruction* b = trsm->operand(1);
+        const Shape& a_shape = a->shape();
+        const Shape& b_shape = b->shape();
+        TF_RET_CHECK(a_shape.dimensions().size() >= 2);
+        TF_RET_CHECK(a_shape.dimensions(a_shape.dimensions().size() - 2) ==
+                     a_shape.dimensions(a_shape.dimensions().size() - 1))
+            << "Triangular solve: A must be square";
+        const int64_t rank = b_shape.dimensions().size();
+        const int64_t m = a_shape.dimensions(a_shape.dimensions().size() - 1);
+        const int64_t num_rhs =
+            b_shape.dimensions(opts.left_side() ? rank - 1 : rank - 2);
+        int64_t batch_size = 1;
+        for (int64_t i = 0; i < rank - 2; ++i) {
+          batch_size *= b_shape.dimensions(i);
+        }
+        TF_ASSIGN_OR_RETURN(BufferAllocation::Slice a_slice,
+                            buffer_assignment->GetUniqueSlice(a, {}));
+        TF_ASSIGN_OR_RETURN(BufferAllocation::Slice b_slice,
+                            buffer_assignment->GetUniqueSlice(b, {}));
+        TF_ASSIGN_OR_RETURN(BufferAllocation::Slice result_slice,
+                            buffer_assignment->GetUniqueSlice(trsm, {}));
+        // MPS solves in place; copy B → result if buffer assignment didn't
+        // already alias them.
+        if (b_slice != result_slice) {
+          thunks.push_back(std::make_unique<gpu::DeviceToDeviceCopyThunk>(
+              gpu::Thunk::ThunkInfo{},
+              /*source_buffer=*/ShapedSlice{b_slice, b_shape},
+              /*destination_buffer=*/ShapedSlice{result_slice, b_shape},
+              /*mem_size=*/b_slice.size()));
+        }
+        thunks.push_back(std::make_unique<MetalTriangularSolveThunk>(
+            gpu::Thunk::ThunkInfo{}, opts, a_shape.element_type(), a_slice,
+            a_shape, result_slice, b_shape, batch_size, m, num_rhs));
         break;
       }
 
