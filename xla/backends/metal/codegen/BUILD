@@ -79,6 +79,30 @@ cc_library(
     ],
 )
 
+# Bitonic-sort planner and MLIR module emitter. The compiler dispatches
+# kSort here, gets back a list of stage descriptions, and feeds each through
+# the standard MSL lowering+translation pipeline.
+cc_library(
+    name = "sort_emitter",
+    srcs = ["sort_emitter.cc"],
+    hdrs = ["sort_emitter.h"],
+    deps = [
+        "//xla:shape_util",
+        "//xla:util",
+        "//xla/codegen/emitters:kernel_arguments",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:buffer_assignment",
+        "//xla/service/gpu:launch_dimensions",
+        "//xla/stream_executor:device_description",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@llvm-project//mlir:IR",
+    ],
+)
+
 cc_test(
     name = "msl_kernel_emitter_test",
     srcs = ["msl_kernel_emitter_test.cc"],
