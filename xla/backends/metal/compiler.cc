@@ -34,6 +34,7 @@ limitations under the License.
 #include "absl/synchronization/blocking_counter.h"
 #include "absl/synchronization/mutex.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
+#include "mlir/Conversion/ComplexToStandard/ComplexToStandard.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Pass/PassManager.h"
@@ -638,6 +639,7 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
       pm.addPass(mlir::createLoopInvariantCodeMotionPass());
       pm.addPass(mlir::createSymbolDCEPass());
       pm.addPass(mlir::createCSEPass());
+      pm.addPass(mlir::createConvertComplexToStandardPass());
       pm.addPass(CreateConvertComplexToArithMathPass());
       pm.addPass(emitters::CreateExpandFloatOpsPass());
       pm.addPass(CreateExpandFloatOpsPass());

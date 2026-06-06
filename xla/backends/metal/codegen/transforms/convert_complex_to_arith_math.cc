@@ -111,25 +111,6 @@ std::pair<mlir::Value, mlir::Value> GetComplexComponentIndices(
   return {real_index, imag_index};
 }
 
-struct BinaryComplexOperands {
-  mlir::Value lhs_re;
-  mlir::Value lhs_im;
-  mlir::Value rhs_re;
-  mlir::Value rhs_im;
-};
-
-template <typename OpTy>
-BinaryComplexOperands UnpackBinaryComplexOperands(
-    OpTy op, typename OpTy::Adaptor adaptor, mlir::PatternRewriter& rewriter) {
-  mlir::Location loc = op.getLoc();
-  return {
-      ExtractReal(loc, adaptor.getLhs(), rewriter),
-      ExtractImag(loc, adaptor.getLhs(), rewriter),
-      ExtractReal(loc, adaptor.getRhs(), rewriter),
-      ExtractImag(loc, adaptor.getRhs(), rewriter),
-  };
-}
-
 class ComplexToArithMathTypeConverter : public mlir::TypeConverter {
  public:
   ComplexToArithMathTypeConverter() {
@@ -225,170 +206,6 @@ struct ImOpConversion final
       mlir::ConversionPatternRewriter& rewriter) const override {
     rewriter.replaceOp(
         op, ExtractImag(op.getLoc(), adaptor.getComplex(), rewriter));
-    return mlir::success();
-  }
-};
-
-struct AbsOpConversion final
-    : public mlir::OpConversionPattern<mlir::complex::AbsOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  mlir::LogicalResult matchAndRewrite(
-      mlir::complex::AbsOp op, OpAdaptor adaptor,
-      mlir::ConversionPatternRewriter& rewriter) const override {
-    mlir::Location loc = op.getLoc();
-    mlir::Value real = ExtractReal(loc, adaptor.getComplex(), rewriter);
-    mlir::Value imag = ExtractImag(loc, adaptor.getComplex(), rewriter);
-    ma::FastMathFlagsAttr fmf = op.getFastMathFlagsAttr();
-
-    mlir::Value real_sq = ma::MulFOp::create(rewriter, loc, real, real, fmf);
-    mlir::Value imag_sq = ma::MulFOp::create(rewriter, loc, imag, imag, fmf);
-    mlir::Value sq_norm =
-        ma::AddFOp::create(rewriter, loc, real_sq, imag_sq, fmf);
-    rewriter.replaceOp(op,
-                       mlir::math::SqrtOp::create(rewriter, loc, sq_norm, fmf));
-    return mlir::success();
-  }
-};
-
-struct AddOpConversion final
-    : public mlir::OpConversionPattern<mlir::complex::AddOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  mlir::LogicalResult matchAndRewrite(
-      mlir::complex::AddOp op, OpAdaptor adaptor,
-      mlir::ConversionPatternRewriter& rewriter) const override {
-    mlir::Location loc = op.getLoc();
-    auto dst_type = mlir::cast<mlir::VectorType>(
-        getTypeConverter()->convertType(op.getType()));
-    BinaryComplexOperands arg =
-        UnpackBinaryComplexOperands<mlir::complex::AddOp>(op, adaptor,
-                                                          rewriter);
-    ma::FastMathFlagsAttr fmf = op.getFastMathFlagsAttr();
-
-    mlir::Value real =
-        ma::AddFOp::create(rewriter, loc, arg.lhs_re, arg.rhs_re, fmf);
-    mlir::Value imag =
-        ma::AddFOp::create(rewriter, loc, arg.lhs_im, arg.rhs_im, fmf);
-    rewriter.replaceOp(op,
-                       BuildComplexVector(loc, dst_type, real, imag, rewriter));
-    return mlir::success();
-  }
-};
-
-struct SubOpConversion final
-    : public mlir::OpConversionPattern<mlir::complex::SubOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  mlir::LogicalResult matchAndRewrite(
-      mlir::complex::SubOp op, OpAdaptor adaptor,
-      mlir::ConversionPatternRewriter& rewriter) const override {
-    mlir::Location loc = op.getLoc();
-    auto dst_type = mlir::cast<mlir::VectorType>(
-        getTypeConverter()->convertType(op.getType()));
-    BinaryComplexOperands arg =
-        UnpackBinaryComplexOperands<mlir::complex::SubOp>(op, adaptor,
-                                                          rewriter);
-    ma::FastMathFlagsAttr fmf = op.getFastMathFlagsAttr();
-
-    mlir::Value real =
-        ma::SubFOp::create(rewriter, loc, arg.lhs_re, arg.rhs_re, fmf);
-    mlir::Value imag =
-        ma::SubFOp::create(rewriter, loc, arg.lhs_im, arg.rhs_im, fmf);
-    rewriter.replaceOp(op,
-                       BuildComplexVector(loc, dst_type, real, imag, rewriter));
-    return mlir::success();
-  }
-};
-
-struct MulOpConversion final
-    : public mlir::OpConversionPattern<mlir::complex::MulOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  mlir::LogicalResult matchAndRewrite(
-      mlir::complex::MulOp op, OpAdaptor adaptor,
-      mlir::ConversionPatternRewriter& rewriter) const override {
-    mlir::Location loc = op.getLoc();
-    auto dst_type = mlir::cast<mlir::VectorType>(
-        getTypeConverter()->convertType(op.getType()));
-    BinaryComplexOperands arg =
-        UnpackBinaryComplexOperands<mlir::complex::MulOp>(op, adaptor,
-                                                          rewriter);
-    ma::FastMathFlagsAttr fmf = op.getFastMathFlagsAttr();
-
-    mlir::Value real;
-    mlir::Value imag;
-    if (ma::bitEnumContainsAll(fmf.getValue(), ma::FastMathFlags::contract)) {
-      mlir::Value lhs_im_rhs_im =
-          ma::MulFOp::create(rewriter, loc, arg.lhs_im, arg.rhs_im, fmf);
-      mlir::Value neg_lhs_im_rhs_im =
-          ma::NegFOp::create(rewriter, loc, lhs_im_rhs_im, fmf);
-      real = mlir::math::FmaOp::create(rewriter, loc, arg.lhs_re, arg.rhs_re,
-                                       neg_lhs_im_rhs_im, fmf);
-
-      mlir::Value lhs_im_rhs_re =
-          ma::MulFOp::create(rewriter, loc, arg.lhs_im, arg.rhs_re, fmf);
-      imag = mlir::math::FmaOp::create(rewriter, loc, arg.lhs_re, arg.rhs_im,
-                                       lhs_im_rhs_re, fmf);
-    } else {
-      mlir::Value lhs_re_rhs_re =
-          ma::MulFOp::create(rewriter, loc, arg.lhs_re, arg.rhs_re, fmf);
-      mlir::Value lhs_im_rhs_im =
-          ma::MulFOp::create(rewriter, loc, arg.lhs_im, arg.rhs_im, fmf);
-      mlir::Value lhs_im_rhs_re =
-          ma::MulFOp::create(rewriter, loc, arg.lhs_im, arg.rhs_re, fmf);
-      mlir::Value lhs_re_rhs_im =
-          ma::MulFOp::create(rewriter, loc, arg.lhs_re, arg.rhs_im, fmf);
-      real =
-          ma::SubFOp::create(rewriter, loc, lhs_re_rhs_re, lhs_im_rhs_im, fmf);
-      imag =
-          ma::AddFOp::create(rewriter, loc, lhs_im_rhs_re, lhs_re_rhs_im, fmf);
-    }
-
-    rewriter.replaceOp(op,
-                       BuildComplexVector(loc, dst_type, real, imag, rewriter));
-    return mlir::success();
-  }
-};
-
-struct NegOpConversion final
-    : public mlir::OpConversionPattern<mlir::complex::NegOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  mlir::LogicalResult matchAndRewrite(
-      mlir::complex::NegOp op, OpAdaptor adaptor,
-      mlir::ConversionPatternRewriter& rewriter) const override {
-    mlir::Location loc = op.getLoc();
-    auto dst_type = mlir::cast<mlir::VectorType>(
-        getTypeConverter()->convertType(op.getType()));
-    ma::FastMathFlagsAttr fmf = op.getFastMathFlagsAttr();
-    mlir::Value real = ma::NegFOp::create(
-        rewriter, loc, ExtractReal(loc, adaptor.getComplex(), rewriter), fmf);
-    mlir::Value imag = ma::NegFOp::create(
-        rewriter, loc, ExtractImag(loc, adaptor.getComplex(), rewriter), fmf);
-    rewriter.replaceOp(op,
-                       BuildComplexVector(loc, dst_type, real, imag, rewriter));
-    return mlir::success();
-  }
-};
-
-template <typename ComparisonOp, ma::CmpFPredicate Pred, typename CombinerOp>
-struct ComparisonOpConversion final
-    : public mlir::OpConversionPattern<ComparisonOp> {
-  using mlir::OpConversionPattern<ComparisonOp>::OpConversionPattern;
-
-  mlir::LogicalResult matchAndRewrite(
-      ComparisonOp op, typename ComparisonOp::Adaptor adaptor,
-      mlir::ConversionPatternRewriter& rewriter) const override {
-    mlir::Location loc = op.getLoc();
-    BinaryComplexOperands arg =
-        UnpackBinaryComplexOperands<ComparisonOp>(op, adaptor, rewriter);
-    mlir::Value real_comparison =
-        ma::CmpFOp::create(rewriter, loc, Pred, arg.lhs_re, arg.rhs_re);
-    mlir::Value imag_comparison =
-        ma::CmpFOp::create(rewriter, loc, Pred, arg.lhs_im, arg.rhs_im);
-    rewriter.replaceOpWithNewOp<CombinerOp>(op, real_comparison,
-                                            imag_comparison);
     return mlir::success();
   }
 };
@@ -510,19 +327,18 @@ class ConvertComplexToArithMathPass
     ComplexToArithMathTypeConverter converter;
 
     mlir::RewritePatternSet patterns(context);
-    patterns.add<AbsOpConversion, AddOpConversion, ConstantOpLowering,
-                 CreateOpConversion, ImOpConversion, MulOpConversion,
-                 NegOpConversion, PoisonOpConversion, ReOpConversion,
-                 SelectOpConversion, SubOpConversion,
-                 TensorExtractConversion, TensorInsertConversion,
-                 ComparisonOpConversion<mlir::complex::EqualOp,
-                                        ma::CmpFPredicate::OEQ, ma::AndIOp>,
-                 ComparisonOpConversion<mlir::complex::NotEqualOp,
-                                        ma::CmpFPredicate::UNE, ma::OrIOp>>(
-        converter, context);
+    patterns.add<ConstantOpLowering, CreateOpConversion, ImOpConversion,
+                 PoisonOpConversion, ReOpConversion, SelectOpConversion,
+                 TensorExtractConversion, TensorInsertConversion>(converter,
+                                                                  context);
     mlir::populateFunctionOpInterfaceTypeConversionPattern<mlir::func::FuncOp>(
         patterns, converter);
     mlir::populateReturnOpTypeConversionPattern(patterns, converter);
+    // Rewrite func.call sites whose callee signatures have been rewritten
+    // (complex<f32> → vector<2xf32>). Without this the call's operand/result
+    // types stay complex<f32> while the callee body is converted, and full
+    // conversion fails with "failed to legalize operation 'func.call'".
+    mlir::populateCallOpTypeConversionPattern(patterns, converter);
 
     mlir::ConversionTarget target(*context);
     target.addIllegalDialect<mlir::complex::ComplexDialect>();
@@ -534,6 +350,11 @@ class ConvertComplexToArithMathPass
     target.addDynamicallyLegalOp<mlir::func::ReturnOp>(
         [&](mlir::func::ReturnOp op) {
           return converter.isLegal(op.getOperandTypes());
+        });
+    target.addDynamicallyLegalOp<mlir::func::CallOp>(
+        [&](mlir::func::CallOp op) {
+          return converter.isLegal(op.getOperandTypes()) &&
+                 converter.isLegal(op.getResultTypes());
         });
     target.markUnknownOpDynamicallyLegal([&](mlir::Operation* op) {
       return std::optional<bool>(converter.isLegal(op));
