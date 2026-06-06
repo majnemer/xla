@@ -41,6 +41,15 @@ class MetalCompiler : public xla::gpu::GpuCompiler {
   MetalCompiler();
   ~MetalCompiler() override = default;
 
+ public:
+  // Runs Metal-specific pre-layout-assignment passes (currently:
+  // MetalExpandComplexTriangularSolve, which expands complex trsms into
+  // matmul+select sequences before LayoutAssignment touches them), then
+  // delegates to the GpuCompiler base for the standard pipeline.
+  absl::StatusOr<std::unique_ptr<HloModule>> RunHloPasses(
+      std::unique_ptr<HloModule> module, se::StreamExecutor* stream_exec,
+      const CompileOptions& options) override;
+
  protected:
   // Normalizes BF16, all F8 variants, F4E2M1FN, and F8E8M0FNU away before
   // delegating to the GpuCompiler base. The MSL emitter cannot lower those

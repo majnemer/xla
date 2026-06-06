@@ -35,6 +35,7 @@ cc_library(
         "//xla/backends/metal/runtime:metal_kernel_artifact",
         "//xla/backends/metal/runtime:metal_kernel_thunk",
         "//xla/backends/metal/runtime:metal_triangular_solve_thunk",
+        "//xla/backends/metal/transforms:expand_complex_triangular_solve",
         "//xla/backends/metal/transforms:lower_adjoint_triangular_solve",
         "//xla/codegen:mlir_kernel_source",
         "//xla/codegen:ir_printing",
