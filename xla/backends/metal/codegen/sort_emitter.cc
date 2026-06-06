@@ -39,8 +39,11 @@ limitations under the License.
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/Types.h"
 #include "mlir/IR/Value.h"
+#include "xla/codegen/emitters/computation_partitioner.h"
+#include "xla/codegen/emitters/kernel_api_builder.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/codegen/emitters/type_util.h"
+#include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/layout.h"
 #include "xla/layout_util.h"
@@ -283,6 +286,20 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
       mlir::ArrayAttr::get(context, arg_attrs),
       /*res_attrs=*/mlir::ArrayAttr{});
   entry_func->setAttr(kXlaEntryAttr, mlir::UnitAttr::get(context));
+
+  // Lower the comparator HLO into callable MLIR func(s) before the entry
+  // body so the kernel can call_target it. PartitionedComputations handles
+  // sub-graph extraction (and any nested called computations); the call
+  // target provider maps each HLO root to its emitted FuncOp. Sort's
+  // comparator is the canonical "called computation": (...scalar) -> i1.
+  const HloComputation* comparator = desc.sort->to_apply();
+  emitters::PartitionedComputations partitioned(comparator, context);
+  TF_ASSIGN_OR_RETURN(
+      emitters::CallTargetProvider comparator_call_targets,
+      emitters::EmitPartitionedComputations(*module, partitioned));
+  // Bound but not yet used: the kernel body below is still passthrough
+  // pending the compare-and-swap lowering. Silence the unused warning.
+  (void)comparator_call_targets;
 
   // Trivial passthrough body: return the args unchanged. The full
   // compare-and-swap body lands in a follow-up commit; this minimum-viable

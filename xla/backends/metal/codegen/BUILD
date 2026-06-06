@@ -89,6 +89,8 @@ cc_library(
     deps = [
         "//xla:shape_util",
         "//xla:util",
+        "//xla/codegen/emitters:computation_partitioner",
+        "//xla/codegen/emitters:kernel_api_builder",
         "//xla/codegen/emitters:kernel_arguments",
         "//xla/codegen/emitters:type_util",
         "//xla/hlo/ir:hlo",
