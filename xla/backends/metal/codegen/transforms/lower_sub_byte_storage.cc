@@ -23,6 +23,7 @@ limitations under the License.
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Func/Transforms/FuncConversions.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/Patterns.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -505,6 +506,85 @@ struct ConvertCmpIOp : public mlir::OpConversionPattern<ma::CmpIOp> {
   }
 };
 
+struct ConvertSubByteShRSIOp : public mlir::OpConversionPattern<ma::ShRSIOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      ma::ShRSIOp op, OpAdaptor adaptor,
+      mlir::ConversionPatternRewriter& rewriter) const override {
+    std::optional<int> bit_width = GetSubByteBitWidth(op.getType());
+    if (!bit_width) {
+      return rewriter.notifyMatchFailure(op, "not a sub-byte result");
+    }
+    mlir::ImplicitLocOpBuilder builder(op.getLoc(), rewriter);
+    mlir::Value lhs =
+        SignExtendLowBitsToI8(adaptor.getLhs(), *bit_width, builder);
+    mlir::Value rhs = MaskLowBits(adaptor.getRhs(), *bit_width, builder);
+    mlir::Value result = ma::ShRSIOp::create(builder, lhs, rhs);
+    rewriter.replaceOp(op, MaskLowBits(result, *bit_width, builder));
+    return mlir::success();
+  }
+};
+
+struct ConvertSubByteCtlzOp
+    : public mlir::OpConversionPattern<mlir::math::CountLeadingZerosOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::math::CountLeadingZerosOp op, OpAdaptor adaptor,
+      mlir::ConversionPatternRewriter& rewriter) const override {
+    std::optional<int> bit_width = GetSubByteBitWidth(op.getType());
+    if (!bit_width) {
+      return rewriter.notifyMatchFailure(op, "not a sub-byte result");
+    }
+    mlir::ImplicitLocOpBuilder builder(op.getLoc(), rewriter);
+    // Mask high bits so the i8 widening doesn't pollute the count.
+    mlir::Value value =
+        MaskLowBits(adaptor.getOperand(), *bit_width, builder);
+    mlir::Value clz =
+        mlir::math::CountLeadingZerosOp::create(builder, value);
+    mlir::Value padding =
+        ConstantIntLike(builder, clz.getType(), 8 - *bit_width);
+    rewriter.replaceOp(op, ma::SubIOp::create(builder, clz, padding));
+    return mlir::success();
+  }
+};
+
+struct ConvertSubByteSIToFPOp : public mlir::OpConversionPattern<ma::SIToFPOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      ma::SIToFPOp op, OpAdaptor adaptor,
+      mlir::ConversionPatternRewriter& rewriter) const override {
+    std::optional<int> bit_width = GetSubByteBitWidth(op.getIn().getType());
+    if (!bit_width) {
+      return rewriter.notifyMatchFailure(op, "input is not sub-byte");
+    }
+    mlir::ImplicitLocOpBuilder builder(op.getLoc(), rewriter);
+    mlir::Value value =
+        SignExtendLowBitsToI8(adaptor.getIn(), *bit_width, builder);
+    rewriter.replaceOpWithNewOp<ma::SIToFPOp>(op, op.getType(), value);
+    return mlir::success();
+  }
+};
+
+struct ConvertSubByteUIToFPOp : public mlir::OpConversionPattern<ma::UIToFPOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      ma::UIToFPOp op, OpAdaptor adaptor,
+      mlir::ConversionPatternRewriter& rewriter) const override {
+    std::optional<int> bit_width = GetSubByteBitWidth(op.getIn().getType());
+    if (!bit_width) {
+      return rewriter.notifyMatchFailure(op, "input is not sub-byte");
+    }
+    mlir::ImplicitLocOpBuilder builder(op.getLoc(), rewriter);
+    mlir::Value value = MaskLowBits(adaptor.getIn(), *bit_width, builder);
+    rewriter.replaceOpWithNewOp<ma::UIToFPOp>(op, op.getType(), value);
+    return mlir::success();
+  }
+};
+
 struct ConvertSelectOp : public mlir::OpConversionPattern<ma::SelectOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -794,9 +874,11 @@ class LowerSubByteStoragePass
     mlir::RewritePatternSet patterns(context);
     patterns.add<
         ConvertBitcastOp, ConvertCmpIOp, ConvertConstantOp, ConvertExtSIOp,
-        ConvertExtUIOp, ConvertPoisonOp, ConvertSelectOp, ConvertTensorExtract,
-        ConvertTensorInsert, ConvertTruncIOp, ConvertVectorBroadcast,
-        ConvertVectorExtract, ConvertVectorFromElements, ConvertVectorInsert,
+        ConvertExtUIOp, ConvertPoisonOp, ConvertSelectOp,
+        ConvertSubByteCtlzOp, ConvertSubByteShRSIOp, ConvertSubByteSIToFPOp,
+        ConvertSubByteUIToFPOp, ConvertTensorExtract, ConvertTensorInsert,
+        ConvertTruncIOp, ConvertVectorBroadcast, ConvertVectorExtract,
+        ConvertVectorFromElements, ConvertVectorInsert,
         ConvertVectorTransferRead, ConvertVectorTransferWrite,
         ConvertSubByteBinaryOp<ma::AddIOp>,
         ConvertSubByteBinaryOp<ma::AndIOp>,
