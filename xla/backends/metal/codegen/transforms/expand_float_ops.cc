@@ -139,6 +139,51 @@ class RewriteLog1pPattern : public mlir::OpRewritePattern<mlir::math::Log1pOp> {
   }
 };
 
+// MSL has no expm1 intrinsic. Follow the same algorithm as upstream MLIR's
+// ExpM1Approximation: expm1(x) = (exp(x) - 1) * x / log(exp(x)), with guards
+// for x == 0, exp(x) == +inf, and exp(x) - 1 == -1.
+class RewriteExpm1Pattern : public mlir::OpRewritePattern<mlir::math::ExpM1Op> {
+ public:
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::math::ExpM1Op op,
+      mlir::PatternRewriter& rewriter) const override {
+    mlir::Type type = op.getType();
+    mlir::Type element_type = mlir::getElementTypeOrSelf(type);
+    if (!mlir::isa<mlir::Float16Type, mlir::Float32Type>(element_type)) {
+      return rewriter.notifyMatchFailure(op, "not an f16/f32 expm1");
+    }
+
+    mlir::ImplicitLocOpBuilder builder(op.getLoc(), rewriter);
+    ma::FastMathFlagsAttr fastmath = op.getFastmathAttr();
+    auto c = [&](double value) -> mlir::Value {
+      return GetFloatConst(builder, type, value);
+    };
+
+    mlir::Value x = op.getOperand();
+    mlir::Value one = c(1.0);
+    mlir::Value neg_one = c(-1.0);
+    mlir::Value u = mlir::math::ExpOp::create(builder, x, fastmath);
+    mlir::Value u_eq_one_or_nan =
+        ma::CmpFOp::create(builder, ma::CmpFPredicate::UEQ, u, one);
+    mlir::Value u_minus_one = ma::SubFOp::create(builder, u, one, fastmath);
+    mlir::Value u_minus_one_eq_neg_one = ma::CmpFOp::create(
+        builder, ma::CmpFPredicate::OEQ, u_minus_one, neg_one);
+    mlir::Value log_u = mlir::math::LogOp::create(builder, u, fastmath);
+    mlir::Value is_inf =
+        ma::CmpFOp::create(builder, ma::CmpFPredicate::OEQ, log_u, u);
+    mlir::Value ratio = ma::DivFOp::create(builder, x, log_u, fastmath);
+    mlir::Value expm1 = Mul(builder, u_minus_one, ratio, fastmath);
+    expm1 = ma::SelectOp::create(builder, is_inf, u, expm1);
+    mlir::Value with_neg_inf =
+        ma::SelectOp::create(builder, u_minus_one_eq_neg_one, neg_one, expm1);
+    rewriter.replaceOpWithNewOp<ma::SelectOp>(op, u_eq_one_or_nan, x,
+                                              with_neg_inf);
+    return mlir::success();
+  }
+};
+
 class ExpandFloatOpsPass
     : public impl::ExpandFloatOpsPassBase<ExpandFloatOpsPass> {
  public:
@@ -146,7 +191,7 @@ class ExpandFloatOpsPass
 
   void runOnOperation() override {
     mlir::RewritePatternSet patterns(&getContext());
-    patterns.add<RewriteLog1pPattern>(&getContext());
+    patterns.add<RewriteExpm1Pattern, RewriteLog1pPattern>(&getContext());
 
     if (mlir::failed(
             mlir::applyPatternsGreedily(getOperation(), std::move(patterns)))) {

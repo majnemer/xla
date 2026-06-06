@@ -27,6 +27,7 @@ limitations under the License.
 #include "xla/tests/complex_unary_op_samples.h"
 #include "xla/tests/hlo_pjrt_interpreter_reference_mixin.h"
 #include "xla/tests/hlo_pjrt_test_base.h"
+#include "xla/tests/xla_test_backend_predicates.h"
 #include "xla/tsl/platform/test.h"
 #include "xla/xla_data.pb.h"
 
@@ -112,36 +113,46 @@ class ComplexUnaryOpTest
 TEST_F(ComplexUnaryOpTest, Log1pTest) {
   UnaryTestHelper<complex_unary_op_samples::Log1p<float>>(
       [](XlaOp x) { return Log1p(x); });
-  UnaryTestHelper<complex_unary_op_samples::Log1p<double>>(
-      [](XlaOp x) { return Log1p(x); });
+  if (test::BackendSupportsComplex128()) {
+    UnaryTestHelper<complex_unary_op_samples::Log1p<double>>(
+        [](XlaOp x) { return Log1p(x); });
+  }
 }
 
 TEST_F(ComplexUnaryOpTest, TanTest) {
   UnaryTestHelper<complex_unary_op_samples::Tan<float>>(
       [](XlaOp x) { return Tan(x); });
-  UnaryTestHelper<complex_unary_op_samples::Tan<double>>(
-      [](XlaOp x) { return Tan(x); });
+  if (test::BackendSupportsComplex128()) {
+    UnaryTestHelper<complex_unary_op_samples::Tan<double>>(
+        [](XlaOp x) { return Tan(x); });
+  }
 }
 
 TEST_F(ComplexUnaryOpTest, AsinTest) {
   UnaryTestHelper<complex_unary_op_samples::Asin<float>>(
       [](XlaOp x) { return Asin(x); });
-  UnaryTestHelper<complex_unary_op_samples::Asin<double>>(
-      [](XlaOp x) { return Asin(x); });
+  if (test::BackendSupportsComplex128()) {
+    UnaryTestHelper<complex_unary_op_samples::Asin<double>>(
+        [](XlaOp x) { return Asin(x); });
+  }
 }
 
 TEST_F(ComplexUnaryOpTest, AsinhTest) {
   UnaryTestHelper<complex_unary_op_samples::Asinh<float>>(
       [](XlaOp x) { return Asinh(x); });
-  UnaryTestHelper<complex_unary_op_samples::Asinh<double>>(
-      [](XlaOp x) { return Asinh(x); });
+  if (test::BackendSupportsComplex128()) {
+    UnaryTestHelper<complex_unary_op_samples::Asinh<double>>(
+        [](XlaOp x) { return Asinh(x); });
+  }
 }
 
 TEST_F(ComplexUnaryOpTest, ExpTest) {
   UnaryTestHelper<complex_unary_op_samples::Exp<float>>(
       [](XlaOp x) { return Exp(x); });
-  UnaryTestHelper<complex_unary_op_samples::Exp<double>>(
-      [](XlaOp x) { return Exp(x); });
+  if (test::BackendSupportsComplex128()) {
+    UnaryTestHelper<complex_unary_op_samples::Exp<double>>(
+        [](XlaOp x) { return Exp(x); });
+  }
 }
 
 }  // namespace
