@@ -41,6 +41,7 @@ limitations under the License.
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "xla/backends/gpu/codegen/emitters/ir/xla_gpu_ops.h"
 #include "xla/backends/metal/codegen/transforms/passes.h"
 
 namespace xla {
@@ -316,6 +317,55 @@ struct TensorInsertConversion final
   }
 };
 
+struct AllocateSharedConversion final
+    : public mlir::OpConversionPattern<::xla::gpu::AllocateSharedOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      ::xla::gpu::AllocateSharedOp op, OpAdaptor /*adaptor*/,
+      mlir::ConversionPatternRewriter& rewriter) const override {
+    if (!HasComplexElementType(op.getType())) {
+      return rewriter.notifyMatchFailure(op, "result is not complex");
+    }
+    mlir::Type converted_type = getTypeConverter()->convertType(op.getType());
+    if (!converted_type) {
+      return rewriter.notifyMatchFailure(op, "failed to convert result type");
+    }
+    rewriter.replaceOpWithNewOp<::xla::gpu::AllocateSharedOp>(op,
+                                                              converted_type);
+    return mlir::success();
+  }
+};
+
+struct SyncThreadsConversion final
+    : public mlir::OpConversionPattern<::xla::gpu::SyncThreadsOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      ::xla::gpu::SyncThreadsOp op, OpAdaptor adaptor,
+      mlir::ConversionPatternRewriter& rewriter) const override {
+    // SyncThreadsOp has TypesMatchWith between operands and results, so each
+    // result type tracks its operand. Rewrite both via the converter.
+    llvm::SmallVector<mlir::Type> new_result_types;
+    new_result_types.reserve(op.getNumResults());
+    bool any_complex = false;
+    for (mlir::Type t : op.getResultTypes()) {
+      mlir::Type conv = getTypeConverter()->convertType(t);
+      if (!conv) {
+        return rewriter.notifyMatchFailure(op, "failed to convert result type");
+      }
+      if (HasComplexElementType(t)) any_complex = true;
+      new_result_types.push_back(conv);
+    }
+    if (!any_complex) {
+      return rewriter.notifyMatchFailure(op, "no complex operands");
+    }
+    rewriter.replaceOpWithNewOp<::xla::gpu::SyncThreadsOp>(
+        op, new_result_types, adaptor.getOperands());
+    return mlir::success();
+  }
+};
+
 class ConvertComplexToArithMathPass
     : public impl::ConvertComplexToArithMathPassBase<
           ConvertComplexToArithMathPass> {
@@ -327,8 +377,9 @@ class ConvertComplexToArithMathPass
     ComplexToArithMathTypeConverter converter;
 
     mlir::RewritePatternSet patterns(context);
-    patterns.add<ConstantOpLowering, CreateOpConversion, ImOpConversion,
-                 PoisonOpConversion, ReOpConversion, SelectOpConversion,
+    patterns.add<AllocateSharedConversion, ConstantOpLowering,
+                 CreateOpConversion, ImOpConversion, PoisonOpConversion,
+                 ReOpConversion, SelectOpConversion, SyncThreadsConversion,
                  TensorExtractConversion, TensorInsertConversion>(converter,
                                                                   context);
     mlir::populateFunctionOpInterfaceTypeConversionPattern<mlir::func::FuncOp>(
