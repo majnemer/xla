@@ -287,6 +287,8 @@ class MetalThunkEmissionBackend final : public gpu::ThunkEmissionBackend {
       case HloOpcode::kRngGetAndUpdateState:
         return EmitRngGetAndUpdateState(
             Cast<HloRngGetAndUpdateStateInstruction>(instr));
+      case HloOpcode::kSort:
+        return EmitSort(Cast<HloSortInstruction>(instr));
       default:
         return Unimplemented(
             "MetalCompiler::CompileToBackendResult: post-scheduling HLO "
@@ -390,6 +392,13 @@ class MetalThunkEmissionBackend final : public gpu::ThunkEmissionBackend {
     thunks.push_back(std::make_unique<gpu::OutfeedThunk>(
         GetThunkInfo(outfeed), std::move(source_slices)));
     return thunks;
+  }
+
+  absl::StatusOr<gpu::ThunkSequence> EmitSort(const HloSortInstruction* sort) {
+    return Unimplemented(
+        "MetalCompiler::CompileToBackendResult: bitonic sort emitter not yet "
+        "implemented for sort '%s'.",
+        sort->name());
   }
 
   absl::StatusOr<gpu::ThunkSequence> EmitRngGetAndUpdateState(
