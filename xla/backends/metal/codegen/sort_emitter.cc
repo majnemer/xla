@@ -26,15 +26,27 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "llvm/ADT/SmallVector.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/IR/Attributes.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
+#include "mlir/IR/Types.h"
+#include "mlir/IR/Value.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
+#include "xla/codegen/emitters/type_util.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/gpu/launch_dimensions.h"
+#include "xla/service/llvm_ir/llvm_util.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/stream_executor/device_description.h"
@@ -148,9 +160,18 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
       &tiled_num_iterations_in_sort_dim);
 
   TF_ASSIGN_OR_RETURN(
-      emitters::KernelArguments kernel_args,
+      emitters::KernelArguments full_kernel_args,
       emitters::KernelArguments::Create(buffer_assignment, buffer_alignment,
                                         sort));
+  // Sort runs in place on the output buffers; the input buffers alias the
+  // outputs after the D2D copy emitted earlier, so the kernel only takes the
+  // output buffers. Drop the operand half (the first operand_count args) so
+  // we stay under Metal's 31-buffer-argument limit for wide many-input sorts.
+  TF_RET_CHECK(full_kernel_args.args().size() == 2 * sort->operand_count());
+  std::vector<emitters::KernelArgument> output_args(
+      full_kernel_args.args().begin() + sort->operand_count(),
+      full_kernel_args.args().end());
+  emitters::KernelArguments kernel_args(std::move(output_args));
 
   std::vector<SortStageDescription> stages;
   bool emit_iota_operands = true;
@@ -209,12 +230,69 @@ bool ShrinkSortStageTile(SortStageDescription& desc,
   return true;
 }
 
+namespace {
+
+constexpr absl::string_view kXlaEntryAttr = "xla.entry";
+constexpr absl::string_view kXlaSliceIndexAttr = "xla.slice_index";
+constexpr absl::string_view kXlaInvariantAttr = "xla.invariant";
+
+}  // namespace
+
 absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
     mlir::MLIRContext* context, const SortStageDescription& desc) {
-  (void)context;
-  (void)desc;
-  return absl::UnimplementedError(
-      "MetalCompiler::EmitSortStageModule: MLIR emission not yet implemented.");
+  mlir::OpBuilder builder(context);
+  auto loc = mlir::NameLoc::get(builder.getStringAttr(desc.entry_name));
+  mlir::OwningOpRef<mlir::ModuleOp> module = llvm_ir::CreateMlirModuleOp(loc);
+
+  mlir::ImplicitLocOpBuilder b(loc, *module);
+  const auto& args = desc.kernel_args.args();
+  const int64_t operand_count = desc.sort->operand_count();
+  // PlanBitonicSort drops the operand-half of KernelArguments::Create's
+  // output, so the kernel signature carries only the in-place output buffers.
+  TF_RET_CHECK(args.size() == operand_count);
+
+  llvm::SmallVector<mlir::Type> param_types;
+  llvm::SmallVector<mlir::Attribute> arg_attrs;
+  param_types.reserve(args.size());
+  arg_attrs.reserve(args.size());
+  for (const auto& arg : args) {
+    param_types.push_back(emitters::TensorShapeToMlirType(arg.shape(), b));
+    llvm::SmallVector<mlir::NamedAttribute> attrs;
+    attrs.push_back(b.getNamedAttr(kXlaSliceIndexAttr,
+                                   b.getIndexAttr(arg.slice_index())));
+    attrs.push_back(
+        b.getNamedAttr(mlir::LLVM::LLVMDialect::getAlignAttrName(),
+                       b.getIndexAttr(arg.alignment())));
+    attrs.push_back(
+        b.getNamedAttr(mlir::LLVM::LLVMDialect::getDereferenceableAttrName(),
+                       b.getIndexAttr(arg.slice().size())));
+    if (!arg.written()) {
+      attrs.push_back(b.getNamedAttr(kXlaInvariantAttr, b.getUnitAttr()));
+    }
+    arg_attrs.push_back(b.getDictionaryAttr(attrs));
+  }
+
+  // In-place sort: result tensors are the same buffers we received.
+  llvm::SmallVector<mlir::Type> result_types(param_types);
+
+  b.setInsertionPointToStart(module->getBody());
+  auto entry_func = mlir::func::FuncOp::create(
+      b, desc.entry_name,
+      mlir::FunctionType::get(context, param_types, result_types),
+      /*sym_visibility=*/mlir::StringAttr{},
+      mlir::ArrayAttr::get(context, arg_attrs),
+      /*res_attrs=*/mlir::ArrayAttr{});
+  entry_func->setAttr(kXlaEntryAttr, mlir::UnitAttr::get(context));
+
+  // Trivial passthrough body: return the args unchanged. The full
+  // compare-and-swap body lands in a follow-up commit; this minimum-viable
+  // body lets the Phase-2 plumbing exercise the end-to-end pipeline.
+  mlir::Block* entry_block = entry_func.addEntryBlock();
+  b.setInsertionPointToStart(entry_block);
+  llvm::SmallVector<mlir::Value> returns(entry_block->getArguments());
+  mlir::func::ReturnOp::create(b, returns);
+
+  return module;
 }
 
 }  // namespace xla::metal

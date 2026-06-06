@@ -27,6 +27,7 @@ cc_library(
         "//xla/backends/gpu/runtime:thunk",
         "//xla/backends/gpu/runtime:thunk_executor",
         "//xla/backends/metal/codegen:msl_kernel_emitter",
+        "//xla/backends/metal/codegen:sort_emitter",
         "//xla/backends/metal/codegen:msl_kernel_source",
         "//xla/backends/metal/codegen/transforms:passes",
         "//xla/backends/metal/runtime:metal_kernel_artifact",
