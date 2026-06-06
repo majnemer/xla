@@ -618,6 +618,12 @@ class MslEmitter {
     if (mlir::isa<mlir::math::SinOp>(op)) {
       return EmitMathCall(op, "metal::sin");
     }
+    if (mlir::isa<mlir::math::TanhOp>(op)) {
+      return EmitMathCall(op, "metal::tanh");
+    }
+    if (mlir::isa<mlir::math::RoundOp>(op)) {
+      return EmitMathCall(op, "metal::round");
+    }
     if (auto clz = mlir::dyn_cast<mlir::math::CountLeadingZerosOp>(op)) {
       return EmitMathCtlz(clz);
     }
