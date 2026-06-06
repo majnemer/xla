@@ -480,7 +480,7 @@ TEST_P(ReducedPrecisionAccuracyTest, ReducePrecisionFloat) {
 }
 
 TEST_P(ReducedPrecisionAccuracyTest, ReducePrecisionDouble) {
-  if (test::DeviceTypeIs(test::kTpu)) {
+  if (test::DeviceTypeIs(test::kTpu) || !test::BackendSupportsFloat64()) {
     GTEST_SKIP();
   }
   int operation_index = GetParam();

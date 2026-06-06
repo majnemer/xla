@@ -2734,6 +2734,9 @@ TEST_F(ArrayElementwiseOpTest, RealF64s) {
 }
 
 TEST_F(ArrayElementwiseOpTest, ImagF64s) {
+  if (!test::BackendSupportsFloat64()) {
+    GTEST_SKIP();
+  }
   XlaBuilder builder(TestName());
   std::vector<double> xs = {3.14159, 0.0, 1.570796, -0.78539};
   auto a = ConstantR1<double>(&builder, xs);

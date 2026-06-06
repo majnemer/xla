@@ -111,7 +111,13 @@ bool BackendIsStrict(absl::string_view device) {
   return device_matches && modifiers_match;
 }
 
-bool BackendSupportsFloat64() { return !DeviceTypeIs(kTpu); }
-bool BackendSupportsComplex128() { return !DeviceTypeIs(kTpu); }
+bool BackendSupportsFloat64() {
+  // Apple Silicon GPUs have no FP64 hardware; the MSL emitter rejects F64.
+  return !DeviceTypeIs(kTpu) && !DeviceIs(kMetal);
+}
+bool BackendSupportsComplex128() {
+  // C128 reduces to F64 internally; same Apple Silicon restriction.
+  return !DeviceTypeIs(kTpu) && !DeviceIs(kMetal);
+}
 
 }  // namespace xla::test
