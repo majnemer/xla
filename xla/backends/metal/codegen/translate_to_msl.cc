@@ -612,6 +612,9 @@ class MslEmitter {
     if (mlir::isa<mlir::math::Atan2Op>(op)) {
       return EmitMathCall(op, "metal::atan2");
     }
+    if (mlir::isa<mlir::math::CosOp>(op)) {
+      return EmitMathCall(op, "metal::cos");
+    }
     if (auto clz = mlir::dyn_cast<mlir::math::CountLeadingZerosOp>(op)) {
       return EmitMathCtlz(clz);
     }
