@@ -28,9 +28,14 @@ limitations under the License.
 #include <vector>
 
 #include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/synchronization/mutex.h"
+#include "xla/stream_executor/fft.h"
+#include "xla/stream_executor/metal/metal_platform_id.h"
+#include "xla/stream_executor/plugin_registry.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/event.h"
@@ -83,6 +88,23 @@ MetalExecutor::MetalExecutor(Platform* platform, int ordinal)
     : gpu::GpuExecutor(platform, ordinal), device_(nil) {}
 
 MetalExecutor::~MetalExecutor() = default;
+
+fft::FftSupport* MetalExecutor::AsFft() {
+  absl::MutexLock lock(&fft_mu_);
+  if (fft_ != nullptr) {
+    return fft_.get();
+  }
+  PluginRegistry* registry = PluginRegistry::Instance();
+  absl::StatusOr<PluginRegistry::FftFactory> factory =
+      registry->GetFactory<PluginRegistry::FftFactory>(kMetalPlatformId);
+  if (!factory.ok()) {
+    LOG(ERROR) << "Unable to retrieve Metal FFT factory: "
+               << factory.status().message();
+    return nullptr;
+  }
+  fft_.reset(factory.value()(this));
+  return fft_.get();
+}
 
 absl::Status MetalExecutor::Init() {
   NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();

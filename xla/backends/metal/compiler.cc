@@ -44,6 +44,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/emitters/transforms/passes.h"
 #include "xla/backends/gpu/codegen/fusions.h"
 #include "xla/backends/gpu/runtime/device_to_device_copy_thunk.h"
+#include "xla/backends/gpu/runtime/fft_thunk.h"
 #include "xla/backends/gpu/runtime/infeed_thunk.h"
 #include "xla/backends/gpu/runtime/kernel_thunk.h"
 #include "xla/backends/gpu/runtime/outfeed_thunk.h"
@@ -299,6 +300,8 @@ class MetalThunkEmissionBackend final : public gpu::ThunkEmissionBackend {
             Cast<HloRngGetAndUpdateStateInstruction>(instr));
       case HloOpcode::kSort:
         return EmitSort(Cast<HloSortInstruction>(instr));
+      case HloOpcode::kFft:
+        return EmitFft(Cast<HloFftInstruction>(instr));
       default:
         return Unimplemented(
             "MetalCompiler::CompileToBackendResult: post-scheduling HLO "
@@ -401,6 +404,22 @@ class MetalThunkEmissionBackend final : public gpu::ThunkEmissionBackend {
     gpu::ThunkSequence thunks;
     thunks.push_back(std::make_unique<gpu::OutfeedThunk>(
         GetThunkInfo(outfeed), std::move(source_slices)));
+    return thunks;
+  }
+
+  absl::StatusOr<gpu::ThunkSequence> EmitFft(const HloFftInstruction* fft) {
+    TF_ASSIGN_OR_RETURN(
+        BufferAllocation::Slice arg_slice,
+        buffer_assignment_->GetUniqueSlice(fft->operand(0), {}));
+    TF_ASSIGN_OR_RETURN(BufferAllocation::Slice dest_slice,
+                        buffer_assignment_->GetUniqueSlice(fft, {}));
+    gpu::ThunkSequence thunks;
+    thunks.push_back(std::make_unique<gpu::FftThunk>(
+        GetThunkInfo(fft), fft->fft_type(), fft->fft_length(),
+        /*input_buffer=*/arg_slice,
+        /*output_buffer=*/dest_slice,
+        /*input_shape=*/fft->operand(0)->shape(),
+        /*output_shape=*/fft->shape()));
     return thunks;
   }
 

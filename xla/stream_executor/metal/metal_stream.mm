@@ -581,6 +581,38 @@ MetalStream::LaunchKernel(const ThreadDim &thread_dims,
   return absl::OkStatus();
 }
 
+absl::StatusOr<id<MTLCommandBuffer>> MetalStream::EncodeWithCommandBuffer(
+    absl::string_view label, absl::string_view op_name,
+    absl::FunctionRef<absl::StatusOr<id<MTLCommandBuffer>>(
+        id<MTLCommandBuffer> cmd_buf)>
+        encode) {
+  TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
+  @autoreleasepool {
+    absl::MutexLock lock(&submit_mu_);
+    id<MTLCommandBuffer> cmd_buf = [command_queue_ commandBuffer];
+    if (cmd_buf == nil) {
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "MetalStream::EncodeWithCommandBuffer: commandBuffer returned nil "
+          "for '", op_name, "'."));
+    }
+    if (!label.empty()) {
+      cmd_buf.label = [[NSString alloc] initWithBytes:label.data()
+                                               length:label.size()
+                                             encoding:NSUTF8StringEncoding];
+    }
+    TF_ASSIGN_OR_RETURN(id<MTLCommandBuffer> tail, encode(cmd_buf));
+    if (tail == nil) {
+      return absl::InternalError(absl::StrCat(
+          "MetalStream::EncodeWithCommandBuffer: encode callback returned nil "
+          "tail for '", op_name, "'."));
+    }
+    TrackCommandBufferErrors(tail, op_name);
+    [tail commit];
+    tail_buffer_ = tail;
+    return tail;
+  }
+}
+
 absl::Status MetalStream::BlockHostUntilDone() {
   id<MTLCommandBuffer> tail = nil;
   {
