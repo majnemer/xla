@@ -501,8 +501,8 @@ std::vector<DotTestParam> CreateDotTestParameters() {
 TEST_P(ParametricDotTest, TestF16) { TestImpl<Eigen::half>(); }
 TEST_P(ParametricDotTest, TestF32) { TestImpl<float>(); }
 TEST_P(ParametricDotTest, TestF64) {
-  if (test::HasModifiers({test::kGrm})) {
-    // Oversize.
+  if (test::HasModifiers({test::kGrm}) || !test::BackendSupportsFloat64()) {
+    // Oversize on GRM; FP64 unsupported on some backends (e.g. Metal).
     GTEST_SKIP();
   }
   TestImpl<double>();

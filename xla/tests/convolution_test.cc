@@ -1861,7 +1861,7 @@ class ConvolutionHloTest
 };
 
 TEST_F(ConvolutionHloTest, ConvolveF64Forward) {
-  if (test::DeviceTypeIs(test::kTpu)) {
+  if (test::DeviceTypeIs(test::kTpu) || !test::BackendSupportsFloat64()) {
     GTEST_SKIP();
   }
   if (IsRocm()) {
@@ -1910,7 +1910,7 @@ ENTRY Test {
 }
 
 TEST_F(ConvolutionHloTest, ConvolveF64BackwardFilter) {
-  if (test::DeviceTypeIs(test::kTpu)) {
+  if (test::DeviceTypeIs(test::kTpu) || !test::BackendSupportsFloat64()) {
     GTEST_SKIP();
   }
   if (IsRocm()) {
@@ -1928,7 +1928,7 @@ ENTRY Test {
 }
 
 TEST_F(ConvolutionHloTest, ConvolveF64BackwardInput) {
-  if (test::DeviceTypeIs(test::kTpu)) {
+  if (test::DeviceTypeIs(test::kTpu) || !test::BackendSupportsFloat64()) {
     GTEST_SKIP();
   }
   if (IsRocm()) {

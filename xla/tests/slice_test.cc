@@ -260,7 +260,12 @@ std::string SliceR1TestDataToString(
 
 TEST_P(SliceR1Test, DoIt_F32) { Run<float>(GetParam()); }
 
-TEST_P(SliceR1Test, DoIt_F64) { Run<double>(GetParam()); }
+TEST_P(SliceR1Test, DoIt_F64) {
+  if (!test::BackendSupportsFloat64()) {
+    GTEST_SKIP();
+  }
+  Run<double>(GetParam());
+}
 
 TEST_P(SliceR1Test, DoIt_U32) { Run<uint32_t>(GetParam()); }
 

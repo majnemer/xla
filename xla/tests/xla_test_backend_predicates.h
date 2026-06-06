@@ -57,6 +57,8 @@ inline constexpr const absl::string_view kB200 = "b200";
 inline constexpr const absl::string_view kP100 = "p100";
 inline constexpr const absl::string_view kV100 = "v100";
 
+inline constexpr const absl::string_view kMetal = "metal";
+
 inline constexpr const absl::string_view kInterpreter = "interpreter";
 
 inline constexpr const absl::string_view kTpu = "tpu";
