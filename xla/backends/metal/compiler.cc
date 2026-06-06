@@ -50,7 +50,6 @@ limitations under the License.
 #include "xla/backends/metal/runtime/metal_kernel_thunk.h"
 #include "xla/backends/metal/runtime/metal_triangular_solve_thunk.h"
 #include "xla/backends/metal/transforms/expand_complex_triangular_solve.h"
-#include "xla/backends/metal/transforms/lower_adjoint_triangular_solve.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/codegen/emitters/transforms/passes.h"
 #include "xla/codegen/ir_printing.h"
@@ -142,21 +141,21 @@ MetalCompiler::MetalCompiler()
     : xla::gpu::GpuCompiler(stream_executor::metal::kMetalPlatformId,
                             /*pointer_size=*/8) {}
 
-absl::StatusOr<std::unique_ptr<HloModule>> MetalCompiler::RunHloPasses(
-    std::unique_ptr<HloModule> module, se::StreamExecutor* stream_exec,
-    const CompileOptions& options) {
-  // Run our pre-layout-assignment pipeline first: MPSMatrixSolveTriangular
-  // is F32-only, so expand complex-typed trsms into matmul+select sequences
-  // before LayoutAssignment runs. Mirrors how GpuCompiler's own
-  // CholeskyExpander runs at the OptimizeHloModule level.
-  HloPassPipeline pre("metal_pre_layout_assignment");
-  pre.AddPass<MetalExpandComplexTriangularSolve>();
-  TF_RETURN_IF_ERROR(
-      pre.Run(module.get(),
-              /*execution_threads=*/{HloInstruction::kMainExecutionThread})
-          .status());
-  return xla::gpu::GpuCompiler::RunHloPasses(std::move(module), stream_exec,
-                                              options);
+absl::Status MetalCompiler::OptimizeHloConvolutionCanonicalization(
+    HloModule* hlo_module, const se::GpuComputeCapability& /*gpu_version*/,
+    se::dnn::VersionInfo /*dnn_version*/,
+    const se::SemanticVersion& /*toolkit_version*/,
+    CompilationStats* compilation_stats) {
+  // MPSMatrixSolveTriangular is F32-only. Expand complex-typed trsms into
+  // matmul+select sequences. Sits at the right pipeline stage — after
+  // CholeskyExpander has produced its trsms but before LayoutAssignment
+  // runs, so the new ops get layouts assigned by the standard machinery.
+  HloPassPipeline pipeline("metal_pre_layout_assignment", compilation_stats);
+  pipeline.AddPass<MetalExpandComplexTriangularSolve>();
+  return pipeline
+      .Run(hlo_module,
+           /*execution_threads=*/{HloInstruction::kMainExecutionThread})
+      .status();
 }
 
 absl::Status MetalCompiler::OptimizeHloPostLayoutAssignment(
@@ -198,11 +197,6 @@ absl::Status MetalCompiler::OptimizeHloPostLayoutAssignment(
   pre.AddPass<FloatNormalization>(&f8e4m3b11fnuz);
   pre.AddPass<FloatNormalization>(&f4e2m1fn);
   pre.AddPass<FloatNormalization>(&f8e8m0fnu);
-  // MPSMatrixSolveTriangular has no conjugate flag; rewrite ADJOINT trsms
-  // into (conj(A), TRANSPOSE) pairs so the thunk emitter only ever sees
-  // NO_TRANSPOSE / TRANSPOSE. After the complex expander runs only
-  // real-typed trsms reach here; ADJOINT folds cleanly to TRANSPOSE.
-  pre.AddPass<MetalLowerAdjointTriangularSolve>();
   TF_RETURN_IF_ERROR(
       pre.Run(hlo_module,
               /*execution_threads=*/{HloInstruction::kMainExecutionThread})

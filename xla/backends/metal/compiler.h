@@ -41,16 +41,17 @@ class MetalCompiler : public xla::gpu::GpuCompiler {
   MetalCompiler();
   ~MetalCompiler() override = default;
 
- public:
-  // Runs Metal-specific pre-layout-assignment passes (currently:
-  // MetalExpandComplexTriangularSolve, which expands complex trsms into
-  // matmul+select sequences before LayoutAssignment touches them), then
-  // delegates to the GpuCompiler base for the standard pipeline.
-  absl::StatusOr<std::unique_ptr<HloModule>> RunHloPasses(
-      std::unique_ptr<HloModule> module, se::StreamExecutor* stream_exec,
-      const CompileOptions& options) override;
-
  protected:
+  // Slot for Metal-specific HLO passes that must run after expanders
+  // (CholeskyExpander, etc.) but before LayoutAssignment. The base hook is
+  // named for its primary use case on LLVM-flavored GPU backends; we use it
+  // because it sits at the right position in OptimizeHloModule.
+  absl::Status OptimizeHloConvolutionCanonicalization(
+      HloModule* hlo_module, const se::GpuComputeCapability& gpu_version,
+      se::dnn::VersionInfo dnn_version,
+      const se::SemanticVersion& toolkit_version,
+      CompilationStats* compilation_stats) override;
+
   // Normalizes BF16, all F8 variants, F4E2M1FN, and F8E8M0FNU away before
   // delegating to the GpuCompiler base. The MSL emitter cannot lower those
   // types, and the inherited float_normalization sub-pipeline gates many of
