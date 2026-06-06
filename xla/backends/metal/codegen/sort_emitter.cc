@@ -338,11 +338,24 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
   const int64_t sort_dim = desc.sort->sort_dimension();
   const int64_t dim_to_sort_bound = keys_shape.dimensions(sort_dim);
   const int64_t rank = keys_shape.dimensions().size();
-  const int64_t iteration_bound = desc.num_iterations_in_sort_dim;
+  // iteration_shape_sort_dim drives the thread→iteration decomposition; the
+  // bitonic block-size logic and bounds checks use the *actual* array length
+  // (dim_to_sort_bound). Match EmitCompareLoopBody, which is called with
+  // dimension_to_sort_bound as its iteration_bound parameter.
+  const int64_t iteration_shape_sort_dim = desc.num_iterations_in_sort_dim;
   const int64_t xor_mask = desc.xor_masks[0];
   int64_t block_size = xor_mask;
   if (xor_mask > 1 && (xor_mask & (xor_mask + 1)) == 0) {
     block_size = (xor_mask + 1) / 2;
+  }
+  if (block_size >= dim_to_sort_bound) {
+    // No adjacent block to compare with; emit a no-op kernel body so the
+    // PSO is still installed for thunk dispatch.
+    mlir::Block* entry_block = entry_func.addEntryBlock();
+    b.setInsertionPointToStart(entry_block);
+    llvm::SmallVector<mlir::Value> returns(entry_block->getArguments());
+    mlir::func::ReturnOp::create(b, returns);
+    return module;
   }
 
   mlir::Block* entry_block = entry_func.addEntryBlock();
@@ -364,14 +377,14 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
       tid);
 
   // Decompose linear into iteration_shape (= keys_shape with sort_dim
-  // replaced by iteration_bound) using minor-to-major order so the
-  // innermost (most-frequent) coordinate corresponds to the physical
+  // replaced by iteration_shape_sort_dim) using minor-to-major order so
+  // the innermost (most-frequent) coordinate corresponds to the physical
   // layout's stride-1 dimension.
   llvm::SmallVector<mlir::Value, 4> indices(rank);
   mlir::Value remaining = linear;
   for (int64_t d : keys_shape.layout().minor_to_major()) {
-    int64_t size =
-        (d == sort_dim) ? iteration_bound : keys_shape.dimensions(d);
+    int64_t size = (d == sort_dim) ? iteration_shape_sort_dim
+                                    : keys_shape.dimensions(d);
     mlir::Value size_c = const_idx(size);
     indices[d] = ma::RemUIOp::create(b, remaining, size_c);
     remaining = ma::DivUIOp::create(b, remaining, size_c);
@@ -385,7 +398,7 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
   mlir::Value block_size_c = const_idx(block_size);
   if (block_size == 1) {
     current = ma::MulIOp::create(b, iter_sort_idx, const_idx(2));
-  } else if (block_size * 2 < iteration_bound) {
+  } else if (block_size * 2 < dim_to_sort_bound) {
     mlir::Value blk = ma::DivUIOp::create(b, iter_sort_idx, block_size_c);
     mlir::Value idx_in_blk =
         ma::RemUIOp::create(b, iter_sort_idx, block_size_c);
@@ -394,9 +407,9 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
     current = ma::AddIOp::create(b, first_in_block, idx_in_blk);
   } else {
     // Sentinel: a thread in the "right" block of the pair must skip; force
-    // its current index to iteration_bound^xor_mask so the compare index
-    // falls at iteration_bound and the bounds check below rejects it.
-    mlir::Value sentinel = const_idx(iteration_bound ^ xor_mask);
+    // its current index to dim_to_sort_bound^xor_mask so the compare index
+    // falls at dim_to_sort_bound and the bounds check below rejects it.
+    mlir::Value sentinel = const_idx(dim_to_sort_bound ^ xor_mask);
     mlir::Value is_left = ma::CmpIOp::create(b, ma::CmpIPredicate::ult,
                                              iter_sort_idx, block_size_c);
     current = ma::SelectOp::create(b, is_left, iter_sort_idx, sentinel);
