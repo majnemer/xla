@@ -609,6 +609,9 @@ class MslEmitter {
     if (mlir::isa<mlir::math::CopySignOp>(op)) {
       return EmitMathCall(op, "metal::copysign");
     }
+    if (mlir::isa<mlir::math::Atan2Op>(op)) {
+      return EmitMathCall(op, "metal::atan2");
+    }
     if (auto clz = mlir::dyn_cast<mlir::math::CountLeadingZerosOp>(op)) {
       return EmitMathCtlz(clz);
     }
