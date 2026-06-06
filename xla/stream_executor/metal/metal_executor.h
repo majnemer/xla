@@ -158,9 +158,6 @@ class MetalExecutor : public gpu::GpuExecutor {
   // The Metal device handle. Populated by Init() and immutable thereafter.
   id<MTLDevice> device_;
 
-  // Guards the lazy-initialised FFT plugin and other future cached plugins,
-  // mirroring CudaExecutor::mu_. Shadows StreamExecutorCommon::mu_ (private
-  // there).
   absl::Mutex mu_;
   std::unique_ptr<fft::FftSupport> fft_ ABSL_GUARDED_BY(mu_);
 
