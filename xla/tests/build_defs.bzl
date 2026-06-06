@@ -207,6 +207,42 @@ def prepare_intel_gpu_backend_data(backends, disabled_backends, backend_tags, ba
     return new_backends, new_disabled_backends, new_backend_tags, backend_args
 
 # buildifier: disable=function-docstring
+def prepare_apple_metal_backend_data(backends, disabled_backends, backend_tags, backend_args, common_tags):
+    new_backends = [name for name in backends if name != "gpu"]
+
+    # Expand "gpu" backend name into Metal unless it's tagged for a specific
+    # non-Metal GPU family.
+    if (len(new_backends) < len(backends) and
+        "cuda-only" not in common_tags and
+        "rocm-only" not in common_tags and
+        "oneapi-only" not in common_tags):
+        new_backends.extend(APPLE_METAL_DEFAULT_BACKENDS)
+
+    new_disabled_backends = [name for name in disabled_backends if name != "gpu"]
+    if len(new_disabled_backends) < len(disabled_backends):
+        new_disabled_backends.extend(APPLE_METAL_DEFAULT_BACKENDS)
+
+    new_backend_tags = {
+        key: value
+        for key, value in backend_tags.items()
+        if key not in ["gpu"] + NVIDIA_GPU_BACKENDS + AMD_GPU_DEFAULT_BACKENDS + INTEL_GPU_DEFAULT_BACKENDS
+    }
+
+    gpu_backend_tags = backend_tags.get("gpu", [])
+    nvidia_tags = []
+    for key in gpu_backend_tags:
+        if key.startswith("requires-"):
+            nvidia_tags.append(key)
+
+    for key in nvidia_tags:
+        gpu_backend_tags.remove(key)
+
+    for key in APPLE_METAL_DEFAULT_BACKENDS:
+        new_backend_tags.setdefault(key, gpu_backend_tags[:])
+
+    return new_backends, new_disabled_backends, new_backend_tags, backend_args
+
+# buildifier: disable=function-docstring
 def prepare_gpu_backend_data(backends, disabled_backends, backend_tags, backend_args, common_tags):
     nvidia_backends = [
         backend
@@ -223,10 +259,15 @@ def prepare_gpu_backend_data(backends, disabled_backends, backend_tags, backend_
         for backend in backends
         if backend in ["gpu"] + INTEL_GPU_DEFAULT_BACKENDS
     ]
+    metal_backends = [
+        backend
+        for backend in backends
+        if backend in ["gpu"] + APPLE_METAL_DEFAULT_BACKENDS
+    ]
     other_backends = [
         backend
         for backend in backends
-        if backend not in ["gpu"] + NVIDIA_GPU_BACKENDS + AMD_GPU_DEFAULT_BACKENDS + INTEL_GPU_DEFAULT_BACKENDS
+        if backend not in ["gpu"] + NVIDIA_GPU_BACKENDS + AMD_GPU_DEFAULT_BACKENDS + INTEL_GPU_DEFAULT_BACKENDS + APPLE_METAL_DEFAULT_BACKENDS
     ]
 
     nvidia_backends, nvidia_disabled_backends, nvidia_backend_tags, nvidia_backend_args = \
@@ -235,17 +276,19 @@ def prepare_gpu_backend_data(backends, disabled_backends, backend_tags, backend_
         prepare_amd_gpu_backend_data(amd_backends, disabled_backends, backend_tags, {}, common_tags)
     intel_backends, intel_disabled_backends, intel_backend_tags, intel_backend_args = \
         prepare_intel_gpu_backend_data(intel_backends, disabled_backends, backend_tags, {}, common_tags)
+    metal_backends, metal_disabled_backends, metal_backend_tags, metal_backend_args = \
+        prepare_apple_metal_backend_data(metal_backends, disabled_backends, backend_tags, {}, common_tags)
 
     new_backends = [
         backend
-        for backend in nvidia_backends + amd_backends + intel_backends + other_backends
+        for backend in nvidia_backends + amd_backends + intel_backends + metal_backends + other_backends
     ]
 
-    disabled_backends = nvidia_disabled_backends + amd_disabled_backends + intel_disabled_backends
+    disabled_backends = nvidia_disabled_backends + amd_disabled_backends + intel_disabled_backends + metal_disabled_backends
 
-    backend_tags = nvidia_backend_tags | amd_backend_tags | intel_backend_tags
+    backend_tags = nvidia_backend_tags | amd_backend_tags | intel_backend_tags | metal_backend_tags
 
-    backend_args = nvidia_backend_args | amd_backend_args | intel_backend_args
+    backend_args = nvidia_backend_args | amd_backend_args | intel_backend_args | metal_backend_args
 
     return new_backends, disabled_backends, backend_tags, backend_args
 
@@ -387,11 +430,17 @@ def xla_test(
 
             if not use_legacy_runtime:
                 backend_deps.append("//xla/tests:pjrt_cpu_client_registry")
-        elif backend in NVIDIA_GPU_BACKENDS + AMD_GPU_DEFAULT_BACKENDS + INTEL_GPU_DEFAULT_BACKENDS:
+        elif backend in NVIDIA_GPU_BACKENDS + AMD_GPU_DEFAULT_BACKENDS + INTEL_GPU_DEFAULT_BACKENDS + APPLE_METAL_DEFAULT_BACKENDS:
+            # All GPU families share the same plumbing: XLA_TEST_DEVICE_TYPE =
+            # "gpu" so backend-conditional code (e.g. `if (gpu) ...`) picks
+            # the target up, gpu_plugin pulls in the compiler / collectives
+            # plumbing / StreamExecutor / TransferManager / PJRT registration
+            # for the configured family (Metal's plumbing is gated by the
+            # if_metal() arm of gpu_plugin_without_collectives).
             device_type_for_env = "gpu"
-            backend_deps.append(
-                "//xla/service:gpu_plugin",
-            )
+            backend_deps.append("//xla/service:gpu_plugin")
+            if not use_legacy_runtime:
+                backend_deps.append("//xla/tests:pjrt_gpu_client_registry")
             if backend in NVIDIA_GPU_BACKENDS:
                 this_backend_tags += tf_gpu_tests_tags()
                 backend_deps += [
@@ -399,7 +448,7 @@ def xla_test(
                     "//xla/stream_executor/cuda:gpu_test_kernels_cuda",
                     "//xla/stream_executor/cuda:stream_executor_cuda",
                 ]
-            if backend in AMD_GPU_DEFAULT_BACKENDS:
+            elif backend in AMD_GPU_DEFAULT_BACKENDS:
                 this_backend_tags.append("gpu")
                 if "multi_gpu" in this_backend_tags:
                     this_backend_tags.append("exclusive-if-local")
@@ -408,34 +457,21 @@ def xla_test(
                     "//xla/stream_executor/rocm:gpu_test_kernels_rocm",
                     "//xla/stream_executor/rocm:stream_executor_rocm",
                 ]
-            if backend in INTEL_GPU_DEFAULT_BACKENDS:
+            elif backend in INTEL_GPU_DEFAULT_BACKENDS:
                 this_backend_tags.append("gpu")
                 backend_deps += [
                     "//xla/stream_executor/sycl:all_runtime",
                     "//xla/stream_executor/sycl:stream_executor_sycl",
                 ]
-
-            if not use_legacy_runtime:
-                backend_deps.append("//xla/tests:pjrt_gpu_client_registry")
-        elif backend in APPLE_METAL_DEFAULT_BACKENDS:
-            # Metal is a GPU from the test framework's POV: XLA_TEST_DEVICE_TYPE
-            # stays "gpu" so backend-conditional code (e.g. `if (gpu) ...`)
-            # picks it up. The binary itself is macOS-only because the
-            # underlying StreamExecutor platform is Objective-C++.
-            #
-            # gpu_plugin pulls in MetalCompiler / collectives stub / Metal
-            # StreamExecutor / GpuTransferManager / Metal PJRT compiler
-            # registration via the if_metal() arm on gpu_plugin_without_
-            # collectives. On macOS, XLA_USE_METAL flips platform_util's
-            # "gpu" alias to "metal" so pjrt_gpu_client_registry resolves
-            # to the Metal platform without any Metal-specific test glue.
-            device_type_for_env = "gpu"
-            this_backend_tags.append("gpu")
-            this_backend_kwargs["target_compatible_with"] = \
-                ["@platforms//os:macos"]
-            backend_deps.append("//xla/service:gpu_plugin")
-            if not use_legacy_runtime:
-                backend_deps.append("//xla/tests:pjrt_gpu_client_registry")
+            elif backend in APPLE_METAL_DEFAULT_BACKENDS:
+                this_backend_tags.append("gpu")
+                # Metal's StreamExecutor platform is Obj-C++; gate the target
+                # at the platform level so non-macOS builds skip rather than
+                # fail to compile. On macOS, XLA_USE_METAL flips platform_-
+                # util's "gpu" alias to "metal" so pjrt_gpu_client_registry
+                # resolves to the Metal platform with no extra glue.
+                this_backend_kwargs["target_compatible_with"] = \
+                    ["@platforms//os:macos"]
         elif backend == "interpreter":
             device_type_for_env = "interpreter"
             backend_deps.append(
@@ -516,7 +552,11 @@ def xla_test(
             )
 
         if ((backend in NVIDIA_GPU_BACKENDS and is_cuda_configured()) or
-            (backend in AMD_GPU_DEFAULT_BACKENDS and is_rocm_configured())):
+            (backend in AMD_GPU_DEFAULT_BACKENDS and is_rocm_configured()) or
+            backend in APPLE_METAL_DEFAULT_BACKENDS):
+            # Metal targets carry target_compatible_with macOS, so on non-mac
+            # hosts the test_suite entry is incompatible and bazel skips it
+            # rather than failing the suite.
             test_names.append(test_name)
 
     # Notably, a test_suite with `tests = []` is not empty:
