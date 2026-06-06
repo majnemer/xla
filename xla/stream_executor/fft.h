@@ -70,11 +70,31 @@ enum class Type {
 };
 
 // FFT plan class. Each FFT implementation should define a plan class that is
-// derived from this class. It does not provide any interface but serves
-// as a common type that is used to execute the plan.
+// derived from this class.
 class Plan {
  public:
   virtual ~Plan() {}
+
+  // Divisor the runtime must still apply to the FFT output to produce XLA's
+  // normalised result (forward unnormalised, inverse 1/N). The default
+  // captures cuFFT/rocFFT semantics: their forward transforms are
+  // unnormalised (no scaling), their inverse transforms are unnormalised
+  // (caller normalises by output_distance = prod(fft_length)). Backends
+  // whose primitive already normalises inverses — e.g. MPSGraph with
+  // scalingMode = Size — should override to return 1 unconditionally;
+  // backends with mixed coverage can switch on `type`.
+  virtual uint64_t PostFftScaleFactor(Type type,
+                                      uint64_t output_distance) const {
+    switch (type) {
+      case Type::kC2CInverse:
+      case Type::kZ2ZInverse:
+      case Type::kC2R:
+      case Type::kZ2D:
+        return output_distance;
+      default:
+        return 1;
+    }
+  }
 };
 
 // FFT support interface -- this can be derived from a GPU executor when the

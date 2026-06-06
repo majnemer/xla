@@ -198,7 +198,8 @@ absl::Status RunFft(se::DeviceAddressBase input, const Shape& input_shape,
         batch_size, &scratch_allocator);
     TF_RET_CHECK(fft_plan != nullptr)
         << "Failed to create cuFFT batched plan with scratch allocator";
-    fft_plan_ptr->scale_factor = output_distance;
+    fft_plan_ptr->scale_factor =
+        fft_plan->PostFftScaleFactor(fft_type, output_distance);
   } else {
     fft->UpdatePlanWithScratchAllocator(stream, fft_plan.get(),
                                         &scratch_allocator);
@@ -224,7 +225,7 @@ absl::Status RunFft(se::DeviceAddressBase input, const Shape& input_shape,
       se::DeviceAddress<complex64> input_data(input);
       se::DeviceAddress<complex64> output_data(output);
       launch_ok = fft->DoFft(stream, fft_plan.get(), input_data, &output_data);
-      if (launch_ok) {
+      if (launch_ok && scale_factor != 1) {
         TF_ASSIGN_OR_RETURN(auto blas, GetBlas(stream));
         launch_ok =
             blas->DoBlasScal(stream, ShapeUtil::ElementsIn(output_shape),
@@ -236,7 +237,7 @@ absl::Status RunFft(se::DeviceAddressBase input, const Shape& input_shape,
       se::DeviceAddress<complex128> input_data(input);
       se::DeviceAddress<complex128> output_data(output);
       launch_ok = fft->DoFft(stream, fft_plan.get(), input_data, &output_data);
-      if (launch_ok) {
+      if (launch_ok && scale_factor != 1) {
         TF_ASSIGN_OR_RETURN(auto blas, GetBlas(stream));
         launch_ok =
             blas->DoBlasScal(stream, ShapeUtil::ElementsIn(output_shape),
@@ -260,7 +261,7 @@ absl::Status RunFft(se::DeviceAddressBase input, const Shape& input_shape,
       se::DeviceAddress<complex64> input_data(input);
       se::DeviceAddress<float> output_data(output);
       launch_ok = fft->DoFft(stream, fft_plan.get(), input_data, &output_data);
-      if (launch_ok) {
+      if (launch_ok && scale_factor != 1) {
         TF_ASSIGN_OR_RETURN(auto blas, GetBlas(stream));
         launch_ok =
             blas->DoBlasScal(stream, ShapeUtil::ElementsIn(output_shape),
@@ -272,7 +273,7 @@ absl::Status RunFft(se::DeviceAddressBase input, const Shape& input_shape,
       se::DeviceAddress<complex128> input_data(input);
       se::DeviceAddress<double> output_data(output);
       launch_ok = fft->DoFft(stream, fft_plan.get(), input_data, &output_data);
-      if (launch_ok) {
+      if (launch_ok && scale_factor != 1) {
         TF_ASSIGN_OR_RETURN(auto blas, GetBlas(stream));
         launch_ok =
             blas->DoBlasScal(stream, ShapeUtil::ElementsIn(output_shape),
