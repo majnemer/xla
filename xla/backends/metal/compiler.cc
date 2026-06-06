@@ -43,6 +43,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/emitters/mlir_kernel_emitter.h"
 #include "xla/backends/gpu/codegen/emitters/transforms/passes.h"
 #include "xla/backends/gpu/codegen/fusions.h"
+#include "xla/backends/gpu/runtime/device_to_device_copy_thunk.h"
 #include "xla/backends/gpu/runtime/infeed_thunk.h"
 #include "xla/backends/gpu/runtime/kernel_thunk.h"
 #include "xla/backends/gpu/runtime/outfeed_thunk.h"
@@ -52,6 +53,7 @@ limitations under the License.
 #include "xla/backends/metal/codegen/msl_kernel_emitter.h"
 #include "xla/backends/metal/codegen/msl_kernel_source.h"
 #include "xla/backends/metal/codegen/transforms/passes.h"
+#include "xla/backends/metal/codegen/sort_emitter.h"
 #include "xla/backends/metal/runtime/metal_kernel_artifact.h"
 #include "xla/backends/metal/runtime/metal_kernel_thunk.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
@@ -152,6 +154,16 @@ struct DeferredFusion {
   xla::metal::MetalKernelThunk* thunk;     // owned by SequentialThunk.
 };
 
+// One bitonic-sort stage queued for Phase-2 MLIR emission. Mirrors
+// DeferredFusion in structure: a name for diagnostics, the planner-produced
+// stage description (xor_masks, tile_size, launch dims, kernel args, entry
+// name), and the MetalKernelThunk this stage's PSO eventually fills.
+struct DeferredSortStage {
+  std::string sort_name;
+  xla::metal::SortStageDescription stage;
+  xla::metal::MetalKernelThunk* thunk;     // owned by SequentialThunk.
+};
+
 class RngGetAndUpdateStateThunk final : public gpu::Thunk {
  public:
   RngGetAndUpdateStateThunk(ThunkInfo thunk_info, std::string kernel_name,
@@ -242,17 +254,14 @@ class RngGetAndUpdateStateThunk final : public gpu::Thunk {
 
 class MetalThunkEmissionBackend final : public gpu::ThunkEmissionBackend {
  public:
-  MetalThunkEmissionBackend(HloModule* hlo_module,
-                            const se::DeviceDescription& gpu_device_info,
-                            BufferAssignment* buffer_assignment,
-                            CallGraph* call_graph,
-                            std::vector<gpu::GpuExecutable::ConstantInfo>*
-                                constants,
-                            std::vector<gpu::GpuExecutable::GlobalInfo>*
-                                globals,
-                            std::string* msl_blob,
-                            NameUniquer* msl_function_name_uniquer,
-                            std::vector<DeferredFusion>* deferred_fusions)
+  MetalThunkEmissionBackend(
+      HloModule* hlo_module, const se::DeviceDescription& gpu_device_info,
+      BufferAssignment* buffer_assignment, CallGraph* call_graph,
+      std::vector<gpu::GpuExecutable::ConstantInfo>* constants,
+      std::vector<gpu::GpuExecutable::GlobalInfo>* globals,
+      std::string* msl_blob, NameUniquer* msl_function_name_uniquer,
+      std::vector<DeferredFusion>* deferred_fusions,
+      std::vector<DeferredSortStage>* deferred_sort_stages)
       : hlo_module_(hlo_module),
         gpu_device_info_(gpu_device_info),
         buffer_assignment_(buffer_assignment),
@@ -261,7 +270,8 @@ class MetalThunkEmissionBackend final : public gpu::ThunkEmissionBackend {
         globals_(globals),
         msl_blob_(msl_blob),
         msl_function_name_uniquer_(msl_function_name_uniquer),
-        deferred_fusions_(deferred_fusions) {}
+        deferred_fusions_(deferred_fusions),
+        deferred_sort_stages_(deferred_sort_stages) {}
 
   const BufferAssignment& buffer_assignment() const override {
     return *buffer_assignment_;
@@ -395,10 +405,57 @@ class MetalThunkEmissionBackend final : public gpu::ThunkEmissionBackend {
   }
 
   absl::StatusOr<gpu::ThunkSequence> EmitSort(const HloSortInstruction* sort) {
-    return Unimplemented(
-        "MetalCompiler::CompileToBackendResult: bitonic sort emitter not yet "
-        "implemented for sort '%s'.",
-        sort->name());
+    if (sort->is_stable()) {
+      return Internal(
+          "Metal: stable sort not supported here. Did stable_sort_expander "
+          "run? Sort '%s'",
+          sort->name());
+    }
+
+    // First, the per-operand in-place copy: sort runs on the output buffer,
+    // so non-aliased operands need to be copied into it before the bitonic
+    // sweep begins. Iota operands are emitted directly inside the first sort
+    // kernel below (no preceding copy).
+    gpu::ThunkSequence thunks;
+    for (int64_t i = 0; i < sort->operand_count(); ++i) {
+      const HloInstruction* operand = sort->operand(i);
+      if (HloPredicateIsOp<HloOpcode::kIota>(operand)) continue;
+      ShapeIndex shape_index =
+          sort->operand_count() > 1 ? ShapeIndex({i}) : ShapeIndex({});
+      TF_ASSIGN_OR_RETURN(BufferAllocation::Slice src,
+                          buffer_assignment_->GetUniqueSlice(operand, {}));
+      TF_ASSIGN_OR_RETURN(BufferAllocation::Slice dst,
+                          buffer_assignment_->GetUniqueSlice(sort, shape_index));
+      if (src == dst) continue;
+      const Shape& shape = operand->shape();
+      thunks.push_back(std::make_unique<gpu::DeviceToDeviceCopyThunk>(
+          GetThunkInfo(sort),
+          /*source_buffer=*/ShapedSlice{src, shape},
+          /*destination_buffer=*/ShapedSlice{dst, shape},
+          /*mem_size=*/src.size()));
+    }
+
+    // Plan the bitonic sweep: one SortStageDescription per kernel invocation.
+    std::string entry_name_prefix = msl_function_name_uniquer_->GetUniqueName(
+        llvm_ir::SanitizeFunctionName(std::string(sort->name())));
+    TF_ASSIGN_OR_RETURN(
+        std::vector<xla::metal::SortStageDescription> stages,
+        xla::metal::PlanBitonicSort(sort, *buffer_assignment_, gpu_device_info_,
+                                    gpu::GetDefaultBufferAlignment(),
+                                    entry_name_prefix));
+
+    for (auto& stage : stages) {
+      auto thunk = std::make_unique<xla::metal::MetalKernelThunk>(
+          GetThunkInfo(sort), stage.kernel_args);
+      auto* thunk_ptr = thunk.get();
+      thunks.push_back(std::move(thunk));
+      deferred_sort_stages_->push_back(DeferredSortStage{
+          /*sort_name=*/std::string(sort->name()),
+          /*stage=*/std::move(stage),
+          /*thunk=*/thunk_ptr,
+      });
+    }
+    return thunks;
   }
 
   absl::StatusOr<gpu::ThunkSequence> EmitRngGetAndUpdateState(
@@ -470,6 +527,7 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
   std::string* msl_blob_;
   NameUniquer* msl_function_name_uniquer_;
   std::vector<DeferredFusion>* deferred_fusions_;
+  std::vector<DeferredSortStage>* deferred_sort_stages_;
   absl::flat_hash_set<const HloConstantInstruction*> emitted_constants_;
   std::optional<std::string> rng_state_symbol_name_;
   gpu::ThunkIdGenerator thunk_id_generator_;
@@ -591,10 +649,11 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
   std::string msl_blob;
   NameUniquer msl_function_name_uniquer;
   std::vector<DeferredFusion> deferred_fusions;
+  std::vector<DeferredSortStage> deferred_sort_stages;
   MetalThunkEmissionBackend metal_thunk_backend(
       hlo_module.get(), gpu_device_info, buffer_assignment.get(),
       call_graph.get(), &constants, &globals, &msl_blob,
-      &msl_function_name_uniquer, &deferred_fusions);
+      &msl_function_name_uniquer, &deferred_fusions, &deferred_sort_stages);
   gpu::ThunkSequenceEmitter thunk_emitter(&metal_thunk_backend);
   TF_ASSIGN_OR_RETURN(
       std::unique_ptr<gpu::SequentialThunk> sequential_thunk,
@@ -806,6 +865,125 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
   for (size_t i = 0; i < deferred_fusions.size(); ++i) {
     BuildResult build_result = *std::move(results[i]);
     deferred_fusions[i].thunk->SetArtifact(std::move(build_result.artifact));
+    if (!msl_blob.empty()) msl_blob.append("\n");
+    msl_blob.append(build_result.msl);
+  }
+
+  // Phase 2/3 for sort stages. Sort kernels don't go through the fusion
+  // MLIR-kernel-emitter; we build their MLIR modules directly from each
+  // SortStageDescription. Retry is simpler than fusion's: tiled stages can
+  // ShrinkSortStageTile on a PSO grant below requested threads; non-tiled
+  // stages fall back to threads_per_block_limit just like fusions.
+  auto build_sort_artifact =
+      [&](xla::metal::SortStageDescription stage) -> absl::StatusOr<BuildResult> {
+    const int64_t simd_width = gpu_device_info.threads_per_warp();
+    for (;;) {
+      auto context = std::make_unique<mlir::MLIRContext>();
+      context->appendDialectRegistry(
+          gpu::MlirKernelEmitter::GetDialectRegistry());
+      context->loadAllAvailableDialects();
+
+      TF_ASSIGN_OR_RETURN(
+          mlir::OwningOpRef<mlir::ModuleOp> owning_module,
+          xla::metal::EmitSortStageModule(context.get(), stage));
+      mlir::ModuleOp module = *owning_module;
+
+      mlir::PassManager pm(module.getContext());
+      gpu::AddLoopTransformationPasses(pm, gpu_device_info,
+                                       /*max_unroll_factor=*/0,
+                                       /*max_vector_elements=*/4);
+      pm.addNestedPass<mlir::func::FuncOp>(
+          emitters::CreateConvertPureCallOpsPass());
+      pm.addNestedPass<mlir::func::FuncOp>(
+          emitters::CreateSimplifyArithPass());
+      pm.addPass(emitters::CreateSimplifyAffinePass());
+      pm.addPass(gpu::CreateConvertIndexTypePass());
+      pm.addPass(mlir::createLowerAffinePass());
+      pm.addPass(mlir::createLoopInvariantCodeMotionPass());
+      pm.addPass(mlir::createSymbolDCEPass());
+      pm.addPass(mlir::createCSEPass());
+      pm.addPass(mlir::createConvertComplexToStandardPass());
+      pm.addPass(CreateConvertComplexToArithMathPass());
+      pm.addPass(emitters::CreateExpandFloatOpsPass());
+      pm.addPass(CreateExpandFloatOpsPass());
+      pm.addPass(CreateLowerSubByteStoragePass());
+      pm.addPass(CreateLowerFloatStoragePass());
+      pm.addPass(mlir::createLowerAffinePass());
+      std::string dump_kernel_name =
+          absl::StrCat(stage.entry_name, ".metal-lowering");
+      EnableIRPrintingIfRequested(pm, module.getContext(), *hlo_module,
+                                  dump_kernel_name, "mlir-sort");
+      if (mlir::failed(pm.run(module))) {
+        return absl::InternalError(absl::StrCat(
+            "MetalCompiler::CompileToBackendResult: MLIR lowering pipeline "
+            "failed on sort stage '",
+            stage.entry_name, "'."));
+      }
+      NameUniquer per_stage_uniquer;
+      TF_ASSIGN_OR_RETURN(
+          metal::MslKernelSource msl_source,
+          metal::EmitMslKernel(module, &per_stage_uniquer, *hlo_module,
+                               stage.entry_name));
+      std::string msl_src = std::move(msl_source).source();
+
+      TF_ASSIGN_OR_RETURN(
+          stream_executor::metal::CompiledPipeline compiled,
+          stream_executor::metal::CompileAndProbe(
+              metal_device, msl_src, stage.entry_name,
+              stage.launch_dimensions.num_threads_per_block()));
+      int64_t requested = stage.launch_dimensions.num_threads_per_block();
+      if (compiled.pso_max_threads >= requested) {
+        unsigned arity =
+            static_cast<unsigned>(stage.kernel_args.args().size());
+        auto artifact = std::make_unique<MetalKernelArtifact>(
+            stage.entry_name, arity, stage.launch_dimensions,
+            std::move(compiled.pso));
+        return BuildResult{std::move(artifact), std::move(msl_src)};
+      }
+      // PSO ceiling is below the launch's threads-per-block. For tiled
+      // stages, the tile width sets threads_per_block — shrink and re-emit.
+      // For non-tiled stages, the launch divides the iteration shape and
+      // can't be re-tiled here, so surface a ResourceExhausted.
+      if (xla::metal::ShrinkSortStageTile(stage, gpu_device_info)) {
+        VLOG(1) << "Sort stage '" << stage.entry_name << "': requested "
+                << requested << " threads, PSO ceiling "
+                << compiled.pso_max_threads << "; shrinking tile to "
+                << stage.tile_size << " and retrying.";
+        continue;
+      }
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "Sort stage '", stage.entry_name, "': requested ", requested,
+          " threads per threadgroup, but the device's PSO grants only ",
+          compiled.pso_max_threads, " (>= SIMD width ", simd_width,
+          " required). Tile cannot shrink further."));
+    }
+  };
+
+  std::vector<absl::StatusOr<BuildResult>> sort_results(
+      deferred_sort_stages.size());
+  if (thread_pool) {
+    absl::BlockingCounter counter(deferred_sort_stages.size());
+    for (size_t i = 0; i < deferred_sort_stages.size(); ++i) {
+      thread_pool.get_mutable()->Schedule([&, i] {
+        sort_results[i] =
+            build_sort_artifact(std::move(deferred_sort_stages[i].stage));
+        counter.DecrementCount();
+      });
+    }
+    counter.Wait();
+  } else {
+    for (size_t i = 0; i < deferred_sort_stages.size(); ++i) {
+      sort_results[i] =
+          build_sort_artifact(std::move(deferred_sort_stages[i].stage));
+    }
+  }
+  for (size_t i = 0; i < deferred_sort_stages.size(); ++i) {
+    TF_RETURN_IF_ERROR(sort_results[i].status());
+  }
+  for (size_t i = 0; i < deferred_sort_stages.size(); ++i) {
+    BuildResult build_result = *std::move(sort_results[i]);
+    deferred_sort_stages[i].thunk->SetArtifact(
+        std::move(build_result.artifact));
     if (!msl_blob.empty()) msl_blob.append("\n");
     msl_blob.append(build_result.msl);
   }
