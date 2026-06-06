@@ -66,6 +66,7 @@ objc_library(
         "//xla/stream_executor:device_address",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:event",
+        "//xla/stream_executor:event_based_timer",
         "//xla/stream_executor:kernel",
         "//xla/stream_executor:kernel_spec",
         "//xla/stream_executor:memory_allocation",
@@ -121,6 +122,8 @@ objc_library(
         ":metal_executor_header",
         ":metal_kernel",
         ":metal_stream",
+        ":metal_timer",
+        "//xla/stream_executor:event_based_timer",
         "//xla/stream_executor:device_address",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:event",
@@ -180,9 +183,34 @@ objc_library(
     deps = [
         ":metal_executor_header",
         "//xla/stream_executor:event",
+        "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+# EventBasedTimer for Metal. Builds two timing-capable MetalEvents and reads
+# GPU time off the underlying MTLCommandBuffers via GPUStartTime/GPUEndTime.
+objc_library(
+    name = "metal_timer",
+    srcs = ["metal_timer.mm"],
+    hdrs = ["metal_timer.h"],
+    sdk_frameworks = [
+        "Foundation",
+        "Metal",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":metal_event",
+        ":metal_executor_header",
+        "//xla/stream_executor:event_based_timer",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/time",
     ],
 )
 
@@ -235,6 +263,7 @@ objc_library(
         ":metal_kernel",
         "//xla/stream_executor:device_address",
         "//xla/stream_executor:event",
+        "//xla/stream_executor:event_based_timer",
         "//xla/stream_executor:launch_dim",
         "//xla/stream_executor:platform",
         "//xla/stream_executor:stream",

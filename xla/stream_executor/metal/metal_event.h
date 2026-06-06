@@ -23,9 +23,11 @@ limitations under the License.
 #include <memory>
 #include <optional>
 
+#include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "xla/stream_executor/event.h"
 
 namespace stream_executor {
@@ -40,10 +42,16 @@ struct MetalEventErrorState;
 // recorded_value_ is the latest value whose signal command buffer has been
 // successfully submitted. Waiters/pollers must never observe a value that has
 // only been reserved but not submitted.
+//
+// When `allow_timing` is true, the event also retains the MTLCommandBuffer
+// that issued each signal so MetalTimer can read GPUStartTime / GPUEndTime
+// off the buffer after completion. Timing events still satisfy the regular
+// Event interface (PollForStatus / Synchronize) via the same recorded_value_
+// path.
 class MetalEvent final : public Event {
  public:
   static absl::StatusOr<std::unique_ptr<MetalEvent>> Create(
-      MetalExecutor* executor);
+      MetalExecutor* executor, bool allow_timing = false);
 
   ~MetalEvent() override;
 
@@ -51,6 +59,8 @@ class MetalEvent final : public Event {
   MetalEvent& operator=(const MetalEvent&) = delete;
 
   id<MTLSharedEvent> shared_event() const { return shared_event_; }
+
+  bool allow_timing() const { return allow_timing_; }
 
   uint64_t recorded_value() const {
     return recorded_value_.load(std::memory_order_acquire);
@@ -65,15 +75,30 @@ class MetalEvent final : public Event {
   // lock), reserve order is well-defined (next_value_ is atomic) but publish
   // order is not — without max, a smaller value published last could
   // overwrite a larger one and let a later waiter pass on a signal that
-  // hasn't run yet.
-  void PublishRecordedValue(uint64_t value) {
+  // hasn't run yet. Returns true iff this call strictly advanced
+  // recorded_value_; the timing-publish overload uses that as the gate on
+  // updating timing_record_.
+  bool PublishRecordedValue(uint64_t value) {
     uint64_t old = recorded_value_.load(std::memory_order_relaxed);
     while (old < value &&
            !recorded_value_.compare_exchange_weak(
                old, value, std::memory_order_release,
                std::memory_order_relaxed)) {
     }
+    return old < value;
   }
+
+  // Timing-aware publish: stashes `cmd_buf` together with `value` under the
+  // timing lock so ElapsedDurationSince() can read it back as a coherent
+  // pair. For non-timing events this delegates to the atomic CAS path.
+  void PublishRecordedValue(uint64_t value, id<MTLCommandBuffer> cmd_buf);
+
+  // Computes elapsed GPU time between `start` (which must also be a timing
+  // event with a published cmd_buf) and `*this`. Waits on both signal cmd
+  // buffers and returns (this.cmd_buf.GPUStartTime - start.cmd_buf.GPUEndTime).
+  // Both events must have been recorded; returns FailedPrecondition otherwise.
+  absl::StatusOr<absl::Duration> ElapsedDurationSince(
+      const MetalEvent& start) const;
 
   // Called by command-buffer completion handlers if the command buffer that
   // was supposed to signal `value` fails.
@@ -96,14 +121,27 @@ class MetalEvent final : public Event {
   uint64_t AllocateNextRecordedValue() = delete;
 
  private:
-  explicit MetalEvent(id<MTLSharedEvent> shared_event);
+  MetalEvent(id<MTLSharedEvent> shared_event, bool allow_timing);
 
   std::optional<absl::Status> ErrorForValue(uint64_t value) const;
 
+  // (value, cmd_buf) pair published for the most recent signal. Used only
+  // when allow_timing_ is true.
+  struct RecordedCommandBuffer {
+    uint64_t value = 0;
+    __strong id<MTLCommandBuffer> command_buffer = nil;
+  };
+
+  absl::StatusOr<RecordedCommandBuffer> GetTimingRecord() const;
+
   __strong id<MTLSharedEvent> shared_event_;
+  const bool allow_timing_;
 
   std::atomic<uint64_t> next_value_{0};
   std::atomic<uint64_t> recorded_value_{0};
+
+  mutable absl::Mutex timing_mu_;
+  RecordedCommandBuffer timing_record_ ABSL_GUARDED_BY(timing_mu_);
 
   std::shared_ptr<MetalEventErrorState> error_state_;
 };

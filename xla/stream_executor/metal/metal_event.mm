@@ -26,7 +26,9 @@ limitations under the License.
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "xla/stream_executor/event.h"
 #include "xla/stream_executor/metal/metal_executor.h"
 
@@ -41,17 +43,16 @@ struct MetalEventErrorState {
   absl::Status error_status = absl::OkStatus();
 };
 
-MetalEvent::MetalEvent(id<MTLSharedEvent> shared_event)
-    : shared_event_(shared_event),
+MetalEvent::MetalEvent(id<MTLSharedEvent> shared_event, bool allow_timing)
+    : shared_event_(shared_event), allow_timing_(allow_timing),
       error_state_(std::make_shared<MetalEventErrorState>()) {}
 
 MetalEvent::~MetalEvent() = default;
 
-absl::StatusOr<std::unique_ptr<MetalEvent>> MetalEvent::Create(
-    MetalExecutor* executor) {
+absl::StatusOr<std::unique_ptr<MetalEvent>>
+MetalEvent::Create(MetalExecutor *executor, bool allow_timing) {
   if (executor == nullptr) {
-    return absl::InvalidArgumentError(
-        "MetalEvent::Create: executor is null.");
+    return absl::InvalidArgumentError("MetalEvent::Create: executor is null.");
   }
   id<MTLDevice> device = executor->device();
   if (device == nil) {
@@ -65,13 +66,96 @@ absl::StatusOr<std::unique_ptr<MetalEvent>> MetalEvent::Create(
   }
   // 0 means "never recorded" in this backend.
   shared_event.signaledValue = 0;
-  return std::unique_ptr<MetalEvent>(new MetalEvent(shared_event));
+  return std::unique_ptr<MetalEvent>(
+      new MetalEvent(shared_event, allow_timing));
+}
+
+void MetalEvent::PublishRecordedValue(uint64_t value,
+                                      id<MTLCommandBuffer> cmd_buf) {
+  if (!allow_timing_) {
+    PublishRecordedValue(value);
+    return;
+  }
+  // Hold the lock across the CAS so timing_record_ stays consistent with
+  // recorded_value_ for any GetTimingRecord caller. The single-arg
+  // PublishRecordedValue does the monotonic-max CAS and tells us whether
+  // this value won.
+  absl::MutexLock lock(&timing_mu_);
+  if (!PublishRecordedValue(value)) {
+    return;
+  }
+  timing_record_.value = value;
+  timing_record_.command_buffer = cmd_buf; // strong retain via ARC
+}
+
+absl::StatusOr<MetalEvent::RecordedCommandBuffer>
+MetalEvent::GetTimingRecord() const {
+  if (!allow_timing_) {
+    return absl::FailedPreconditionError(
+        "MetalEvent::GetTimingRecord: event was not created with timing "
+        "enabled.");
+  }
+  absl::MutexLock lock(&timing_mu_);
+  if (timing_record_.command_buffer == nil || timing_record_.value == 0) {
+    return absl::FailedPreconditionError(
+        "MetalEvent::GetTimingRecord: event has no recorded command buffer; "
+        "RecordEvent was not called.");
+  }
+  return timing_record_;
+}
+
+namespace {
+
+absl::Status CommandBufferStatusToStatus(id<MTLCommandBuffer> cmd_buf,
+                                         absl::string_view stage) {
+  if (cmd_buf.status != MTLCommandBufferStatusError) {
+    return absl::OkStatus();
+  }
+  NSError *error = cmd_buf.error;
+  NSString *desc = error == nil ? nil : [error localizedDescription];
+  const char *utf8 = desc == nil ? nullptr : [desc UTF8String];
+  return absl::InternalError(
+      absl::StrCat(stage, ": command buffer entered error state: ",
+                   utf8 == nullptr ? "(no error info)" : utf8));
+}
+
+} // namespace
+
+absl::StatusOr<absl::Duration>
+MetalEvent::ElapsedDurationSince(const MetalEvent &start) const {
+  TF_ASSIGN_OR_RETURN(RecordedCommandBuffer start_record,
+                      start.GetTimingRecord());
+  TF_ASSIGN_OR_RETURN(RecordedCommandBuffer stop_record, GetTimingRecord());
+
+  @autoreleasepool {
+    [start_record.command_buffer waitUntilCompleted];
+    [stop_record.command_buffer waitUntilCompleted];
+    TF_RETURN_IF_ERROR(CommandBufferStatusToStatus(
+        start_record.command_buffer, "MetalEvent::Elapsed start"));
+    TF_RETURN_IF_ERROR(CommandBufferStatusToStatus(stop_record.command_buffer,
+                                                   "MetalEvent::Elapsed stop"));
+  }
+
+  // Each event-record cmd_buf has only a single encodeSignalEvent; GPUEndTime
+  // of the start cmd_buf marks when the start signal fired, GPUStartTime of
+  // the stop cmd_buf marks when the stop signal is about to fire. The
+  // interval between those two is the elapsed GPU time.
+  CFTimeInterval start_time = start_record.command_buffer.GPUEndTime;
+  CFTimeInterval stop_time = stop_record.command_buffer.GPUStartTime;
+  if (start_time == 0 || stop_time == 0 || stop_time < start_time) {
+    return absl::InternalError(
+        absl::StrCat("MetalEvent::ElapsedDurationSince: invalid GPU timestamps "
+                     "(start_GPUEndTime=",
+                     start_time, ", stop_GPUStartTime=", stop_time, ")."));
+  }
+  return absl::Seconds(stop_time - start_time);
 }
 
 void MetalEvent::MarkSignalErrorForValue(
-    const std::shared_ptr<MetalEventErrorState>& state, uint64_t value,
+    const std::shared_ptr<MetalEventErrorState> &state, uint64_t value,
     absl::Status status) {
-  if (state == nullptr || status.ok()) return;
+  if (state == nullptr || status.ok())
+    return;
   absl::MutexLock lock(&state->mu);
   // Newer record always wins: a fresher cmd_buf failing supersedes whatever
   // we had recorded for an earlier value.
@@ -94,8 +178,7 @@ void MetalEvent::MarkSignalErrorForValue(uint64_t value, absl::Status status) {
 
 std::optional<absl::Status> MetalEvent::ErrorForValue(uint64_t value) const {
   absl::MutexLock lock(&error_state_->mu);
-  if (error_state_->error_value == value &&
-      !error_state_->error_status.ok()) {
+  if (error_state_->error_value == value && !error_state_->error_status.ok()) {
     return error_state_->error_status;
   }
   return std::nullopt;
@@ -140,8 +223,8 @@ absl::Status MetalEvent::Synchronize() {
       return absl::OkStatus();
     }
     @autoreleasepool {
-      BOOL signaled = [shared_event_ waitUntilSignaledValue:value
-                                                  timeoutMS:kWaitChunkMs];
+      BOOL signaled =
+          [shared_event_ waitUntilSignaledValue:value timeoutMS:kWaitChunkMs];
       if (signaled) {
         return absl::OkStatus();
       }
@@ -149,5 +232,5 @@ absl::Status MetalEvent::Synchronize() {
   }
 }
 
-}  // namespace metal
-}  // namespace stream_executor
+} // namespace metal
+} // namespace stream_executor

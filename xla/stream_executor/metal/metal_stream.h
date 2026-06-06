@@ -86,6 +86,11 @@ class MetalStream : public StreamCommon {
                             void** args, int64_t shmem_bytes,
                             bool use_pdl) override;
 
+  absl::StatusOr<std::unique_ptr<EventBasedTimer>> CreateEventBasedTimer(
+      bool use_delay_kernel) override {
+    return executor_->CreateEventBasedTimer(this, use_delay_kernel);
+  }
+
   // Underlying MTLCommandQueue. Available only inside .mm consumers.
   id<MTLCommandQueue> command_queue() const { return command_queue_; }
 

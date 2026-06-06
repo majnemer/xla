@@ -30,6 +30,7 @@ limitations under the License.
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/event.h"
+#include "xla/stream_executor/event_based_timer.h"
 #include "xla/stream_executor/gpu/gpu_executor.h"
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/kernel_spec.h"
@@ -87,6 +88,9 @@ class MetalExecutor : public gpu::GpuExecutor {
   absl::StatusOr<std::unique_ptr<Stream>> CreateStream(
       std::optional<std::variant<StreamPriority, int>> priority) override;
   absl::StatusOr<std::unique_ptr<Event>> CreateEvent() override;
+
+  absl::StatusOr<std::unique_ptr<EventBasedTimer>> CreateEventBasedTimer(
+      Stream* stream, bool use_delay_kernel) override;
 
   absl::StatusOr<std::unique_ptr<DeviceDescription>> CreateDeviceDescription()
       const override {
