@@ -43,7 +43,10 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/emitters/mlir_kernel_emitter.h"
 #include "xla/backends/gpu/codegen/emitters/transforms/passes.h"
 #include "xla/backends/gpu/codegen/fusions.h"
+#include "xla/backends/gpu/runtime/infeed_thunk.h"
 #include "xla/backends/gpu/runtime/kernel_thunk.h"
+#include "xla/backends/gpu/runtime/outfeed_thunk.h"
+#include "xla/backends/gpu/runtime/shaped_slice.h"
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/thunk_executor.h"
 #include "xla/backends/metal/codegen/msl_kernel_emitter.h"
@@ -277,6 +280,10 @@ class MetalThunkEmissionBackend final : public gpu::ThunkEmissionBackend {
         return EmitConstant(Cast<HloConstantInstruction>(instr));
       case HloOpcode::kFusion:
         return EmitFusion(Cast<HloFusionInstruction>(instr));
+      case HloOpcode::kInfeed:
+        return EmitInfeed(Cast<HloInfeedInstruction>(instr));
+      case HloOpcode::kOutfeed:
+        return EmitOutfeed(Cast<HloOutfeedInstruction>(instr));
       case HloOpcode::kRngGetAndUpdateState:
         return EmitRngGetAndUpdateState(
             Cast<HloRngGetAndUpdateStateInstruction>(instr));
@@ -334,6 +341,54 @@ class MetalThunkEmissionBackend final : public gpu::ThunkEmissionBackend {
         /*kernel_args=*/std::move(kernel_args),
         /*thunk=*/thunk_ptr,
     });
+    return thunks;
+  }
+
+  absl::StatusOr<gpu::ThunkSequence> EmitInfeed(
+      const HloInfeedInstruction* infeed) {
+    // Infeed's output is a tuple of (data..., token). Collect each array
+    // leaf's slice as the destination for the host→device copy.
+    std::vector<ShapedSlice> dest_slices;
+    TF_RETURN_IF_ERROR(ShapeUtil::ForEachSubshapeWithStatus(
+        infeed->shape(),
+        [&](const Shape& subshape, const ShapeIndex& index) -> absl::Status {
+          if (subshape.IsTuple() || subshape.IsToken()) return absl::OkStatus();
+          if (!subshape.IsArray()) {
+            return Internal("Unexpected subshape for infeed '%s' at %s",
+                            infeed->ToString(), index.ToString());
+          }
+          TF_ASSIGN_OR_RETURN(BufferAllocation::Slice data,
+                              buffer_assignment_->GetUniqueSlice(infeed, index));
+          dest_slices.push_back(ShapedSlice{data, subshape});
+          return absl::OkStatus();
+        }));
+    gpu::ThunkSequence thunks;
+    thunks.push_back(std::make_unique<gpu::InfeedThunk>(GetThunkInfo(infeed),
+                                                        std::move(dest_slices)));
+    return thunks;
+  }
+
+  absl::StatusOr<gpu::ThunkSequence> EmitOutfeed(
+      const HloOutfeedInstruction* outfeed) {
+    // Outfeed source is operand(0); each array leaf becomes a source slice.
+    const HloInstruction* source = outfeed->operand(0);
+    std::vector<ShapedSlice> source_slices;
+    TF_RETURN_IF_ERROR(ShapeUtil::ForEachSubshapeWithStatus(
+        source->shape(),
+        [&](const Shape& subshape, const ShapeIndex& index) -> absl::Status {
+          if (subshape.IsTuple()) return absl::OkStatus();
+          if (!subshape.IsArray()) {
+            return Internal("Unexpected subshape for outfeed source '%s' at %s",
+                            source->ToString(), index.ToString());
+          }
+          TF_ASSIGN_OR_RETURN(BufferAllocation::Slice data,
+                              buffer_assignment_->GetUniqueSlice(source, index));
+          source_slices.push_back(ShapedSlice{data, subshape});
+          return absl::OkStatus();
+        }));
+    gpu::ThunkSequence thunks;
+    thunks.push_back(std::make_unique<gpu::OutfeedThunk>(
+        GetThunkInfo(outfeed), std::move(source_slices)));
     return thunks;
   }
 
