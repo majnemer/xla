@@ -615,6 +615,9 @@ class MslEmitter {
     if (mlir::isa<mlir::math::CosOp>(op)) {
       return EmitMathCall(op, "metal::cos");
     }
+    if (mlir::isa<mlir::math::SinOp>(op)) {
+      return EmitMathCall(op, "metal::sin");
+    }
     if (auto clz = mlir::dyn_cast<mlir::math::CountLeadingZerosOp>(op)) {
       return EmitMathCtlz(clz);
     }
