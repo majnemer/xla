@@ -27,8 +27,12 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "llvm/ADT/SmallVector.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -59,10 +63,13 @@ limitations under the License.
 namespace xla::metal {
 namespace {
 
-// Match the LLVM emitter's unroll factor so the same tile_size formula
-// applies. Each thread copies kBitonicSortUnrollFactor adjacent elements
-// into the shared tile and performs kBitonicSortUnrollFactor/2 compares.
-constexpr uint64_t kBitonicSortUnrollFactor = 4;
+// Effective unroll factor for the MLIR sort kernel. The LLVM emitter uses 4
+// (each thread copies 4 adjacent elements into shared memory and runs 2
+// pair-compares). The first-pass MLIR kernel does one element pair per
+// thread per stage; set the unroll factor to 1 so PlanBitonicSort's launch
+// dimensions match. Bumping this requires emitting an inner unrolled loop
+// in EmitSortStageModule.
+constexpr uint64_t kBitonicSortUnrollFactor = 1;
 
 uint64_t Pow2Floor(uint64_t value) {
   CHECK_GT(value, 0u);
@@ -147,6 +154,12 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
       {max_threads_per_block * kBitonicSortUnrollFactor, max_tile_in_shmem,
        uint64_t{1} << num_stages});
   tile_size = Pow2Floor(std::max<uint64_t>(tile_size, 1));
+
+  // The MLIR sort kernel only supports single-mask global-memory stages
+  // today; the tiled threadgroup-memory path lands in a follow-up. Forcing
+  // tile_size to 1 makes every xor_mask >= tile_size, so the bundling loop
+  // below flushes each mask into its own SortStageDescription.
+  tile_size = 1;
 
   // Standard (non-tiled) launch covers ceil(2^(num_stages-1)/unroll) element
   // pairs per thread along the sort dimension; one element pair compared per
@@ -297,17 +310,190 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
   TF_ASSIGN_OR_RETURN(
       emitters::CallTargetProvider comparator_call_targets,
       emitters::EmitPartitionedComputations(*module, partitioned));
-  // Bound but not yet used: the kernel body below is still passthrough
-  // pending the compare-and-swap lowering. Silence the unused warning.
-  (void)comparator_call_targets;
+  mlir::func::FuncOp comparator_func =
+      comparator_call_targets(comparator->root_instruction());
 
-  // Trivial passthrough body: return the args unchanged. The full
-  // compare-and-swap body lands in a follow-up commit; this minimum-viable
-  // body lets the Phase-2 plumbing exercise the end-to-end pipeline.
+  // Tiled stages are not yet supported by this kernel body; the planner
+  // queues them via tile_size > 0. The phase-2 retry loop reduces the tile
+  // by halving so eventually only single-mask global-memory stages remain,
+  // but for now reject tiled stages explicitly.
+  if (desc.tile_size != 0 || desc.xor_masks.size() != 1) {
+    return absl::UnimplementedError(absl::StrCat(
+        "MetalCompiler::EmitSortStageModule: tiled sort stages are not yet "
+        "supported (entry '",
+        desc.entry_name, "'); only single-mask global-memory passes work."));
+  }
+
+  // Iota operands need the kernel to synthesise their values on first
+  // touch; the bitonic body below reads from output tensors only.
+  for (int64_t i = 0; i < operand_count; ++i) {
+    if (HloPredicateIsOp<HloOpcode::kIota>(desc.sort->operand(i))) {
+      return absl::UnimplementedError(absl::StrCat(
+          "MetalCompiler::EmitSortStageModule: iota operand at index ", i,
+          " is not yet supported by the MLIR sort kernel."));
+    }
+  }
+
+  const Shape& keys_shape = desc.sort->operand(0)->shape();
+  const int64_t sort_dim = desc.sort->sort_dimension();
+  const int64_t dim_to_sort_bound = keys_shape.dimensions(sort_dim);
+  const int64_t rank = keys_shape.dimensions().size();
+  const int64_t iteration_bound = desc.num_iterations_in_sort_dim;
+  const int64_t xor_mask = desc.xor_masks[0];
+  int64_t block_size = xor_mask;
+  if (xor_mask > 1 && (xor_mask & (xor_mask + 1)) == 0) {
+    block_size = (xor_mask + 1) / 2;
+  }
+
   mlir::Block* entry_block = entry_func.addEntryBlock();
   b.setInsertionPointToStart(entry_block);
-  llvm::SmallVector<mlir::Value> returns(entry_block->getArguments());
-  mlir::func::ReturnOp::create(b, returns);
+  namespace ma = mlir::arith;
+  auto const_idx = [&](int64_t v) {
+    return ma::ConstantIndexOp::create(b, v).getResult();
+  };
+
+  // linear = bid.x * threads_per_block + tid.x. We use only the x dim;
+  // PlanBitonicSort issues a 1D launch by feeding a CeilOfRatio-shaped
+  // standard iteration shape into CalculateLaunchDimensions.
+  mlir::Value tid = mlir::gpu::ThreadIdOp::create(b, mlir::gpu::Dimension::x);
+  mlir::Value bid = mlir::gpu::BlockIdOp::create(b, mlir::gpu::Dimension::x);
+  mlir::Value linear = ma::AddIOp::create(
+      b, ma::MulIOp::create(b, bid,
+                            const_idx(desc.launch_dimensions
+                                          .num_threads_per_block())),
+      tid);
+
+  // Decompose linear into iteration_shape (= keys_shape with sort_dim
+  // replaced by iteration_bound) using minor-to-major order so the
+  // innermost (most-frequent) coordinate corresponds to the physical
+  // layout's stride-1 dimension.
+  llvm::SmallVector<mlir::Value, 4> indices(rank);
+  mlir::Value remaining = linear;
+  for (int64_t d : keys_shape.layout().minor_to_major()) {
+    int64_t size =
+        (d == sort_dim) ? iteration_bound : keys_shape.dimensions(d);
+    mlir::Value size_c = const_idx(size);
+    indices[d] = ma::RemUIOp::create(b, remaining, size_c);
+    remaining = ma::DivUIOp::create(b, remaining, size_c);
+  }
+
+  // Apply the xor-block derivation to convert iter_sort_idx (which ranges
+  // [0, iteration_bound)) into the actual current_keys_index inside the
+  // keys array. Three cases mirror EmitCompareLoopBody:
+  mlir::Value iter_sort_idx = indices[sort_dim];
+  mlir::Value current;
+  mlir::Value block_size_c = const_idx(block_size);
+  if (block_size == 1) {
+    current = ma::MulIOp::create(b, iter_sort_idx, const_idx(2));
+  } else if (block_size * 2 < iteration_bound) {
+    mlir::Value blk = ma::DivUIOp::create(b, iter_sort_idx, block_size_c);
+    mlir::Value idx_in_blk =
+        ma::RemUIOp::create(b, iter_sort_idx, block_size_c);
+    mlir::Value first_in_block =
+        ma::MulIOp::create(b, blk, const_idx(2 * block_size));
+    current = ma::AddIOp::create(b, first_in_block, idx_in_blk);
+  } else {
+    // Sentinel: a thread in the "right" block of the pair must skip; force
+    // its current index to iteration_bound^xor_mask so the compare index
+    // falls at iteration_bound and the bounds check below rejects it.
+    mlir::Value sentinel = const_idx(iteration_bound ^ xor_mask);
+    mlir::Value is_left = ma::CmpIOp::create(b, ma::CmpIPredicate::ult,
+                                             iter_sort_idx, block_size_c);
+    current = ma::SelectOp::create(b, is_left, iter_sort_idx, sentinel);
+  }
+
+  // compare = current XOR xor_mask. Bounds check both indices against the
+  // *actual* sort dimension length (not iteration_bound) to skip phantom
+  // pairs that the bitonic algorithm would otherwise touch on the next-
+  // power-of-two padding.
+  mlir::Value compare =
+      ma::XOrIOp::create(b, current, const_idx(xor_mask));
+  mlir::Value bound = const_idx(dim_to_sort_bound);
+  mlir::Value in_bounds = ma::AndIOp::create(
+      b,
+      ma::CmpIOp::create(b, ma::CmpIPredicate::ult, current, bound),
+      ma::CmpIOp::create(b, ma::CmpIPredicate::ult, compare, bound));
+
+  llvm::SmallVector<mlir::Value, 4> current_indices(indices.begin(),
+                                                     indices.end());
+  llvm::SmallVector<mlir::Value, 4> compare_indices(indices.begin(),
+                                                     indices.end());
+  current_indices[sort_dim] = current;
+  compare_indices[sort_dim] = compare;
+
+  llvm::SmallVector<mlir::Type, 4> tensor_types;
+  for (auto arg : entry_block->getArguments()) {
+    tensor_types.push_back(arg.getType());
+  }
+  llvm::SmallVector<mlir::Value, 4> entry_tensors(
+      entry_block->getArguments().begin(), entry_block->getArguments().end());
+
+  // scf.if in_bounds: compare-and-conditionally-swap; else: passthrough.
+  auto if_op = mlir::scf::IfOp::create(b, tensor_types, in_bounds,
+                                       /*withElseRegion=*/true);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(if_op.thenBlock());
+    llvm::SmallVector<mlir::Value, 4> compare_args;
+    llvm::SmallVector<mlir::Value, 4> compare_vals;
+    llvm::SmallVector<mlir::Value, 4> current_vals;
+    compare_args.reserve(2 * operand_count);
+    compare_vals.reserve(operand_count);
+    current_vals.reserve(operand_count);
+    for (int64_t i = 0; i < operand_count; ++i) {
+      mlir::Value tensor = entry_tensors[i];
+      mlir::Value v_compare =
+          mlir::tensor::ExtractOp::create(b, tensor, compare_indices);
+      mlir::Value v_current =
+          mlir::tensor::ExtractOp::create(b, tensor, current_indices);
+      compare_vals.push_back(v_compare);
+      current_vals.push_back(v_current);
+      compare_args.push_back(v_compare);
+      compare_args.push_back(v_current);
+    }
+    mlir::Value cmp_result =
+        mlir::func::CallOp::create(b, comparator_func, compare_args)
+            .getResult(0);
+    // PRED lowers to i8 in MLIR; truncate to i1 for scf.if.
+    mlir::Value cmp_i1 = ma::CmpIOp::create(
+        b, ma::CmpIPredicate::ne, cmp_result,
+        ma::ConstantOp::create(b, cmp_result.getType(),
+                               b.getIntegerAttr(cmp_result.getType(), 0))
+            .getResult());
+    auto swap_if = mlir::scf::IfOp::create(b, tensor_types, cmp_i1,
+                                           /*withElseRegion=*/true);
+    {
+      mlir::OpBuilder::InsertionGuard sg(b);
+      b.setInsertionPointToStart(swap_if.thenBlock());
+      llvm::SmallVector<mlir::Value, 4> swapped;
+      swapped.reserve(operand_count);
+      for (int64_t i = 0; i < operand_count; ++i) {
+        mlir::Value tensor = entry_tensors[i];
+        // current position gets compare_value; compare position gets
+        // current_value. This matches EmitCompareLoopBody's swap.
+        tensor = mlir::tensor::InsertOp::create(b, compare_vals[i], tensor,
+                                                current_indices);
+        tensor = mlir::tensor::InsertOp::create(b, current_vals[i], tensor,
+                                                compare_indices);
+        swapped.push_back(tensor);
+      }
+      mlir::scf::YieldOp::create(b, swapped);
+    }
+    {
+      mlir::OpBuilder::InsertionGuard sg(b);
+      b.setInsertionPointToStart(swap_if.elseBlock());
+      mlir::scf::YieldOp::create(b, entry_tensors);
+    }
+    mlir::scf::YieldOp::create(b, swap_if.getResults());
+  }
+  {
+    mlir::OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(if_op.elseBlock());
+    mlir::scf::YieldOp::create(b, entry_tensors);
+  }
+
+  b.setInsertionPointToEnd(entry_block);
+  mlir::func::ReturnOp::create(b, if_op.getResults());
 
   return module;
 }
