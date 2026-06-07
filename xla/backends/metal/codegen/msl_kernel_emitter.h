@@ -16,11 +16,13 @@ limitations under the License.
 #ifndef XLA_BACKENDS_METAL_CODEGEN_MSL_KERNEL_EMITTER_H_
 #define XLA_BACKENDS_METAL_CODEGEN_MSL_KERNEL_EMITTER_H_
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "xla/backends/metal/codegen/msl_kernel_source.h"
 #include "xla/backends/metal/codegen/translate_to_msl.h"
+#include "xla/stream_executor/device_description.h"
 
 namespace xla {
 
@@ -28,6 +30,16 @@ class HloModule;
 class NameUniquer;
 
 namespace metal {
+
+// Runs the full Metal MLIR lowering pipeline on `module`: GPU loop transforms,
+// arith/affine simplification, complex lowering, narrow-float / sub-byte
+// storage widening. Idempotent. `hlo_module` is used only for IR-dump routing
+// via `EnableIRPrintingIfRequested`; `dump_category` is the category string
+// (e.g. "mlir-fusion", "mlir-sort").
+absl::Status RunMetalLoweringPipeline(
+    mlir::ModuleOp module, const stream_executor::DeviceDescription& device,
+    int max_unroll_factor, const HloModule& hlo_module,
+    absl::string_view entry_function_name, absl::string_view dump_category);
 
 // Runs the Metal-specific MLIR pass pipeline on `module`, then translates
 // the entry-point func.func to MSL via TranslateToMSL. The input module is
