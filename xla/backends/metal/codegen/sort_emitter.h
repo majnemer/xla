@@ -53,6 +53,11 @@ struct SortStageDescription {
   // Tile width in elements per threadgroup when the stage runs in shared
   // memory; 0 means the stage runs in global memory.
   int64_t tile_size = 0;
+  // Elements per thread for the tiled body's load/store; pair-compares
+  // per xor_mask = unroll_factor / 2. 0 for non-tiled stages. Halved by
+  // ShrinkSortStageTile when tile_size has bottomed out under register
+  // pressure (4 → 2 → ResourceExhausted).
+  int64_t unroll_factor = 0;
   // Non-tiled stages: number of element-pair iterations along the sort
   // dimension. Tiled stages: number of tiles in the sort dimension.
   int64_t num_iterations_in_sort_dim = 0;
