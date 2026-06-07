@@ -949,6 +949,21 @@ ENTRY entry {
   EXPECT_TRUE(RunAndCompare(hlo, ErrorSpec{1e-5, 1e-5}));
 }
 
+TEST_F(CpuGpuFusionTest, TransposeDiamondWithNonTrivialBranchF32) {
+  const char* hlo = R"(
+HloModule module
+
+ENTRY entry {
+  p = f32[16,16]{1,0} parameter(0)
+  trans = f32[16,16]{1,0} transpose(p), dimensions={1,0}
+  rev = f32[16,16]{1,0} reverse(trans), dimensions={0,1}
+  sub = f32[16,16]{1,0} subtract(trans, trans)
+  ROOT add = f32[16,16]{1,0} add(rev, sub)
+}
+)";
+  EXPECT_TRUE(RunAndCompare(hlo, ErrorSpec{1e-5, 1e-5}));
+}
+
 void BM_ParallelFusion(::testing::benchmark::State& state) {
   // Simple element-wise computation to benchmark parallel task partitioning.
 
