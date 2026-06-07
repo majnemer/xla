@@ -37,22 +37,24 @@ namespace xla::metal {
 // same deferred pipeline used for fusions.
 //
 // Each stage compares element pairs across the sort dimension using the
-// `xor_masks`. When a stage has a single mask the kernel runs in global memory.
-// When it carries multiple masks it loads `tile_size` elements per threadgroup
-// into a shared (threadgroup) tile, sweeps the masks in order, then writes the
-// tile back. The tile_size is a power of two and decreases on PSO-retry.
+// `xor_masks`. When `tile_size > 0`, the stage loads `tile_size` elements
+// per threadgroup into a shared (threadgroup) tile, sweeps the masks in
+// order, then writes the tile back; xor masks smaller than `tile_size`
+// route through this path. Larger xor masks set `tile_size = 0` and stream
+// pairs directly through global memory. `tile_size` is a power of two and
+// decreases on PSO-retry.
 struct SortStageDescription {
   // The sort HLO this stage belongs to. The comparator computation is re-
   // resolved from this pointer during Phase-2 MLIR emission.
   const HloSortInstruction* sort = nullptr;
-  // xor_masks for this stage. A single mask = global-memory pass. Multiple
-  // masks = tiled shared-memory pass.
+  // xor_masks for this stage; one mask per kernel today, multi-mask
+  // bundling is a future optimisation.
   std::vector<int64_t> xor_masks;
-  // Tile width in elements per threadgroup when masks are tiled together;
-  // 0 means the stage runs in global memory (no shared-memory tiling).
+  // Tile width in elements per threadgroup when the stage runs in shared
+  // memory; 0 means the stage runs in global memory.
   int64_t tile_size = 0;
-  // Total number of element-pair iterations along the sort dimension this
-  // stage covers (after rounding/unrolling).
+  // Non-tiled stages: number of element-pair iterations along the sort
+  // dimension. Tiled stages: number of tiles in the sort dimension.
   int64_t num_iterations_in_sort_dim = 0;
   // Launch dimensions chosen for this stage.
   gpu::LaunchDimensions launch_dimensions;
