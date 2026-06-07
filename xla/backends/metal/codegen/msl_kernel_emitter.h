@@ -33,8 +33,10 @@ namespace metal {
 
 // Runs the full Metal MLIR lowering pipeline on `module`: GPU loop transforms,
 // arith/affine simplification, complex lowering, narrow-float / sub-byte
-// storage widening. Idempotent. `hlo_module` is used only for IR-dump routing
-// via `EnableIRPrintingIfRequested`; `dump_category` is the category string
+// storage widening. Designed to be called once per kernel — not safe to run
+// twice on the same module (the storage-lowering passes may not be no-ops on
+// already-lowered IR). `hlo_module` is used only for IR-dump routing via
+// `EnableIRPrintingIfRequested`; `dump_category` is the category string
 // (e.g. "mlir-fusion", "mlir-sort").
 absl::Status RunMetalLoweringPipeline(
     mlir::ModuleOp module, const stream_executor::DeviceDescription& device,

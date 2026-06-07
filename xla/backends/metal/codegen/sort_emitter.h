@@ -47,8 +47,9 @@ struct SortStageDescription {
   // The sort HLO this stage belongs to. The comparator computation is re-
   // resolved from this pointer during Phase-2 MLIR emission.
   const HloSortInstruction* sort = nullptr;
-  // xor_masks for this stage; one mask per kernel today, multi-mask
-  // bundling is a future optimisation.
+  // xor_masks for this stage. Tiled stages bundle every adjacent mask
+  // below tile_size into one kernel and sweep them in order between
+  // syncs; non-tiled stages always carry a single mask.
   std::vector<int64_t> xor_masks;
   // Tile width in elements per threadgroup when the stage runs in shared
   // memory; 0 means the stage runs in global memory.
@@ -85,10 +86,12 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
     const emitters::KernelArguments::BufferAlignment& buffer_alignment,
     const std::string& entry_name_prefix);
 
-// Re-plans `desc` with a halved tile_size (rounded down to the next power of
-// two, never below threads_per_warp). Returns false if there's no smaller
-// usable tile size — caller should surface ResourceExhausted in that case.
-// Recomputes launch_dimensions accordingly.
+// Re-plans `desc` after the PSO grants fewer threads than the launch
+// requested. Tries shrinking tile_size first (preserves bank-aware path);
+// on failure halves unroll_factor (4 → 2) to lower per-thread register
+// pressure. Returns false when neither knob has any room left — caller
+// should surface ResourceExhausted. Recomputes launch_dimensions and
+// num_iterations_in_sort_dim on success.
 bool ShrinkSortStageTile(SortStageDescription& desc,
                          const se::DeviceDescription& device);
 
