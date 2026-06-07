@@ -932,8 +932,8 @@ TEST_F(FusionClientLibraryTest, ManyLayoutTransformations) {
 }
 
 TEST_F(CpuGpuFusionTest, TransposeDiamondWithNonTrivialBranch) {
-  if (test::DeviceIs(test::kMetal)) {
-    GTEST_SKIP() << "Apple Silicon GPUs have no fp64 hardware.";
+  if (!test::BackendSupportsFloat64()) {
+    GTEST_SKIP() << "Backend does not support f64.";
   }
   const char* hlo = R"(
 HloModule module
