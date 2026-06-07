@@ -139,6 +139,18 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
         keys_shape, ShapeUtil::GetSubshape(sort->shape(), shape_index),
         Layout::Equal().IgnoreMemorySpace().IgnoreElementSize()));
   }
+  // TODO(majnemer): emit iota inline. EmitCompareLoopBody (sort_util.cc)
+  // checks `emit_iota_operands && operand is kIota` and calls EmitIota
+  // instead of reading from the buffer. The MLIR version would inline an
+  // iota_op_from_index call on the first stage that touches each iota
+  // operand and then read from the output buffer on subsequent stages.
+  for (int64_t i = 0; i < sort->operand_count(); ++i) {
+    if (HloPredicateIsOp<HloOpcode::kIota>(sort->operand(i))) {
+      return absl::UnimplementedError(absl::StrCat(
+          "MetalCompiler::PlanBitonicSort: iota operand at index ", i,
+          " is not yet supported by the MLIR sort kernel."));
+    }
+  }
 
   const int64_t dimension_to_sort = sort->sort_dimension();
   const uint64_t dimension_to_sort_bound =
@@ -661,19 +673,6 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
 
   TF_RET_CHECK(desc.tile_size != 0 || desc.xor_masks.size() == 1)
       << "non-tiled stages emit one mask per kernel";
-
-  // TODO(majnemer): emit iota inline. EmitCompareLoopBody (sort_util.cc)
-  // checks `emit_iota_operands && operand is kIota` and calls EmitIota
-  // instead of reading from the buffer. The MLIR version would inline an
-  // iota_op_from_index call on the first stage that touches each iota
-  // operand and then read from the output buffer on subsequent stages.
-  for (int64_t i = 0; i < operand_count; ++i) {
-    if (HloPredicateIsOp<HloOpcode::kIota>(desc.sort->operand(i))) {
-      return absl::UnimplementedError(absl::StrCat(
-          "MetalCompiler::EmitSortStageModule: iota operand at index ", i,
-          " is not yet supported by the MLIR sort kernel."));
-    }
-  }
 
   if (desc.tile_size != 0) {
     TF_RETURN_IF_ERROR(
