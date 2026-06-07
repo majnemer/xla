@@ -33,15 +33,8 @@ limitations under the License.
 #include "absl/strings/substitute.h"
 #include "absl/synchronization/blocking_counter.h"
 #include "absl/synchronization/mutex.h"
-#include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
-#include "mlir/Conversion/ComplexToStandard/ComplexToStandard.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/MLIRContext.h"
-#include "mlir/Pass/PassManager.h"
-#include "mlir/Support/LogicalResult.h"
-#include "mlir/Transforms/Passes.h"
 #include "xla/backends/gpu/codegen/emitters/mlir_kernel_emitter.h"
-#include "xla/backends/gpu/codegen/emitters/transforms/passes.h"
 #include "xla/backends/gpu/codegen/fusions.h"
 #include "xla/backends/gpu/runtime/device_to_device_copy_thunk.h"
 #include "xla/backends/gpu/runtime/fft_thunk.h"
@@ -53,15 +46,12 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/thunk_executor.h"
 #include "xla/backends/metal/codegen/msl_kernel_emitter.h"
 #include "xla/backends/metal/codegen/msl_kernel_source.h"
-#include "xla/backends/metal/codegen/transforms/passes.h"
 #include "xla/backends/metal/codegen/sort_emitter.h"
 #include "xla/backends/metal/runtime/metal_kernel_artifact.h"
 #include "xla/backends/metal/runtime/metal_kernel_thunk.h"
 #include "xla/backends/metal/runtime/metal_triangular_solve_thunk.h"
 #include "xla/backends/metal/transforms/expand_complex_triangular_solve.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
-#include "xla/codegen/emitters/transforms/passes.h"
-#include "xla/codegen/ir_printing.h"
 #include "xla/codegen/mlir_kernel_source.h"
 #include "xla/hlo/analysis/hlo_ordering.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
@@ -839,35 +829,13 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
           mlir_fusion->mlir_kernel_emitter()->unroll_factor();
 
       mlir::ModuleOp module = mlir_source.module();
-      mlir::PassManager pm(module.getContext());
-      gpu::AddLoopTransformationPasses(pm, dev, unroll_factor,
-                                       /*max_vector_elements=*/4);
-      pm.addNestedPass<mlir::func::FuncOp>(
-          emitters::CreateConvertPureCallOpsPass());
-      pm.addNestedPass<mlir::func::FuncOp>(
-          emitters::CreateSimplifyArithPass());
-      pm.addPass(emitters::CreateSimplifyAffinePass());
-      pm.addPass(gpu::CreateConvertIndexTypePass());
-      pm.addPass(mlir::createLowerAffinePass());
-      pm.addPass(mlir::createLoopInvariantCodeMotionPass());
-      pm.addPass(mlir::createSymbolDCEPass());
-      pm.addPass(mlir::createCSEPass());
-      pm.addPass(mlir::createConvertComplexToStandardPass());
-      pm.addPass(CreateConvertComplexToArithMathPass());
-      pm.addPass(emitters::CreateExpandFloatOpsPass());
-      pm.addPass(CreateExpandFloatOpsPass());
-      pm.addPass(CreateLowerSubByteStoragePass());
-      pm.addPass(CreateLowerFloatStoragePass());
-      pm.addPass(mlir::createLowerAffinePass());
-      std::string dump_kernel_name =
-          absl::StrCat(deferred.entry_name, ".metal-lowering");
-      EnableIRPrintingIfRequested(pm, module.getContext(), *hlo_module,
-                                  dump_kernel_name, "mlir-fusion");
-      if (mlir::failed(pm.run(module))) {
+      if (auto status = metal::RunMetalLoweringPipeline(
+              module, dev, unroll_factor, *hlo_module, deferred.entry_name,
+              "mlir-fusion");
+          !status.ok()) {
         return absl::InternalError(absl::StrCat(
-            "MetalCompiler::CompileToBackendResult: MLIR lowering pipeline "
-            "failed on fusion '",
-            deferred.fusion_name, "'."));
+            "MetalCompiler::CompileToBackendResult: ", status.message(),
+            " (fusion '", deferred.fusion_name, "')"));
       }
       NameUniquer per_fusion_uniquer;
       TF_ASSIGN_OR_RETURN(metal::MslKernelSource msl_source,
@@ -978,36 +946,13 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
           xla::metal::EmitSortStageModule(context.get(), stage));
       mlir::ModuleOp module = *owning_module;
 
-      mlir::PassManager pm(module.getContext());
-      gpu::AddLoopTransformationPasses(pm, gpu_device_info,
-                                       /*max_unroll_factor=*/0,
-                                       /*max_vector_elements=*/4);
-      pm.addNestedPass<mlir::func::FuncOp>(
-          emitters::CreateConvertPureCallOpsPass());
-      pm.addNestedPass<mlir::func::FuncOp>(
-          emitters::CreateSimplifyArithPass());
-      pm.addPass(emitters::CreateSimplifyAffinePass());
-      pm.addPass(gpu::CreateConvertIndexTypePass());
-      pm.addPass(mlir::createLowerAffinePass());
-      pm.addPass(mlir::createLoopInvariantCodeMotionPass());
-      pm.addPass(mlir::createSymbolDCEPass());
-      pm.addPass(mlir::createCSEPass());
-      pm.addPass(mlir::createConvertComplexToStandardPass());
-      pm.addPass(CreateConvertComplexToArithMathPass());
-      pm.addPass(emitters::CreateExpandFloatOpsPass());
-      pm.addPass(CreateExpandFloatOpsPass());
-      pm.addPass(CreateLowerSubByteStoragePass());
-      pm.addPass(CreateLowerFloatStoragePass());
-      pm.addPass(mlir::createLowerAffinePass());
-      std::string dump_kernel_name =
-          absl::StrCat(stage.entry_name, ".metal-lowering");
-      EnableIRPrintingIfRequested(pm, module.getContext(), *hlo_module,
-                                  dump_kernel_name, "mlir-sort");
-      if (mlir::failed(pm.run(module))) {
+      if (auto status = metal::RunMetalLoweringPipeline(
+              module, gpu_device_info, /*max_unroll_factor=*/0, *hlo_module,
+              stage.entry_name, "mlir-sort");
+          !status.ok()) {
         return absl::InternalError(absl::StrCat(
-            "MetalCompiler::CompileToBackendResult: MLIR lowering pipeline "
-            "failed on sort stage '",
-            stage.entry_name, "'."));
+            "MetalCompiler::CompileToBackendResult: ", status.message(),
+            " (sort stage '", stage.entry_name, "')"));
       }
       NameUniquer per_stage_uniquer;
       TF_ASSIGN_OR_RETURN(
