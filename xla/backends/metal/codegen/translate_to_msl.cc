@@ -752,6 +752,40 @@ class MslEmitter {
 
   absl::Status EmitArithConstant(mlir::arith::ConstantOp op) {
     mlir::Type ty = op.getType();
+    // Materialise non-scalar tensor constants as local C-style arrays. The
+    // LLVM GPU pipeline does this in LowerTensorsPass (RewriteNonScalarConstants),
+    // which we don't run; downstream tensor.extract becomes plain `arr[i]`.
+    if (auto tensor_ty = mlir::dyn_cast<mlir::RankedTensorType>(ty)) {
+      if (tensor_ty.getRank() != 1) {
+        return absl::UnimplementedError(absl::StrCat(
+            "arith.constant of tensor type must be rank-1 after flatten; got ",
+            mlir::debugString(ty)));
+      }
+      auto dense_attr =
+          mlir::dyn_cast<mlir::DenseElementsAttr>(op.getValueAttr());
+      if (!dense_attr) {
+        return absl::UnimplementedError(absl::StrCat(
+            "arith.constant of tensor type requires a DenseElementsAttr: ",
+            mlir::debugString(ty)));
+      }
+      TF_ASSIGN_OR_RETURN(std::string elem_msl,
+                          EmitElementType(tensor_ty.getElementType()));
+      std::string name = BindValueName(op.getResult());
+      addr_spaces_[op.getResult()] = "thread";
+      os_ << elem_msl << " " << name << "[" << tensor_ty.getNumElements()
+          << "] = {";
+      bool first = true;
+      for (mlir::Attribute elt : dense_attr.getValues<mlir::Attribute>()) {
+        if (!first) os_ << ", ";
+        first = false;
+        TF_ASSIGN_OR_RETURN(
+            std::string lit,
+            FormatConstantLiteral(tensor_ty.getElementType(), elt));
+        os_ << lit;
+      }
+      os_ << "};\n";
+      return absl::OkStatus();
+    }
     TF_ASSIGN_OR_RETURN(std::string ty_msl, TypeToMSL(ty));
     TF_ASSIGN_OR_RETURN(std::string literal,
                         FormatConstantLiteral(ty, op.getValueAttr()));
