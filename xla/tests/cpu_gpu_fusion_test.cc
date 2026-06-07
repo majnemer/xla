@@ -932,6 +932,9 @@ TEST_F(FusionClientLibraryTest, ManyLayoutTransformations) {
 }
 
 TEST_F(CpuGpuFusionTest, TransposeDiamondWithNonTrivialBranch) {
+  if (test::DeviceIs(test::kMetal)) {
+    GTEST_SKIP() << "Apple Silicon GPUs have no fp64 hardware.";
+  }
   const char* hlo = R"(
 HloModule module
 
