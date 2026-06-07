@@ -105,6 +105,8 @@ gpu::LaunchDimensions ComputeTiledLaunchDimensions(
   // threads_per_block = tile_size / unroll_factor so each thread handles
   // `unroll_factor` elements (load + store) and `unroll_factor / 2` pairs
   // per xor_mask.
+  DCHECK_EQ(tile_size % unroll_factor, 0)
+      << "tile_size must divide evenly into per-thread unroll";
   uint64_t num_tiles =
       CeilOfRatio<uint64_t>(dimension_to_sort_bound, tile_size);
   Shape iteration_shape = keys_shape;
@@ -476,34 +478,34 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
   const bool aligned_to_banks =
       threads_per_block % gpu::kNumShmemBanks == 0 && pairs_per_thread > 1;
 
+  // Base pair index per thread, hoisted out of the mask loop because it
+  // depends only on tid. Bank-aware shape treats the tile as rows of
+  // (pairs_per_thread * kNumShmemBanks); each thread keeps the same bank
+  // `offset` across its `pairs_per_thread` iterations so intra-warp
+  // accesses never collide on a bank.
+  mlir::Value epi_base;
+  if (aligned_to_banks) {
+    mlir::Value banks_c = const_idx(gpu::kNumShmemBanks);
+    mlir::Value bank_row = ma::DivUIOp::create(b, tid, banks_c);
+    mlir::Value offset = ma::RemUIOp::create(b, tid, banks_c);
+    mlir::Value first_in_bank_row = ma::MulIOp::create(
+        b, bank_row, const_idx(pairs_per_thread * gpu::kNumShmemBanks));
+    epi_base = ma::AddIOp::create(b, first_in_bank_row, offset);
+  } else {
+    epi_base = ma::MulIOp::create(b, tid, const_idx(pairs_per_thread));
+  }
+
   // Compare phase: one sweep per bundled xor_mask, with a barrier between
   // sweeps so the updated tile is visible to all threads before the next
-  // mask reads it. Each sweep runs `kPairsPerThread` pair-compares per
-  // thread; pair indices come from a bank-aware reshape when
-  // threads_per_block aligns to gpu::kNumShmemBanks, otherwise from a
-  // consecutive layout. The bounds check uses the global positions so
-  // partial tiles at the tail of the sort dim don't shuffle phantom pairs.
-  for (int64_t mask_idx = 0;
-       mask_idx < static_cast<int64_t>(desc.xor_masks.size()); ++mask_idx) {
-    const int64_t xor_mask = desc.xor_masks[mask_idx];
+  // mask reads it. Each sweep runs `pairs_per_thread` pair-compares per
+  // thread; pair indices come from the hoisted `epi_base` plus a per-i
+  // stride that matches the bank-aware reshape. The bounds check uses the
+  // global positions so partial tiles at the tail of the sort dim don't
+  // shuffle phantom pairs.
+  for (int64_t xor_mask : desc.xor_masks) {
     int64_t block_size = xor_mask;
     if (xor_mask > 1 && (xor_mask & (xor_mask + 1)) == 0) {
       block_size = (xor_mask + 1) / 2;
-    }
-    // Base pair index per thread. Bank-aware shape: tile is treated as
-    // rows of (pairs_per_thread * kNumShmemBanks); each thread keeps the
-    // same bank `offset` across its `pairs_per_thread` iterations, so
-    // intra-warp accesses never collide on a bank.
-    mlir::Value epi_base;
-    if (aligned_to_banks) {
-      mlir::Value banks_c = const_idx(gpu::kNumShmemBanks);
-      mlir::Value bank_row = ma::DivUIOp::create(b, tid, banks_c);
-      mlir::Value offset = ma::RemUIOp::create(b, tid, banks_c);
-      mlir::Value first_in_bank_row = ma::MulIOp::create(
-          b, bank_row, const_idx(pairs_per_thread * gpu::kNumShmemBanks));
-      epi_base = ma::AddIOp::create(b, first_in_bank_row, offset);
-    } else {
-      epi_base = ma::MulIOp::create(b, tid, const_idx(pairs_per_thread));
     }
     for (int64_t pair_i = 0; pair_i < pairs_per_thread; ++pair_i) {
       mlir::Value pair_idx;
