@@ -99,19 +99,19 @@ gpu::LaunchDimensions ComputeStandardLaunchDimensions(
 
 gpu::LaunchDimensions ComputeTiledLaunchDimensions(
     const Shape& keys_shape, int64_t dimension_to_sort,
-    int64_t dimension_to_sort_bound, int64_t tile_size,
+    int64_t dimension_to_sort_bound, int64_t tile_size, int64_t unroll_factor,
     int64_t* num_tiles_in_sort_dim_out) {
   // One block per tile in the sort dim, per position in all other dims;
-  // threads_per_block = tile_size / kBitonicTileUnroll so each thread
-  // handles `kBitonicTileUnroll` elements (load + store) and
-  // `kBitonicTileUnroll / 2` pairs per xor_mask.
+  // threads_per_block = tile_size / unroll_factor so each thread handles
+  // `unroll_factor` elements (load + store) and `unroll_factor / 2` pairs
+  // per xor_mask.
   uint64_t num_tiles =
       CeilOfRatio<uint64_t>(dimension_to_sort_bound, tile_size);
   Shape iteration_shape = keys_shape;
   iteration_shape.set_dimensions(dimension_to_sort, num_tiles);
   uint64_t num_blocks = ShapeUtil::ElementsIn(iteration_shape);
   uint64_t threads_per_block =
-      std::max<uint64_t>(1, tile_size / kBitonicTileUnroll);
+      std::max<uint64_t>(1, tile_size / unroll_factor);
   *num_tiles_in_sort_dim_out = num_tiles;
   return gpu::LaunchDimensions(num_blocks, threads_per_block);
 }
@@ -176,7 +176,7 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
   int64_t tiled_num_tiles_in_sort_dim = 0;
   gpu::LaunchDimensions tiled_launch = ComputeTiledLaunchDimensions(
       keys_shape, dimension_to_sort, dimension_to_sort_bound, tile_size,
-      &tiled_num_tiles_in_sort_dim);
+      kBitonicTileUnroll, &tiled_num_tiles_in_sort_dim);
 
   TF_ASSIGN_OR_RETURN(
       emitters::KernelArguments full_kernel_args,
@@ -199,6 +199,8 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
         /*sort=*/sort,
         /*xor_masks=*/std::move(xor_masks),
         /*tile_size=*/tiled ? static_cast<int64_t>(tile_size) : 0,
+        /*unroll_factor=*/
+        tiled ? static_cast<int64_t>(kBitonicTileUnroll) : 0,
         /*num_iterations_in_sort_dim=*/
         tiled ? tiled_num_tiles_in_sort_dim
               : static_cast<int64_t>(standard_num_iterations_in_sort_dim),
@@ -239,6 +241,21 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
   return stages;
 }
 
+namespace {
+
+void RecomputeTiledLaunch(SortStageDescription& desc) {
+  const Shape& keys_shape = desc.sort->operand(0)->shape();
+  const int64_t sort_dim = desc.sort->sort_dimension();
+  const int64_t dim_bound = keys_shape.dimensions(sort_dim);
+  int64_t num_tiles = 0;
+  desc.launch_dimensions = ComputeTiledLaunchDimensions(
+      keys_shape, sort_dim, dim_bound, desc.tile_size, desc.unroll_factor,
+      &num_tiles);
+  desc.num_iterations_in_sort_dim = num_tiles;
+}
+
+}  // namespace
+
 bool ShrinkSortStageTile(SortStageDescription& desc,
                          const se::DeviceDescription& device) {
   // Non-tiled (global-memory) stages have no tile_size knob to shrink;
@@ -246,14 +263,38 @@ bool ShrinkSortStageTile(SortStageDescription& desc,
   // kernels.
   if (desc.tile_size == 0) return false;
   const uint64_t warp = device.threads_per_warp();
-  uint64_t next = static_cast<uint64_t>(desc.tile_size) / 2;
-  // Tiled body assigns kBitonicTileUnroll elements per thread; refuse to
-  // shrink below kBitonicTileUnroll * warp so threads_per_block keeps at
-  // least one full SIMD group.
-  if (next < kBitonicTileUnroll * warp) return false;
-  desc.tile_size = static_cast<int64_t>(Pow2Floor(next));
-  // TODO(majnemer): recompute launch_dimensions for the smaller tile.
-  return true;
+  const uint64_t unroll = static_cast<uint64_t>(desc.unroll_factor);
+  // Rung 1: halve tile_size while threads_per_block stays >= one warp.
+  // Preserves bank-aware indexing when threads_per_block was bank-aligned.
+  uint64_t next = Pow2Floor(static_cast<uint64_t>(desc.tile_size) / 2);
+  if (next >= unroll * warp) {
+    // Every bundled xor_mask must stay strictly below the new tile size,
+    // otherwise the mask's compare would reach across tile boundaries.
+    bool masks_fit = true;
+    for (int64_t mask : desc.xor_masks) {
+      if (static_cast<uint64_t>(mask) >= next) {
+        masks_fit = false;
+        break;
+      }
+    }
+    if (masks_fit) {
+      desc.tile_size = static_cast<int64_t>(next);
+      RecomputeTiledLaunch(desc);
+      return true;
+    }
+  }
+  // Rung 2: tile shrink failed. Halve unroll (4 → 2) to lower per-thread
+  // register pressure; threads_per_block doubles, the next compile sees a
+  // less-loaded kernel that the PSO may grant more threads to. The bank-
+  // aware reshape naturally turns off at unroll=2 (pairs_per_thread = 1).
+  // Floor at 2: pair-compare requires >= 1 pair per thread, so unroll=1
+  // (= 0.5 pairs per thread) has no in-emitter realisation.
+  if (unroll > 2) {
+    desc.unroll_factor = 2;
+    RecomputeTiledLaunch(desc);
+    return true;
+  }
+  return false;
 }
 
 namespace {
@@ -341,23 +382,21 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
       ma::MulIOp::create(b, tile_in_sort, const_idx(tile_size));
   mlir::Value bound = const_idx(dim_to_sort_bound);
 
-  // Each thread owns `kBitonicTileUnroll` adjacent tile slots starting at
-  // `kBitonicTileUnroll * tid`, paired 1:1 with global positions in the
-  // sort dim. Build offsets + per-element bounds + global indices once so
-  // we can reuse them in both the load and the store.
+  // Each thread owns `unroll` adjacent tile slots starting at
+  // `unroll * tid`, paired 1:1 with global positions in the sort dim.
+  // Build offsets + per-element bounds + global indices once so we can
+  // reuse them in both the load and the store.
+  const int64_t unroll = desc.unroll_factor;
   auto build_global_idx = [&](mlir::Value sort_idx) {
     llvm::SmallVector<mlir::Value, 4> result(indices.begin(), indices.end());
     result[sort_dim] = sort_idx;
     return result;
   };
-  mlir::Value base_off =
-      ma::MulIOp::create(b, tid, const_idx(kBitonicTileUnroll));
-  llvm::SmallVector<mlir::Value, kBitonicTileUnroll> offs(kBitonicTileUnroll);
-  llvm::SmallVector<mlir::Value, kBitonicTileUnroll> in_bounds(
-      kBitonicTileUnroll);
-  llvm::SmallVector<llvm::SmallVector<mlir::Value, 4>, kBitonicTileUnroll>
-      global_idxs(kBitonicTileUnroll);
-  for (int64_t i = 0; i < static_cast<int64_t>(kBitonicTileUnroll); ++i) {
+  mlir::Value base_off = ma::MulIOp::create(b, tid, const_idx(unroll));
+  llvm::SmallVector<mlir::Value, 4> offs(unroll);
+  llvm::SmallVector<mlir::Value, 4> in_bounds(unroll);
+  llvm::SmallVector<llvm::SmallVector<mlir::Value, 4>, 4> global_idxs(unroll);
+  for (int64_t i = 0; i < unroll; ++i) {
     offs[i] = ma::AddIOp::create(b, base_off, const_idx(i));
     mlir::Value sort_idx = ma::AddIOp::create(b, tile_base, offs[i]);
     in_bounds[i] =
@@ -421,10 +460,9 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
                          if_op.getResults().end());
   };
 
-  // Load: each thread copies its `kBitonicTileUnroll` adjacent elements
-  // from global into the tile, then a barrier publishes the tile to the
-  // threadgroup.
-  for (int64_t i = 0; i < static_cast<int64_t>(kBitonicTileUnroll); ++i) {
+  // Load: each thread copies its `unroll` adjacent elements from global
+  // into the tile, then a barrier publishes the tile to the threadgroup.
+  for (int64_t i = 0; i < unroll; ++i) {
     emit_load(in_bounds[i], offs[i], global_idxs[i]);
   }
   auto sync_after_load =
@@ -432,11 +470,11 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
   tiles.assign(sync_after_load.getResults().begin(),
                sync_after_load.getResults().end());
 
-  constexpr int64_t kPairsPerThread = kBitonicTileUnroll / 2;
+  const int64_t pairs_per_thread = unroll / 2;
   const int64_t threads_per_block =
       desc.launch_dimensions.num_threads_per_block();
   const bool aligned_to_banks =
-      threads_per_block % gpu::kNumShmemBanks == 0 && kPairsPerThread > 1;
+      threads_per_block % gpu::kNumShmemBanks == 0 && pairs_per_thread > 1;
 
   // Compare phase: one sweep per bundled xor_mask, with a barrier between
   // sweeps so the updated tile is visible to all threads before the next
@@ -453,8 +491,8 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
       block_size = (xor_mask + 1) / 2;
     }
     // Base pair index per thread. Bank-aware shape: tile is treated as
-    // rows of (kPairsPerThread * kNumShmemBanks); each thread keeps the
-    // same bank `offset` across its `kPairsPerThread` iterations, so
+    // rows of (pairs_per_thread * kNumShmemBanks); each thread keeps the
+    // same bank `offset` across its `pairs_per_thread` iterations, so
     // intra-warp accesses never collide on a bank.
     mlir::Value epi_base;
     if (aligned_to_banks) {
@@ -462,12 +500,12 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
       mlir::Value bank_row = ma::DivUIOp::create(b, tid, banks_c);
       mlir::Value offset = ma::RemUIOp::create(b, tid, banks_c);
       mlir::Value first_in_bank_row = ma::MulIOp::create(
-          b, bank_row, const_idx(kPairsPerThread * gpu::kNumShmemBanks));
+          b, bank_row, const_idx(pairs_per_thread * gpu::kNumShmemBanks));
       epi_base = ma::AddIOp::create(b, first_in_bank_row, offset);
     } else {
-      epi_base = ma::MulIOp::create(b, tid, const_idx(kPairsPerThread));
+      epi_base = ma::MulIOp::create(b, tid, const_idx(pairs_per_thread));
     }
-    for (int64_t pair_i = 0; pair_i < kPairsPerThread; ++pair_i) {
+    for (int64_t pair_i = 0; pair_i < pairs_per_thread; ++pair_i) {
       mlir::Value pair_idx;
       if (aligned_to_banks) {
         pair_idx = ma::AddIOp::create(
@@ -548,9 +586,8 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
                  sync_after_cmp.getResults().end());
   }
 
-  // Store: each thread writes its `kBitonicTileUnroll` tile elements back
-  // to global.
-  for (int64_t i = 0; i < static_cast<int64_t>(kBitonicTileUnroll); ++i) {
+  // Store: each thread writes its `unroll` tile elements back to global.
+  for (int64_t i = 0; i < unroll; ++i) {
     emit_store(in_bounds[i], offs[i], global_idxs[i]);
   }
 
