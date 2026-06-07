@@ -756,9 +756,10 @@ class MslEmitter {
     // LLVM GPU pipeline does this in LowerTensorsPass (RewriteNonScalarConstants),
     // which we don't run; downstream tensor.extract becomes plain `arr[i]`.
     if (auto tensor_ty = mlir::dyn_cast<mlir::RankedTensorType>(ty)) {
-      if (tensor_ty.getRank() != 1) {
+      if (tensor_ty.getRank() > 1) {
         return absl::UnimplementedError(absl::StrCat(
-            "arith.constant of tensor type must be rank-1 after flatten; got ",
+            "arith.constant of tensor type must be rank-0 or rank-1 after "
+            "flatten; got ",
             mlir::debugString(ty)));
       }
       auto dense_attr =
