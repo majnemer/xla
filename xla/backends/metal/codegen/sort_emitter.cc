@@ -53,6 +53,7 @@ limitations under the License.
 #include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/service/buffer_assignment.h"
+#include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/gpu/launch_dimensions.h"
 #include "xla/service/llvm_ir/llvm_util.h"
 #include "xla/shape.h"
@@ -64,17 +65,16 @@ limitations under the License.
 namespace xla::metal {
 namespace {
 
-// Effective unroll factor for the MLIR sort kernel. The LLVM emitter uses 4
-// (each thread copies 4 adjacent elements into shared memory and runs 2
-// pair-compares). The first-pass MLIR kernel does one element pair per
-// thread per stage; set the unroll factor to 1 so PlanBitonicSort's launch
-// dimensions match.
-//
-// TODO(majnemer): bump to 4 to match CUDA. Requires emitting an inner
-// `unroll_factor`-trip loop in EmitSortStageModule that adds `i` to the
-// element_pair_index for i in [0, unroll), with optional bank-conflict-
-// aware indexing when num_threads % kNumShmemBanks == 0.
+// Per-thread element count for the non-tiled (global-memory) bitonic sort
+// kernel. Each thread does one pair-compare per dispatch, so the launch
+// shape matches an unroll factor of 1.
 constexpr uint64_t kBitonicSortUnrollFactor = 1;
+
+// Per-thread element count for the tiled (threadgroup-memory) kernel. 4
+// matches CUDA: each thread copies 4 adjacent elements into the tile and
+// runs 2 pair-compares per xor_mask. Bank-aware index reshaping kicks in
+// when threads_per_block is a multiple of gpu::kNumShmemBanks.
+constexpr uint64_t kBitonicTileUnroll = 4;
 
 uint64_t Pow2Floor(uint64_t value) {
   CHECK_GT(value, 0u);
@@ -102,14 +102,16 @@ gpu::LaunchDimensions ComputeTiledLaunchDimensions(
     int64_t dimension_to_sort_bound, int64_t tile_size,
     int64_t* num_tiles_in_sort_dim_out) {
   // One block per tile in the sort dim, per position in all other dims;
-  // threads_per_block = tile_size / 2 so each thread handles one element
-  // pair (load 2 / compare-swap 1 pair / store 2).
+  // threads_per_block = tile_size / kBitonicTileUnroll so each thread
+  // handles `kBitonicTileUnroll` elements (load + store) and
+  // `kBitonicTileUnroll / 2` pairs per xor_mask.
   uint64_t num_tiles =
       CeilOfRatio<uint64_t>(dimension_to_sort_bound, tile_size);
   Shape iteration_shape = keys_shape;
   iteration_shape.set_dimensions(dimension_to_sort, num_tiles);
   uint64_t num_blocks = ShapeUtil::ElementsIn(iteration_shape);
-  uint64_t threads_per_block = std::max<uint64_t>(1, tile_size / 2);
+  uint64_t threads_per_block =
+      std::max<uint64_t>(1, tile_size / kBitonicTileUnroll);
   *num_tiles_in_sort_dim_out = num_tiles;
   return gpu::LaunchDimensions(num_blocks, threads_per_block);
 }
@@ -152,14 +154,15 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
       std::max<uint64_t>(total_element_size, 1);
   const uint64_t max_threads_per_block = device.threads_per_block_limit();
 
-  // Tile size: power-of-two upper-bounded by (threads-per-block * 2),
-  // available shmem, and 2^num_stages. The factor of 2 reflects that the
-  // tiled body assigns one element pair per thread (so tile_size = 2 *
+  // Tile size: power-of-two upper-bounded by
+  // (threads-per-block * kBitonicTileUnroll), available shmem, and
+  // 2^num_stages. The unroll factor reflects elements per thread for the
+  // tiled body's load/store (so tile_size = kBitonicTileUnroll *
   // threads_per_block).
   uint64_t tile_size = std::min(
-      {max_threads_per_block * 2, max_tile_in_shmem,
+      {max_threads_per_block * kBitonicTileUnroll, max_tile_in_shmem,
        uint64_t{1} << num_stages});
-  tile_size = Pow2Floor(std::max<uint64_t>(tile_size, 2));
+  tile_size = Pow2Floor(std::max<uint64_t>(tile_size, kBitonicTileUnroll));
 
   // Standard (non-tiled) launch covers ceil(2^(num_stages-1)/unroll) element
   // pairs per thread along the sort dimension; one element pair compared per
@@ -244,10 +247,10 @@ bool ShrinkSortStageTile(SortStageDescription& desc,
   if (desc.tile_size == 0) return false;
   const uint64_t warp = device.threads_per_warp();
   uint64_t next = static_cast<uint64_t>(desc.tile_size) / 2;
-  // Tiled body needs >= 2 elements per tile (one pair); refuse to shrink
-  // below 2 * warp so threads_per_block = tile_size / 2 keeps at least one
-  // full SIMD group.
-  if (next < 2 * warp) return false;
+  // Tiled body assigns kBitonicTileUnroll elements per thread; refuse to
+  // shrink below kBitonicTileUnroll * warp so threads_per_block keeps at
+  // least one full SIMD group.
+  if (next < kBitonicTileUnroll * warp) return false;
   desc.tile_size = static_cast<int64_t>(Pow2Floor(next));
   // TODO(majnemer): recompute launch_dimensions for the smaller tile.
   return true;
@@ -338,24 +341,29 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
       ma::MulIOp::create(b, tile_in_sort, const_idx(tile_size));
   mlir::Value bound = const_idx(dim_to_sort_bound);
 
-  // Each thread owns positions (2*tid, 2*tid+1) in the tile and the
-  // corresponding global positions in the sort dim. Bounds-check both.
-  mlir::Value off0 = ma::MulIOp::create(b, tid, const_idx(2));
-  mlir::Value off1 = ma::AddIOp::create(b, off0, const_idx(1));
-  mlir::Value sort_idx_0 = ma::AddIOp::create(b, tile_base, off0);
-  mlir::Value sort_idx_1 = ma::AddIOp::create(b, tile_base, off1);
-  mlir::Value in_bound_0 =
-      ma::CmpIOp::create(b, ma::CmpIPredicate::ult, sort_idx_0, bound);
-  mlir::Value in_bound_1 =
-      ma::CmpIOp::create(b, ma::CmpIPredicate::ult, sort_idx_1, bound);
-
+  // Each thread owns `kBitonicTileUnroll` adjacent tile slots starting at
+  // `kBitonicTileUnroll * tid`, paired 1:1 with global positions in the
+  // sort dim. Build offsets + per-element bounds + global indices once so
+  // we can reuse them in both the load and the store.
   auto build_global_idx = [&](mlir::Value sort_idx) {
     llvm::SmallVector<mlir::Value, 4> result(indices.begin(), indices.end());
     result[sort_dim] = sort_idx;
     return result;
   };
-  llvm::SmallVector<mlir::Value, 4> global_idx_0 = build_global_idx(sort_idx_0);
-  llvm::SmallVector<mlir::Value, 4> global_idx_1 = build_global_idx(sort_idx_1);
+  mlir::Value base_off =
+      ma::MulIOp::create(b, tid, const_idx(kBitonicTileUnroll));
+  llvm::SmallVector<mlir::Value, kBitonicTileUnroll> offs(kBitonicTileUnroll);
+  llvm::SmallVector<mlir::Value, kBitonicTileUnroll> in_bounds(
+      kBitonicTileUnroll);
+  llvm::SmallVector<llvm::SmallVector<mlir::Value, 4>, kBitonicTileUnroll>
+      global_idxs(kBitonicTileUnroll);
+  for (int64_t i = 0; i < static_cast<int64_t>(kBitonicTileUnroll); ++i) {
+    offs[i] = ma::AddIOp::create(b, base_off, const_idx(i));
+    mlir::Value sort_idx = ma::AddIOp::create(b, tile_base, offs[i]);
+    in_bounds[i] =
+        ma::CmpIOp::create(b, ma::CmpIPredicate::ult, sort_idx, bound);
+    global_idxs[i] = build_global_idx(sort_idx);
+  }
 
   llvm::SmallVector<mlir::Value, 4> entry_tensors(
       entry_block->getArguments().begin(), entry_block->getArguments().end());
@@ -413,90 +421,126 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
                          if_op.getResults().end());
   };
 
-  // Load: each thread copies its two adjacent elements from global into the
-  // tile, then a barrier publishes the tile to the threadgroup.
-  emit_load(in_bound_0, off0, global_idx_0);
-  emit_load(in_bound_1, off1, global_idx_1);
+  // Load: each thread copies its `kBitonicTileUnroll` adjacent elements
+  // from global into the tile, then a barrier publishes the tile to the
+  // threadgroup.
+  for (int64_t i = 0; i < static_cast<int64_t>(kBitonicTileUnroll); ++i) {
+    emit_load(in_bounds[i], offs[i], global_idxs[i]);
+  }
   auto sync_after_load =
       ::xla::gpu::SyncThreadsOp::create(b, tile_types, tiles);
   tiles.assign(sync_after_load.getResults().begin(),
                sync_after_load.getResults().end());
 
+  constexpr int64_t kPairsPerThread = kBitonicTileUnroll / 2;
+  const int64_t threads_per_block =
+      desc.launch_dimensions.num_threads_per_block();
+  const bool aligned_to_banks =
+      threads_per_block % gpu::kNumShmemBanks == 0 && kPairsPerThread > 1;
+
   // Compare phase: one sweep per bundled xor_mask, with a barrier between
   // sweeps so the updated tile is visible to all threads before the next
-  // mask reads it. The bounds check uses the global positions so partial
-  // tiles at the tail of the sort dim don't shuffle phantom pairs.
-  for (int64_t mask_idx = 0; mask_idx < desc.xor_masks.size(); ++mask_idx) {
+  // mask reads it. Each sweep runs `kPairsPerThread` pair-compares per
+  // thread; pair indices come from a bank-aware reshape when
+  // threads_per_block aligns to gpu::kNumShmemBanks, otherwise from a
+  // consecutive layout. The bounds check uses the global positions so
+  // partial tiles at the tail of the sort dim don't shuffle phantom pairs.
+  for (int64_t mask_idx = 0;
+       mask_idx < static_cast<int64_t>(desc.xor_masks.size()); ++mask_idx) {
     const int64_t xor_mask = desc.xor_masks[mask_idx];
     int64_t block_size = xor_mask;
     if (xor_mask > 1 && (xor_mask & (xor_mask + 1)) == 0) {
       block_size = (xor_mask + 1) / 2;
     }
-    mlir::Value tile_current = DeriveCurrentTileIndex(b, tid, block_size);
-    mlir::Value tile_compare =
-        ma::XOrIOp::create(b, tile_current, const_idx(xor_mask));
-    mlir::Value global_current =
-        ma::AddIOp::create(b, tile_base, tile_current);
-    mlir::Value global_compare =
-        ma::AddIOp::create(b, tile_base, tile_compare);
-    mlir::Value cur_in =
-        ma::CmpIOp::create(b, ma::CmpIPredicate::ult, global_current, bound);
-    mlir::Value cmp_in =
-        ma::CmpIOp::create(b, ma::CmpIPredicate::ult, global_compare, bound);
-    mlir::Value in_bound = ma::AndIOp::create(b, cur_in, cmp_in);
+    // Base pair index per thread. Bank-aware shape: tile is treated as
+    // rows of (kPairsPerThread * kNumShmemBanks); each thread keeps the
+    // same bank `offset` across its `kPairsPerThread` iterations, so
+    // intra-warp accesses never collide on a bank.
+    mlir::Value epi_base;
+    if (aligned_to_banks) {
+      mlir::Value banks_c = const_idx(gpu::kNumShmemBanks);
+      mlir::Value bank_row = ma::DivUIOp::create(b, tid, banks_c);
+      mlir::Value offset = ma::RemUIOp::create(b, tid, banks_c);
+      mlir::Value first_in_bank_row = ma::MulIOp::create(
+          b, bank_row, const_idx(kPairsPerThread * gpu::kNumShmemBanks));
+      epi_base = ma::AddIOp::create(b, first_in_bank_row, offset);
+    } else {
+      epi_base = ma::MulIOp::create(b, tid, const_idx(kPairsPerThread));
+    }
+    for (int64_t pair_i = 0; pair_i < kPairsPerThread; ++pair_i) {
+      mlir::Value pair_idx;
+      if (aligned_to_banks) {
+        pair_idx = ma::AddIOp::create(
+            b, epi_base, const_idx(pair_i * gpu::kNumShmemBanks));
+      } else {
+        pair_idx = ma::AddIOp::create(b, epi_base, const_idx(pair_i));
+      }
+      mlir::Value tile_current = DeriveCurrentTileIndex(b, pair_idx, block_size);
+      mlir::Value tile_compare =
+          ma::XOrIOp::create(b, tile_current, const_idx(xor_mask));
+      mlir::Value global_current =
+          ma::AddIOp::create(b, tile_base, tile_current);
+      mlir::Value global_compare =
+          ma::AddIOp::create(b, tile_base, tile_compare);
+      mlir::Value cur_in =
+          ma::CmpIOp::create(b, ma::CmpIPredicate::ult, global_current, bound);
+      mlir::Value cmp_in =
+          ma::CmpIOp::create(b, ma::CmpIPredicate::ult, global_compare, bound);
+      mlir::Value in_bound = ma::AndIOp::create(b, cur_in, cmp_in);
 
-    auto cmp_if = mlir::scf::IfOp::create(b, tile_types, in_bound,
-                                          /*withElseRegion=*/true);
-    {
-      mlir::OpBuilder::InsertionGuard g(b);
-      b.setInsertionPointToStart(cmp_if.thenBlock());
-      llvm::SmallVector<mlir::Value, 4> compare_args;
-      llvm::SmallVector<mlir::Value, 4> v_compare(operand_count);
-      llvm::SmallVector<mlir::Value, 4> v_current(operand_count);
-      llvm::SmallVector<mlir::Value, 1> cur_pos{tile_current};
-      llvm::SmallVector<mlir::Value, 1> cmp_pos{tile_compare};
-      compare_args.reserve(2 * operand_count);
-      for (int64_t i = 0; i < operand_count; ++i) {
-        v_compare[i] = mlir::tensor::ExtractOp::create(b, tiles[i], cmp_pos);
-        v_current[i] = mlir::tensor::ExtractOp::create(b, tiles[i], cur_pos);
-        compare_args.push_back(v_compare[i]);
-        compare_args.push_back(v_current[i]);
-      }
-      mlir::Value cmp_result =
-          mlir::func::CallOp::create(b, comparator_func, compare_args)
-              .getResult(0);
-      mlir::Value cmp_i1 = ma::CmpIOp::create(
-          b, ma::CmpIPredicate::ne, cmp_result,
-          ma::ConstantOp::create(b, cmp_result.getType(),
-                                 b.getIntegerAttr(cmp_result.getType(), 0))
-              .getResult());
-      auto swap_if = mlir::scf::IfOp::create(b, tile_types, cmp_i1,
-                                             /*withElseRegion=*/true);
+      auto cmp_if = mlir::scf::IfOp::create(b, tile_types, in_bound,
+                                            /*withElseRegion=*/true);
       {
-        mlir::OpBuilder::InsertionGuard sg(b);
-        b.setInsertionPointToStart(swap_if.thenBlock());
-        llvm::SmallVector<mlir::Value, 4> swapped;
+        mlir::OpBuilder::InsertionGuard g(b);
+        b.setInsertionPointToStart(cmp_if.thenBlock());
+        llvm::SmallVector<mlir::Value, 4> compare_args;
+        llvm::SmallVector<mlir::Value, 4> v_compare(operand_count);
+        llvm::SmallVector<mlir::Value, 4> v_current(operand_count);
+        llvm::SmallVector<mlir::Value, 1> cur_pos{tile_current};
+        llvm::SmallVector<mlir::Value, 1> cmp_pos{tile_compare};
+        compare_args.reserve(2 * operand_count);
         for (int64_t i = 0; i < operand_count; ++i) {
-          mlir::Value t = mlir::tensor::InsertOp::create(b, v_current[i],
-                                                         tiles[i], cmp_pos);
-          t = mlir::tensor::InsertOp::create(b, v_compare[i], t, cur_pos);
-          swapped.push_back(t);
+          v_compare[i] = mlir::tensor::ExtractOp::create(b, tiles[i], cmp_pos);
+          v_current[i] = mlir::tensor::ExtractOp::create(b, tiles[i], cur_pos);
+          compare_args.push_back(v_compare[i]);
+          compare_args.push_back(v_current[i]);
         }
-        mlir::scf::YieldOp::create(b, swapped);
+        mlir::Value cmp_result =
+            mlir::func::CallOp::create(b, comparator_func, compare_args)
+                .getResult(0);
+        mlir::Value cmp_i1 = ma::CmpIOp::create(
+            b, ma::CmpIPredicate::ne, cmp_result,
+            ma::ConstantOp::create(b, cmp_result.getType(),
+                                   b.getIntegerAttr(cmp_result.getType(), 0))
+                .getResult());
+        auto swap_if = mlir::scf::IfOp::create(b, tile_types, cmp_i1,
+                                               /*withElseRegion=*/true);
+        {
+          mlir::OpBuilder::InsertionGuard sg(b);
+          b.setInsertionPointToStart(swap_if.thenBlock());
+          llvm::SmallVector<mlir::Value, 4> swapped;
+          for (int64_t i = 0; i < operand_count; ++i) {
+            mlir::Value t = mlir::tensor::InsertOp::create(b, v_current[i],
+                                                           tiles[i], cmp_pos);
+            t = mlir::tensor::InsertOp::create(b, v_compare[i], t, cur_pos);
+            swapped.push_back(t);
+          }
+          mlir::scf::YieldOp::create(b, swapped);
+        }
+        {
+          mlir::OpBuilder::InsertionGuard sg(b);
+          b.setInsertionPointToStart(swap_if.elseBlock());
+          mlir::scf::YieldOp::create(b, tiles);
+        }
+        mlir::scf::YieldOp::create(b, swap_if.getResults());
       }
       {
-        mlir::OpBuilder::InsertionGuard sg(b);
-        b.setInsertionPointToStart(swap_if.elseBlock());
+        mlir::OpBuilder::InsertionGuard g(b);
+        b.setInsertionPointToStart(cmp_if.elseBlock());
         mlir::scf::YieldOp::create(b, tiles);
       }
-      mlir::scf::YieldOp::create(b, swap_if.getResults());
+      tiles.assign(cmp_if.getResults().begin(), cmp_if.getResults().end());
     }
-    {
-      mlir::OpBuilder::InsertionGuard g(b);
-      b.setInsertionPointToStart(cmp_if.elseBlock());
-      mlir::scf::YieldOp::create(b, tiles);
-    }
-    tiles.assign(cmp_if.getResults().begin(), cmp_if.getResults().end());
 
     auto sync_after_cmp =
         ::xla::gpu::SyncThreadsOp::create(b, tile_types, tiles);
@@ -504,9 +548,11 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
                  sync_after_cmp.getResults().end());
   }
 
-  // Store: each thread writes its two tile elements back to global.
-  emit_store(in_bound_0, off0, global_idx_0);
-  emit_store(in_bound_1, off1, global_idx_1);
+  // Store: each thread writes its `kBitonicTileUnroll` tile elements back
+  // to global.
+  for (int64_t i = 0; i < static_cast<int64_t>(kBitonicTileUnroll); ++i) {
+    emit_store(in_bounds[i], offs[i], global_idxs[i]);
+  }
 
   b.setInsertionPointToEnd(entry_block);
   mlir::func::ReturnOp::create(b, entry_tensors);

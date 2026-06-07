@@ -96,6 +96,7 @@ cc_library(
         "//xla/codegen/emitters:type_util",
         "//xla/hlo/ir:hlo",
         "//xla/service:buffer_assignment",
+        "//xla/service/gpu:ir_emission_utils",
         "//xla/service/gpu:launch_dimensions",
         "//xla/service/llvm_ir:llvm_util",
         "//xla/stream_executor:device_description",
