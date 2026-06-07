@@ -191,10 +191,10 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
 
   std::vector<SortStageDescription> stages;
   bool emit_iota_operands = true;
-  auto emit_stage = [&](int64_t xor_mask, bool tiled) {
+  auto emit_stage = [&](std::vector<int64_t> xor_masks, bool tiled) {
     SortStageDescription stage{
         /*sort=*/sort,
-        /*xor_masks=*/{xor_mask},
+        /*xor_masks=*/std::move(xor_masks),
         /*tile_size=*/tiled ? static_cast<int64_t>(tile_size) : 0,
         /*num_iterations_in_sort_dim=*/
         tiled ? tiled_num_tiles_in_sort_dim
@@ -209,19 +209,30 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
     emit_iota_operands = false;
   };
 
-  // One stage per xor_mask. Small masks (< tile_size) route through
-  // threadgroup memory; large masks stream directly through global memory.
-  // TODO(majnemer): bundle adjacent small masks into a single multi-mask
-  // tiled stage to amortise the load/store round trip.
+  // Adjacent xor_masks below tile_size accumulate into one tiled stage
+  // (single tile load+store amortised across all bundled masks). When a
+  // mask >= tile_size appears, flush the bundle and emit the big mask as
+  // its own global-memory pass.
+  std::vector<int64_t> pending;
+  auto flush_pending = [&]() {
+    if (pending.empty()) return;
+    emit_stage(std::move(pending), /*tiled=*/true);
+    pending.clear();
+  };
   for (int64_t stage_idx = 0; stage_idx < num_stages; ++stage_idx) {
     for (int64_t mask = stage_idx; mask >= 0; --mask) {
       int64_t xor_mask =
           (mask == stage_idx) ? ((int64_t{1} << (stage_idx + 1)) - 1)
                               : (int64_t{1} << mask);
-      bool tiled = static_cast<uint64_t>(xor_mask) < tile_size;
-      emit_stage(xor_mask, tiled);
+      if (static_cast<uint64_t>(xor_mask) < tile_size) {
+        pending.push_back(xor_mask);
+      } else {
+        flush_pending();
+        emit_stage({xor_mask}, /*tiled=*/false);
+      }
     }
   }
+  flush_pending();
   return stages;
 }
 
@@ -283,13 +294,8 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
   const int64_t tile_size = desc.tile_size;
   const int64_t num_tiles_in_sort = desc.num_iterations_in_sort_dim;
   const int64_t operand_count = desc.sort->operand_count();
-  TF_RET_CHECK(desc.xor_masks.size() == 1)
-      << "multi-mask tiled stages not yet supported";
-  const int64_t xor_mask = desc.xor_masks[0];
-  int64_t block_size = xor_mask;
-  if (xor_mask > 1 && (xor_mask & (xor_mask + 1)) == 0) {
-    block_size = (xor_mask + 1) / 2;
-  }
+  TF_RET_CHECK(!desc.xor_masks.empty())
+      << "tiled stage requires at least one xor_mask";
 
   mlir::Block* entry_block = entry_func.addEntryBlock();
   b.setInsertionPointToStart(entry_block);
@@ -416,77 +422,87 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
   tiles.assign(sync_after_load.getResults().begin(),
                sync_after_load.getResults().end());
 
-  // Compare phase: derive (current, compare) inside the tile from tid using
-  // the bitonic block-size rule. Bounds check uses the global positions so
-  // partial tiles at the tail of the sort dim don't shuffle phantom pairs.
-  mlir::Value tile_current = DeriveCurrentTileIndex(b, tid, block_size);
-  mlir::Value tile_compare =
-      ma::XOrIOp::create(b, tile_current, const_idx(xor_mask));
-  mlir::Value global_current = ma::AddIOp::create(b, tile_base, tile_current);
-  mlir::Value global_compare = ma::AddIOp::create(b, tile_base, tile_compare);
-  mlir::Value cur_in =
-      ma::CmpIOp::create(b, ma::CmpIPredicate::ult, global_current, bound);
-  mlir::Value cmp_in =
-      ma::CmpIOp::create(b, ma::CmpIPredicate::ult, global_compare, bound);
-  mlir::Value in_bound = ma::AndIOp::create(b, cur_in, cmp_in);
+  // Compare phase: one sweep per bundled xor_mask, with a barrier between
+  // sweeps so the updated tile is visible to all threads before the next
+  // mask reads it. The bounds check uses the global positions so partial
+  // tiles at the tail of the sort dim don't shuffle phantom pairs.
+  for (int64_t mask_idx = 0; mask_idx < desc.xor_masks.size(); ++mask_idx) {
+    const int64_t xor_mask = desc.xor_masks[mask_idx];
+    int64_t block_size = xor_mask;
+    if (xor_mask > 1 && (xor_mask & (xor_mask + 1)) == 0) {
+      block_size = (xor_mask + 1) / 2;
+    }
+    mlir::Value tile_current = DeriveCurrentTileIndex(b, tid, block_size);
+    mlir::Value tile_compare =
+        ma::XOrIOp::create(b, tile_current, const_idx(xor_mask));
+    mlir::Value global_current =
+        ma::AddIOp::create(b, tile_base, tile_current);
+    mlir::Value global_compare =
+        ma::AddIOp::create(b, tile_base, tile_compare);
+    mlir::Value cur_in =
+        ma::CmpIOp::create(b, ma::CmpIPredicate::ult, global_current, bound);
+    mlir::Value cmp_in =
+        ma::CmpIOp::create(b, ma::CmpIPredicate::ult, global_compare, bound);
+    mlir::Value in_bound = ma::AndIOp::create(b, cur_in, cmp_in);
 
-  auto cmp_if = mlir::scf::IfOp::create(b, tile_types, in_bound,
-                                        /*withElseRegion=*/true);
-  {
-    mlir::OpBuilder::InsertionGuard g(b);
-    b.setInsertionPointToStart(cmp_if.thenBlock());
-    llvm::SmallVector<mlir::Value, 4> compare_args;
-    llvm::SmallVector<mlir::Value, 4> v_compare(operand_count);
-    llvm::SmallVector<mlir::Value, 4> v_current(operand_count);
-    llvm::SmallVector<mlir::Value, 1> cur_pos{tile_current};
-    llvm::SmallVector<mlir::Value, 1> cmp_pos{tile_compare};
-    compare_args.reserve(2 * operand_count);
-    for (int64_t i = 0; i < operand_count; ++i) {
-      v_compare[i] = mlir::tensor::ExtractOp::create(b, tiles[i], cmp_pos);
-      v_current[i] = mlir::tensor::ExtractOp::create(b, tiles[i], cur_pos);
-      compare_args.push_back(v_compare[i]);
-      compare_args.push_back(v_current[i]);
-    }
-    mlir::Value cmp_result =
-        mlir::func::CallOp::create(b, comparator_func, compare_args)
-            .getResult(0);
-    mlir::Value cmp_i1 = ma::CmpIOp::create(
-        b, ma::CmpIPredicate::ne, cmp_result,
-        ma::ConstantOp::create(b, cmp_result.getType(),
-                               b.getIntegerAttr(cmp_result.getType(), 0))
-            .getResult());
-    auto swap_if = mlir::scf::IfOp::create(b, tile_types, cmp_i1,
-                                           /*withElseRegion=*/true);
+    auto cmp_if = mlir::scf::IfOp::create(b, tile_types, in_bound,
+                                          /*withElseRegion=*/true);
     {
-      mlir::OpBuilder::InsertionGuard sg(b);
-      b.setInsertionPointToStart(swap_if.thenBlock());
-      llvm::SmallVector<mlir::Value, 4> swapped;
+      mlir::OpBuilder::InsertionGuard g(b);
+      b.setInsertionPointToStart(cmp_if.thenBlock());
+      llvm::SmallVector<mlir::Value, 4> compare_args;
+      llvm::SmallVector<mlir::Value, 4> v_compare(operand_count);
+      llvm::SmallVector<mlir::Value, 4> v_current(operand_count);
+      llvm::SmallVector<mlir::Value, 1> cur_pos{tile_current};
+      llvm::SmallVector<mlir::Value, 1> cmp_pos{tile_compare};
+      compare_args.reserve(2 * operand_count);
       for (int64_t i = 0; i < operand_count; ++i) {
-        mlir::Value t = mlir::tensor::InsertOp::create(b, v_current[i],
-                                                       tiles[i], cmp_pos);
-        t = mlir::tensor::InsertOp::create(b, v_compare[i], t, cur_pos);
-        swapped.push_back(t);
+        v_compare[i] = mlir::tensor::ExtractOp::create(b, tiles[i], cmp_pos);
+        v_current[i] = mlir::tensor::ExtractOp::create(b, tiles[i], cur_pos);
+        compare_args.push_back(v_compare[i]);
+        compare_args.push_back(v_current[i]);
       }
-      mlir::scf::YieldOp::create(b, swapped);
+      mlir::Value cmp_result =
+          mlir::func::CallOp::create(b, comparator_func, compare_args)
+              .getResult(0);
+      mlir::Value cmp_i1 = ma::CmpIOp::create(
+          b, ma::CmpIPredicate::ne, cmp_result,
+          ma::ConstantOp::create(b, cmp_result.getType(),
+                                 b.getIntegerAttr(cmp_result.getType(), 0))
+              .getResult());
+      auto swap_if = mlir::scf::IfOp::create(b, tile_types, cmp_i1,
+                                             /*withElseRegion=*/true);
+      {
+        mlir::OpBuilder::InsertionGuard sg(b);
+        b.setInsertionPointToStart(swap_if.thenBlock());
+        llvm::SmallVector<mlir::Value, 4> swapped;
+        for (int64_t i = 0; i < operand_count; ++i) {
+          mlir::Value t = mlir::tensor::InsertOp::create(b, v_current[i],
+                                                         tiles[i], cmp_pos);
+          t = mlir::tensor::InsertOp::create(b, v_compare[i], t, cur_pos);
+          swapped.push_back(t);
+        }
+        mlir::scf::YieldOp::create(b, swapped);
+      }
+      {
+        mlir::OpBuilder::InsertionGuard sg(b);
+        b.setInsertionPointToStart(swap_if.elseBlock());
+        mlir::scf::YieldOp::create(b, tiles);
+      }
+      mlir::scf::YieldOp::create(b, swap_if.getResults());
     }
     {
-      mlir::OpBuilder::InsertionGuard sg(b);
-      b.setInsertionPointToStart(swap_if.elseBlock());
+      mlir::OpBuilder::InsertionGuard g(b);
+      b.setInsertionPointToStart(cmp_if.elseBlock());
       mlir::scf::YieldOp::create(b, tiles);
     }
-    mlir::scf::YieldOp::create(b, swap_if.getResults());
-  }
-  {
-    mlir::OpBuilder::InsertionGuard g(b);
-    b.setInsertionPointToStart(cmp_if.elseBlock());
-    mlir::scf::YieldOp::create(b, tiles);
-  }
-  tiles.assign(cmp_if.getResults().begin(), cmp_if.getResults().end());
+    tiles.assign(cmp_if.getResults().begin(), cmp_if.getResults().end());
 
-  auto sync_after_cmp =
-      ::xla::gpu::SyncThreadsOp::create(b, tile_types, tiles);
-  tiles.assign(sync_after_cmp.getResults().begin(),
-               sync_after_cmp.getResults().end());
+    auto sync_after_cmp =
+        ::xla::gpu::SyncThreadsOp::create(b, tile_types, tiles);
+    tiles.assign(sync_after_cmp.getResults().begin(),
+                 sync_after_cmp.getResults().end());
+  }
 
   // Store: each thread writes its two tile elements back to global.
   emit_store(in_bound_0, off0, global_idx_0);
@@ -558,14 +574,8 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
   mlir::func::FuncOp comparator_func =
       comparator_call_targets(comparator->root_instruction());
 
-  // TODO(majnemer): bundle adjacent small xor_masks into a single tiled
-  // stage to amortise the load/store round trip.
-  if (desc.xor_masks.size() != 1) {
-    return absl::UnimplementedError(absl::StrCat(
-        "MetalCompiler::EmitSortStageModule: multi-mask tiled stages are not "
-        "yet supported (entry '",
-        desc.entry_name, "')."));
-  }
+  TF_RET_CHECK(desc.tile_size != 0 || desc.xor_masks.size() == 1)
+      << "non-tiled stages emit one mask per kernel";
 
   // TODO(majnemer): emit iota inline. EmitCompareLoopBody (sort_util.cc)
   // checks `emit_iota_operands && operand is kIota` and calls EmitIota
