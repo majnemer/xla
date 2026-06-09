@@ -82,7 +82,8 @@ absl::Status MetalCompiler::OptimizeHloPostLayoutAssignment(
     const CompileOptions& options,
     const xla::gpu::GpuTargetConfig& gpu_target_config,
     const xla::gpu::GpuAliasInfo* alias_info,
-    tsl::thread::ThreadPool* thread_pool, CompilationStats* compilation_stats) {
+    tsl::thread::ThreadPool* thread_pool, CompilationStats* compilation_stats,
+    mlir::MLIRContext* mlir_context) {
   // Widen low-precision types the MSL emitter cannot lower. The base
   // GpuCompiler's float_normalization sub-pipeline keys its decisions off
   // CUDA/ROCm compute capabilities and would otherwise leave many of these
@@ -118,7 +119,7 @@ absl::Status MetalCompiler::OptimizeHloPostLayoutAssignment(
 
   return xla::gpu::GpuCompiler::OptimizeHloPostLayoutAssignment(
       hlo_module, stream_exec, options, gpu_target_config, alias_info,
-      thread_pool, compilation_stats);
+      thread_pool, compilation_stats, mlir_context);
 }
 
 void MetalCompiler::AddGemmRewriteCustomCallPasses(
@@ -154,9 +155,9 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
   // scheduler, scheduled-module verifier, post-scheduling pipelines), then
   // use SequentialHloOrdering off the resulting schedule for buffer
   // assignment — same shape as the LLVM-flavored GPU path.
-  TF_RETURN_IF_ERROR(
-      ScheduleAndVerify(hlo_module.get(), gpu_topology, alias_info.get())
-          .status());
+  TF_RETURN_IF_ERROR(ScheduleAndVerify(hlo_module.get(), gpu_topology,
+                                       alias_info.get(), mlir_context())
+                         .status());
 
   BufferAssigner::Options buffer_assigner_options;
   // Match compile_module_to_llvm_ir.cc:180 — without this, BufferAssigner

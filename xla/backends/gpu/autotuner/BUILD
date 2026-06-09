@@ -547,6 +547,7 @@ cc_library(
         "//xla/backends/autotuner:codegen_backend",
         "//xla/hlo/analysis:alias_info",
         "//xla/service:compiler",
+        "//xla/service:hlo_cost_analysis",
         "//xla/stream_executor:device_address_allocator",
         "//xla/stream_executor:stream_executor_h",
         "//xla/stream_executor/metal:metal_platform_id",

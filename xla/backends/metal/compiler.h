@@ -53,7 +53,8 @@ class MetalCompiler : public xla::gpu::GpuCompiler {
       const xla::gpu::GpuTargetConfig& gpu_target_config,
       const xla::gpu::GpuAliasInfo* alias_info,
       tsl::thread::ThreadPool* thread_pool,
-      CompilationStats* compilation_stats) override;
+      CompilationStats* compilation_stats,
+      mlir::MLIRContext* mlir_context) override;
 
   void AddGemmRewriteCustomCallPasses(
       HloPassPipeline& pipeline, const DebugOptions& debug_options,

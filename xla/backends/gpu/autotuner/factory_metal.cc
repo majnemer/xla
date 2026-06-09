@@ -23,6 +23,7 @@ limitations under the License.
 #include "xla/backends/gpu/autotuner/factory.h"
 #include "xla/hlo/analysis/alias_info.h"
 #include "xla/service/compiler.h"
+#include "xla/service/hlo_cost_analysis.h"
 #include "xla/stream_executor/device_address_allocator.h"
 #include "xla/stream_executor/metal/metal_platform_id.h"
 #include "xla/stream_executor/platform/platform_object_registry.h"
@@ -42,6 +43,7 @@ std::vector<std::unique_ptr<CodegenBackend>> GetCodegenBackendsForMetal(
     const DebugOptions* /*debug_options*/, Compiler* /*compiler*/,
     const Compiler::GpuTargetConfig* /*target_config*/,
     const AliasInfo* /*alias_info*/, mlir::MLIRContext* /*mlir_context*/,
+    HloCostAnalysis::ShapeSizeFunction /*shape_size_fn*/,
     absl::Span<const autotuner::Backend> /*backend_allowlist*/) {
   return {};
 }

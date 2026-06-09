@@ -89,6 +89,11 @@ class GpuCompiler : public Compiler {
       std::unique_ptr<HloModule> module, se::StreamExecutor* stream_exec,
       const CompileOptions& options) override;
 
+  absl::StatusOr<std::vector<std::unique_ptr<Executable>>> Compile(
+      std::unique_ptr<HloModule> hlo_module,
+      std::vector<se::StreamExecutor*> stream_execs,
+      const CompileOptions& options) override;
+
   absl::StatusOr<std::vector<std::unique_ptr<CompiledModule>>>
   CompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,
                      AotCompilationOptions const& options) override;
@@ -149,6 +154,8 @@ class GpuCompiler : public Compiler {
   absl::StatusOr<ScheduleMetadata> ScheduleAndVerify(
       HloModule* module, const GpuTopology& gpu_topology,
       const GpuAliasInfo* alias_info, mlir::MLIRContext* mlir_context);
+
+  mlir::MLIRContext* mlir_context() { return &mlir_context_; }
 
   void CallUserAsmHook(absl::string_view asm_text) {
     absl::MutexLock lock(user_asm_hook_m_);
