@@ -87,6 +87,22 @@ class MetalCompiler : public xla::gpu::GpuCompiler {
     return absl::OkStatus();
   }
 
+  // Conv+GEMM autotuner shares the same empty-backends rejection; skip it on
+  // Metal for the same reason.
+  absl::Status AddConvAndGemmAutotuningPass(
+      HloPassPipeline* pipeline, HloModule* hlo_module,
+      const se::GpuComputeCapability& gpu_version,
+      const CompileOptions& options, tsl::thread::ThreadPool* thread_pool,
+      se::StreamExecutor* stream_exec,
+      const xla::gpu::GpuTargetConfig* target_config,
+      const MultiProcessKeyValueStore& key_value_store,
+      const se::SemanticVersion& toolkit_version,
+      const AliasInfo* alias_info, const DebugOptions& debug_options,
+      mlir::MLIRContext* mlir_context,
+      HloCostAnalysis::ShapeSizeFunction shape_size_fn) override {
+    return absl::OkStatus();
+  }
+
   // Produces the GpuExecutable. Until MSL emission for compute ops lands,
   // only HLO modules whose entry computation is parameter-only are
   // supported; compute opcodes are rejected with Unimplemented up front.
