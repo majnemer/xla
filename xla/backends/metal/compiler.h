@@ -71,6 +71,22 @@ class MetalCompiler : public xla::gpu::GpuCompiler {
       se::GpuComputeCapability gpu_version,
       const se::SemanticVersion& toolkit_version) override;
 
+  // Metal has no cuDNN / cuBLAS / Triton-style backends to autotune over —
+  // factory_metal returns an empty backend list. The shared AutotunerPass::
+  // Create rejects empty backends as an error, so we short-circuit here and
+  // skip adding the autotuner pass altogether.
+  absl::Status AddAutotunerPass(
+      HloPassPipeline* pipeline, HloModule* hlo_module,
+      const se::GpuComputeCapability& gpu_version,
+      const CompileOptions& options, tsl::thread::ThreadPool* thread_pool,
+      stream_executor::StreamExecutor* stream_executor,
+      const xla::gpu::GpuTargetConfig* target_config,
+      const AliasInfo* alias_info, mlir::MLIRContext* mlir_context,
+      HloCostAnalysis::ShapeSizeFunction shape_size_fn,
+      const MultiProcessKeyValueStore& key_value_store) override {
+    return absl::OkStatus();
+  }
+
   // Produces the GpuExecutable. Until MSL emission for compute ops lands,
   // only HLO modules whose entry computation is parameter-only are
   // supported; compute opcodes are rejected with Unimplemented up front.
