@@ -695,6 +695,11 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
       pm.addPass(mlir::createLoopInvariantCodeMotionPass());
       pm.addPass(mlir::createSymbolDCEPass());
       pm.addPass(mlir::createCSEPass());
+      // Lower complex math (complex.tan/exp/log1p/...) into arith on the
+      // real/imag parts BEFORE the Metal-specific complex-to-arith-math pass
+      // rewrites func.call signatures — otherwise complex ops survive past
+      // lowering and the MSL translator rejects them.
+      pm.addPass(mlir::createConvertComplexToStandardPass());
       pm.addPass(CreateConvertComplexToArithMathPass());
       pm.addPass(emitters::CreateExpandFloatOpsPass());
       pm.addPass(CreateExpandFloatOpsPass());
