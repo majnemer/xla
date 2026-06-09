@@ -18,6 +18,7 @@ limitations under the License.
 // (passthrough). Subsequent wedges add real kernel emission for compute
 // ops.
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -235,6 +236,62 @@ TEST(MetalCompilerExecutableTest, ExecuteAddProducesElementwiseSum) {
 
   executor->Deallocate(&a_dev);
   executor->Deallocate(&b_dev);
+}
+
+// The RNG state is a module global seeded once per (executable, executor)
+// and advanced by `delta` on each rng-get-and-update-state launch. Two
+// executions of the same executable must observe the seed, then seed+delta —
+// proving seed-once semantics and cross-execution persistence (a re-seeding
+// or per-execution-allocation bug would return the seed twice).
+TEST(MetalCompilerExecutableTest, RngStateAdvancesAcrossExecutions) {
+  se::StreamExecutor* executor = GetMetalExecutorOrFail();
+  ASSERT_NE(executor, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Stream> stream,
+                          executor->CreateStream());
+
+  constexpr uint64_t kSeed = 0x7012395;
+  constexpr uint64_t kDelta = 7;
+  constexpr absl::string_view kRngHlo = R"hlo(
+    HloModule rng_state
+    ENTRY main {
+      ROOT r = u64[2] rng-get-and-update-state(), delta=7
+    }
+  )hlo";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnUnverifiedModule(kRngHlo));
+
+  MetalCompiler compiler;
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<Executable> executable,
+      compiler.RunBackend(std::move(module), executor,
+                          Compiler::CompileOptions{}));
+
+  se::StreamExecutorAddressAllocator allocator(executor);
+  ExecutableRunOptions run_options;
+  run_options.set_stream(stream.get());
+  run_options.set_allocator(&allocator);
+  run_options.set_device_ordinal(0);
+  ServiceExecutableRunOptions service_run_options(run_options);
+
+  auto run_once = [&]() -> absl::StatusOr<std::array<uint64_t, 2>> {
+    TF_ASSIGN_OR_RETURN(
+        ScopedShapedBuffer result,
+        executable->ExecuteAsyncOnStream(
+            &service_run_options, std::vector<const ShapedBuffer*>{}));
+    std::array<uint64_t, 2> readback = {0, 0};
+    TF_RETURN_IF_ERROR(stream->Memcpy(readback.data(), result.root_buffer(),
+                                      sizeof(readback)));
+    TF_RETURN_IF_ERROR(stream->BlockHostUntilDone());
+    return readback;
+  };
+
+  TF_ASSERT_OK_AND_ASSIGN(auto first, run_once());
+  EXPECT_EQ(first[0], kSeed);
+  EXPECT_EQ(first[1], 0u);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto second, run_once());
+  EXPECT_EQ(second[0], kSeed + kDelta);
+  EXPECT_EQ(second[1], 0u);
 }
 
 }  // namespace
