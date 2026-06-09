@@ -669,9 +669,9 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
       if (mlir_fusion == nullptr) {
         return Unimplemented(
             "MetalCompiler::CompileToBackendResult: fusion '%s' uses a "
-            "non-MLIR emitter (e.g. Triton / CustomFusion); only MLIR-"
-            "kernel fusions are supported on Metal.",
-            deferred.fusion_name);
+            "non-MLIR emitter (%s); only MLIR-kernel fusions are "
+            "supported on Metal.",
+            deferred.fusion_name, typeid(*emitter).name());
       }
       TF_ASSIGN_OR_RETURN(MlirKernelSource mlir_source,
                           mlir_fusion->mlir_kernel_emitter()->Emit(
