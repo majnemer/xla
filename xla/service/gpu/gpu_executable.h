@@ -90,6 +90,23 @@ class GpuExecutable : public Executable {
     int communication = 0;
   };
 
+  // Record of a named module-scope global: a device buffer that the runtime
+  // allocates (or resolves) per executor via ResolveConstantGlobals —
+  // module_spec.AddConstant + LoadModule + GetSymbol — seeds once from
+  // `content`, and keeps address-stable for the executable's lifetime.
+  //
+  // The first and most common producer is HLO kConstant lowering, where
+  // `content` is immutable literal data. But immutability is a property of
+  // that producer, not of the channel: backend compilers also register
+  // mutable module-scoped state here (e.g. Metal's rng-get-and-update-state
+  // counter, seeded from `content` and advanced by its kernel). Runtime
+  // consumers key on address stability via BufferAllocation::is_constant(),
+  // never on content immutability.
+  //
+  // `allocation_index` ties the resolved device address to a BufferAllocation
+  // so it surfaces through BufferAllocations::GetDeviceAddress like any other
+  // slice (see BufferForAllocation's is_constant() branch). Allocations with
+  // no HLO operand backing come from Params::extra_allocations.
   struct ConstantInfo {
     std::string symbol_name;
     DenseDataIntermediate content;
@@ -141,6 +158,17 @@ class GpuExecutable : public Executable {
     std::string module_name;
     ProgramShape program_shape;
     std::optional<std::vector<BufferAllocation>> mlir_allocations;
+    // Backend-injected allocations for module-scoped state with no HLO
+    // operand backing (e.g. Metal's rng-get-and-update-state counter).
+    // Indices must continue the base allocation range (buffer_assignment or
+    // mlir_allocations) contiguously; Create() validates this. Mark entries
+    // set_constant(true) and register a matching ConstantInfo to have the
+    // runtime allocate, seed, and resolve the device buffer through the
+    // standard ResolveConstantGlobals path. The deque is moved (never
+    // copied) into the executable, so BufferAllocation::Slice handles
+    // created against its elements remain valid for the executable's
+    // lifetime.
+    std::deque<BufferAllocation> extra_allocations;
     std::unique_ptr<const BufferAssignment> buffer_assignment;
     std::unique_ptr<GpuAliasInfo> alias_info;
     DebugOptions debug_options;
@@ -352,7 +380,7 @@ class GpuExecutable : public Executable {
       ProgramShape program_shape,
       std::optional<std::vector<BufferAllocation>> mlir_allocations,
       std::unique_ptr<const BufferAssignment> buffer_assignment,
-      std::deque<BufferAllocation> thunk_pass_allocations,
+      std::deque<BufferAllocation> extra_allocations,
       std::unique_ptr<GpuAliasInfo> alias_info, DebugOptions debug_options,
       std::vector<ConstantInfo> constants,
       absl::flat_hash_map<ShapeIndex, OutputInfo> output_info,
@@ -466,10 +494,13 @@ class GpuExecutable : public Executable {
   // access to the compiler. But for debugging purposes, the proto is enough.
   std::optional<BufferAssignmentProto> buffer_assignment_proto_;
 
-  // Extra allocations added by thunk passes outside of the normal buffer
-  // assignment process.
-  // std::deque is used to ensure pointer stability.
-  const std::deque<BufferAllocation> thunk_pass_allocations_;
+  // Allocations created outside the normal buffer assignment process, by two
+  // producers: the backend compiler (via Params::extra_allocations) and thunk
+  // passes (via ThunkPassBufferAllocator inside Create). Indices continue the
+  // base allocation range contiguously.
+  // std::deque is used to ensure pointer stability: BufferAllocation::Slice
+  // handles captured by thunks dereference these elements directly.
+  const std::deque<BufferAllocation> extra_allocations_;
 
   // Backend specific aliasing information whether operands can/should share the
   // buffer with the user.

@@ -172,7 +172,7 @@ MakeConstantsMap(HloModule* absl_nullable debug_module) {
 std::vector<const BufferAllocation*> GatherAllocationPtrs(
     const std::optional<std::vector<BufferAllocation>>& mlir_allocations,
     const BufferAssignment* buffer_assignment,
-    const std::deque<BufferAllocation>& thunk_pass_allocations) {
+    const std::deque<BufferAllocation>& extra_allocations) {
   const std::vector<BufferAllocation>* allocation_vec = nullptr;
   if (mlir_allocations.has_value()) {
     allocation_vec = &mlir_allocations.value();
@@ -188,9 +188,9 @@ std::vector<const BufferAllocation*> GatherAllocationPtrs(
     }
   }
 
-  if (!thunk_pass_allocations.empty()) {
-    alloc_ptrs.reserve(alloc_ptrs.size() + thunk_pass_allocations.size());
-    for (const BufferAllocation& alloc : thunk_pass_allocations) {
+  if (!extra_allocations.empty()) {
+    alloc_ptrs.reserve(alloc_ptrs.size() + extra_allocations.size());
+    for (const BufferAllocation& alloc : extra_allocations) {
       alloc_ptrs.push_back(&alloc);
     }
   }
@@ -202,9 +202,15 @@ class GpuExecutableThunkPassBufferAllocator : public ThunkPassBufferAllocator {
  public:
   ~GpuExecutableThunkPassBufferAllocator() override = default;
 
-  explicit GpuExecutableThunkPassBufferAllocator(
-      BufferAllocation::Index start_idx)
-      : next_idx_(start_idx) {}
+  // `seed_allocations` carries compiler-injected extra allocations (see
+  // GpuExecutable::Params::extra_allocations); thunk-pass allocations are
+  // appended to the same deque so both producers' BufferAllocation::Slice
+  // handles stay valid (deque growth never relocates elements, and the deque
+  // itself is only ever moved whole into the executable).
+  GpuExecutableThunkPassBufferAllocator(
+      BufferAllocation::Index start_idx,
+      std::deque<BufferAllocation> seed_allocations)
+      : next_idx_(start_idx), allocations_(std::move(seed_allocations)) {}
 
   absl::StatusOr<BufferAllocation* absl_nonnull> NewEmptyAllocation(
       int64_t size) override {
@@ -374,7 +380,22 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::Create(
     next_idx = params.buffer_assignment->Allocations().size();
   }
 
-  GpuExecutableThunkPassBufferAllocator allocator(next_idx);
+  // Compiler-injected extra allocations must continue the base index range
+  // contiguously — the runtime's allocation list is indexed positionally.
+  for (const BufferAllocation& alloc : params.extra_allocations) {
+    if (alloc.index() != next_idx) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "Params::extra_allocations indices must continue the base "
+          "allocation range contiguously: expected index %d, got %d.",
+          next_idx, alloc.index()));
+    }
+    ++next_idx;
+  }
+
+  // Thunk passes append to the same deque, after the compiler-injected
+  // entries, so all extra allocations live in one pointer-stable container.
+  GpuExecutableThunkPassBufferAllocator allocator(
+      next_idx, std::move(params.extra_allocations));
 
   // TODO(b/461380690): Remove this once we have a better way to distinguish
   // between compiler-generated and runtime-loaded GPU executables.
@@ -425,7 +446,7 @@ GpuExecutable::GpuExecutable(
     ProgramShape program_shape,
     std::optional<std::vector<BufferAllocation>> mlir_allocations,
     std::unique_ptr<const BufferAssignment> buffer_assignment,
-    std::deque<BufferAllocation> thunk_pass_allocations,
+    std::deque<BufferAllocation> extra_allocations,
     std::unique_ptr<GpuAliasInfo> alias_info, DebugOptions debug_options,
     std::vector<ConstantInfo> constants,
     absl::flat_hash_map<ShapeIndex, OutputInfo> output_info,
@@ -445,11 +466,11 @@ GpuExecutable::GpuExecutable(
       module_name_(std::move(module_name)),
       program_shape_(std::move(program_shape)),
       allocation_ptrs_(GatherAllocationPtrs(
-          mlir_allocations, buffer_assignment.get(), thunk_pass_allocations)),
+          mlir_allocations, buffer_assignment.get(), extra_allocations)),
       allocations_(std::move(mlir_allocations)),
       buffer_assignment_(std::move(buffer_assignment)),
       buffer_assignment_proto_(std::move(buffer_assignment_proto)),
-      thunk_pass_allocations_(std::move(thunk_pass_allocations)),
+      extra_allocations_(std::move(extra_allocations)),
       alias_info_(std::move(alias_info)),
       debug_buffer_assignment_show_max_(
           debug_options.xla_debug_buffer_assignment_show_max()),
