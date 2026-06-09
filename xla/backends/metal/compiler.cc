@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/backends/metal/compiler.h"
 
+#include <functional>
 #include <memory>
 #include <thread>
 #include <utility>
@@ -35,11 +36,13 @@ limitations under the License.
 #include "mlir/Transforms/Passes.h"
 #include "xla/backends/gpu/codegen/emitters/mlir_kernel_emitter.h"
 #include "xla/backends/gpu/codegen/fusions.h"
+#include "xla/backends/gpu/runtime/conditional_thunk.h"
 #include "xla/backends/gpu/runtime/device_to_device_copy_thunk.h"
 #include "xla/backends/gpu/runtime/fft_thunk.h"
 #include "xla/backends/gpu/runtime/infeed_thunk.h"
 #include "xla/backends/gpu/runtime/kernel_thunk.h"
 #include "xla/backends/gpu/runtime/outfeed_thunk.h"
+#include "xla/backends/gpu/runtime/while_thunk.h"
 #include "xla/backends/gpu/codegen/emitters/transforms/passes.h"
 #include "xla/backends/gpu/runtime/shaped_slice.h"
 #include "xla/backends/gpu/runtime/thunk.h"
@@ -92,6 +95,7 @@ limitations under the License.
 #include "xla/tsl/platform/threadpool.h"
 #include "xla/tsl/util/maybe_owning.h"
 #include "xla/util.h"
+#include "xla/xla_data.pb.h"
 
 namespace xla {
 namespace metal {
@@ -277,14 +281,41 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
       gpu::MlirKernelEmitter::GetDialectRegistry());
   mlir_context()->loadAllAvailableDialects();
   std::unique_ptr<CallGraph> call_graph = CallGraph::Build(hlo_module.get());
-  gpu::ThunkSequence thunks;
   std::vector<gpu::GpuExecutable::ConstantInfo> constants;
   std::string msl_blob;
   NameUniquer msl_function_name_uniquer;
   std::vector<DeferredFusion> deferred_fusions;
   std::vector<DeferredSortStage> deferred_sort_stages;
-  for (const HloInstruction* instr :
-       hlo_module->schedule().sequence(entry).instructions()) {
+  // PSO compilation needs a live id<MTLDevice>; MetalCompiler rejects null
+  // stream_exec at entry so the cast is safe here.
+  void* metal_device =
+      stream_executor::metal::GetMetalDeviceOpaque(stream_exec);
+  if (metal_device == nullptr) {
+    return absl::FailedPreconditionError(
+        "MetalCompiler::CompileToBackendResult: stream executor is not a "
+        "MetalExecutor or device handle is unavailable.");
+  }
+
+  // Mutually-recursive helpers: emit_instruction dispatches per opcode and
+  // appends thunks to `thunks_out`. Control-flow opcodes (kWhile /
+  // kConditional / kCall) recurse via emit_computation, which walks a
+  // scheduled HloComputation and returns its ThunkSequence.
+  std::function<absl::Status(const HloInstruction*, gpu::ThunkSequence*)>
+      emit_instruction;
+  std::function<absl::StatusOr<gpu::ThunkSequence>(const HloComputation*)>
+      emit_computation;
+  emit_computation =
+      [&](const HloComputation* comp) -> absl::StatusOr<gpu::ThunkSequence> {
+    gpu::ThunkSequence local;
+    for (const HloInstruction* instr :
+         hlo_module->schedule().sequence(comp).instructions()) {
+      TF_RETURN_IF_ERROR(emit_instruction(instr, &local));
+    }
+    return local;
+  };
+  emit_instruction = [&](const HloInstruction* instr,
+                         gpu::ThunkSequence* thunks_out) -> absl::Status {
+    gpu::ThunkSequence& thunks = *thunks_out;
     switch (instr->opcode()) {
       // Encoded by buffer assignment / ordering; no thunk needed.
       case HloOpcode::kAddDependency:
@@ -516,13 +547,69 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
         break;
       }
 
+      case HloOpcode::kWhile: {
+        TF_ASSIGN_OR_RETURN(
+            gpu::ThunkSequence cond_thunks,
+            emit_computation(instr->while_condition()));
+        TF_ASSIGN_OR_RETURN(gpu::ThunkSequence body_thunks,
+                            emit_computation(instr->while_body()));
+        TF_ASSIGN_OR_RETURN(
+            BufferAllocation::Slice pred_slice,
+            buffer_assignment->GetUniqueSlice(
+                instr->while_condition()->root_instruction(), {}));
+        std::optional<int64_t> trip_count;
+        TF_ASSIGN_OR_RETURN(auto cfg,
+                            instr->backend_config<WhileLoopBackendConfig>());
+        if (cfg.has_known_trip_count()) {
+          trip_count = cfg.known_trip_count().n();
+        }
+        thunks.push_back(std::make_unique<gpu::WhileThunk>(
+            gpu::Thunk::ThunkInfo{}, pred_slice, std::move(cond_thunks),
+            std::move(body_thunks), trip_count));
+        break;
+      }
+
+      case HloOpcode::kConditional: {
+        std::vector<gpu::ThunkSequence> branch_thunks;
+        branch_thunks.reserve(instr->branch_count());
+        for (HloComputation* branch : instr->branch_computations()) {
+          TF_ASSIGN_OR_RETURN(gpu::ThunkSequence b,
+                              emit_computation(branch));
+          branch_thunks.push_back(std::move(b));
+        }
+        TF_ASSIGN_OR_RETURN(BufferAllocation::Slice idx_slice,
+                            buffer_assignment->GetUniqueSlice(
+                                instr->operand(0), {}));
+        thunks.push_back(std::make_unique<gpu::ConditionalThunk>(
+            gpu::Thunk::ThunkInfo{},
+            ShapedSlice{idx_slice, instr->operand(0)->shape()},
+            std::move(branch_thunks)));
+        break;
+      }
+
+      case HloOpcode::kCall: {
+        // Inline the called computation's thunks directly; no separate Thunk
+        // wrapper. Mirrors ThunkEmitter::EmitCallComputation.
+        TF_RET_CHECK(instr->called_computations().size() == 1);
+        TF_ASSIGN_OR_RETURN(
+            gpu::ThunkSequence call_thunks,
+            emit_computation(instr->called_computations().front()));
+        for (std::unique_ptr<gpu::Thunk>& t : call_thunks) {
+          thunks.push_back(std::move(t));
+        }
+        break;
+      }
+
       default:
         return Unimplemented(
             "MetalCompiler::CompileToBackendResult: post-scheduling HLO "
             "opcode '%s' is not yet supported on Metal.",
             HloOpcodeString(instr->opcode()));
     }
-  }
+    return absl::OkStatus();
+  };
+
+  TF_ASSIGN_OR_RETURN(gpu::ThunkSequence thunks, emit_computation(entry));
 
   // Phase 2: per-fusion retry loop. Each worker emits MLIR with a derived
   // device description that caps threads_per_block_limit at the current hint,
@@ -533,14 +620,6 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
   // ResourceExhaustedError naming the fusion. An emitter that ignores the
   // soft cap (num_threads_per_block stays put across retries) trips the
   // unchanged-requested-threads guard so we bail instead of spinning.
-  void* metal_device =
-      stream_executor::metal::GetMetalDeviceOpaque(stream_exec);
-  if (metal_device == nullptr) {
-    return absl::FailedPreconditionError(
-        "MetalCompiler::CompileToBackendResult: stream executor is not a "
-        "MetalExecutor or device handle is unavailable.");
-  }
-
   MaybeOwningThreadPool thread_pool = CreateMaybeOwningThreadPool(
       hlo_module->config()
           .debug_options()
