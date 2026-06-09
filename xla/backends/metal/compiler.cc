@@ -26,6 +26,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/substitute.h"
 #include "absl/synchronization/blocking_counter.h"
 #include "absl/synchronization/mutex.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
@@ -282,10 +283,15 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
   mlir_context()->loadAllAvailableDialects();
   std::unique_ptr<CallGraph> call_graph = CallGraph::Build(hlo_module.get());
   std::vector<gpu::GpuExecutable::ConstantInfo> constants;
+  // Backend-synthesized module globals (RNG state). Slices captured by
+  // thunks point into this deque; it is moved whole into
+  // Params::extra_allocations, which preserves element addresses.
+  std::deque<BufferAllocation> extra_allocations;
   std::string msl_blob;
   NameUniquer msl_function_name_uniquer;
   std::vector<DeferredFusion> deferred_fusions;
   std::vector<DeferredSortStage> deferred_sort_stages;
+  std::optional<BufferAllocation::Slice> rng_state_slice;
   // PSO compilation needs a live id<MTLDevice>; MetalCompiler rejects null
   // stream_exec at entry so the cast is safe here.
   void* metal_device =
@@ -470,6 +476,97 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
             /*output_buffer=*/dest_slice,
             /*input_shape=*/fft->operand(0)->shape(),
             /*output_shape=*/fft->shape()));
+        break;
+      }
+
+      case HloOpcode::kRngGetAndUpdateState: {
+        const auto* rng = Cast<HloRngGetAndUpdateStateInstruction>(instr);
+        TF_ASSIGN_OR_RETURN(
+            BufferAllocation::Slice output_slice,
+            buffer_assignment->GetUniqueSlice(rng, /*index=*/{}));
+
+        // The state is a module global: a 16-byte constant-backed allocation
+        // whose device buffer the Metal executor allocates at LoadModule from
+        // the matching ConstantInfo and seeds from its content (the same
+        // 0x7012395 initialiser CUDA bakes into its rng_state LLVM global —
+        // see llvm_util.cc GetOrCreateVariableForRngState). MSL has no
+        // module-scope globals, so the state crosses the launch boundary as
+        // a kernel argument; making it a real BufferAllocation keeps it
+        // inside the slice machinery that thunk dependency analysis,
+        // command-buffer capture, and buffer tooling reason with. All RNG
+        // ops in the module share one state allocation; each declares a
+        // write on the slice, so ThunkExecutor serialises them in schedule
+        // order.
+        if (!rng_state_slice.has_value()) {
+          constexpr int64_t kStateBytes = 2 * sizeof(uint64_t);
+          const int64_t state_idx = buffer_assignment->Allocations().size() +
+                                    extra_allocations.size();
+          BufferAllocation& state_alloc =
+              extra_allocations.emplace_back(state_idx, kStateBytes,
+                                             /*color=*/0);
+          state_alloc.set_constant(true);
+          rng_state_slice = BufferAllocation::Slice(&state_alloc, /*offset=*/0,
+                                                    kStateBytes);
+
+          std::array<uint64_t, 2> initial_state = {0x7012395ULL, 0};
+          std::vector<uint8_t> content(sizeof(initial_state));
+          std::memcpy(content.data(), initial_state.data(), content.size());
+
+          gpu::GpuExecutable::ConstantInfo info;
+          info.symbol_name = llvm_ir::SanitizeFunctionName(absl::StrCat(
+              hlo_module->name(), "_", hlo_module->unique_id(),
+              "_rng_state"));
+          info.content = gpu::DenseDataIntermediate::Own(std::move(content));
+          info.allocation_index = state_idx;
+          constants.push_back(std::move(info));
+        }
+
+        // Per-op single-thread kernel with delta baked in. u128 increment as
+        // two ulongs with carry.
+        std::string entry_name = msl_function_name_uniquer.GetUniqueName(
+            llvm_ir::SanitizeFunctionName(std::string(rng->name())));
+        std::string rng_msl = absl::Substitute(
+            R"msl(#include <metal_stdlib>
+using namespace metal;
+
+kernel void $0(device ulong* rng_state [[buffer(0)]],
+               device ulong* output [[buffer(1)]]) {
+  ulong old_low = rng_state[0];
+  ulong old_high = rng_state[1];
+  output[0] = old_low;
+  output[1] = old_high;
+  ulong new_low = old_low + $1ul;
+  ulong carry = new_low < old_low ? 1ul : 0ul;
+  rng_state[0] = new_low;
+  rng_state[1] = old_high + carry;
+}
+)msl",
+            entry_name, static_cast<uint64_t>(rng->delta()));
+        if (!msl_blob.empty()) msl_blob.append("\n");
+        msl_blob.append(rng_msl);
+
+        TF_ASSIGN_OR_RETURN(
+            stream_executor::metal::CompiledPipeline compiled,
+            stream_executor::metal::CompileAndProbe(
+                metal_device, rng_msl, entry_name,
+                /*descriptor_thread_hint=*/1));
+
+        const Shape kStateShape = ShapeUtil::MakeShape(U64, {2});
+        std::vector<emitters::KernelArgument> kernel_arg_vec;
+        kernel_arg_vec.emplace_back(kStateShape, *rng_state_slice);
+        kernel_arg_vec.back().set_written(true);
+        kernel_arg_vec.emplace_back(kStateShape, output_slice);
+        kernel_arg_vec.back().set_written(true);
+        emitters::KernelArguments kernel_args(std::move(kernel_arg_vec));
+
+        auto thunk = std::make_unique<xla::metal::MetalKernelThunk>(
+            gpu::Thunk::ThunkInfo{}, kernel_args);
+        gpu::LaunchDimensions launch_dims(/*num_blocks=*/1,
+                                          /*num_threads_per_block=*/1);
+        auto artifact = std::make_unique<xla::metal::MetalKernelArtifact>(
+            entry_name, /*arity=*/2, launch_dims, std::move(compiled.pso));
+        thunk->SetArtifact(std::move(artifact));
+        thunks.push_back(std::move(thunk));
         break;
       }
 
@@ -925,6 +1022,7 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
   }
   params.asm_text = std::move(msl_blob);
   params.constants = std::move(constants);
+  params.extra_allocations = std::move(extra_allocations);
   params.buffer_assignment = std::move(buffer_assignment);
   params.alias_info = std::move(alias_info);
   params.device_description = gpu_device_info;
