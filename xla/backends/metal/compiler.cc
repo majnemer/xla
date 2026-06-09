@@ -37,6 +37,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/fusions.h"
 #include "xla/backends/gpu/runtime/device_to_device_copy_thunk.h"
 #include "xla/backends/gpu/runtime/fft_thunk.h"
+#include "xla/backends/gpu/runtime/infeed_thunk.h"
 #include "xla/backends/gpu/runtime/kernel_thunk.h"
 #include "xla/backends/gpu/runtime/outfeed_thunk.h"
 #include "xla/backends/gpu/codegen/emitters/transforms/passes.h"
@@ -369,6 +370,56 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
         thunks.push_back(std::make_unique<MetalTriangularSolveThunk>(
             gpu::Thunk::ThunkInfo{}, opts, a_shape.element_type(), a_slice,
             a_shape, result_slice, b_shape, batch_size, m, num_rhs));
+        break;
+      }
+
+      case HloOpcode::kInfeed: {
+        const auto* infeed = Cast<HloInfeedInstruction>(instr);
+        std::vector<ShapedSlice> dest_slices;
+        TF_RETURN_IF_ERROR(ShapeUtil::ForEachSubshapeWithStatus(
+            infeed->shape(),
+            [&](const Shape& subshape,
+                const ShapeIndex& index) -> absl::Status {
+              if (subshape.IsTuple() || subshape.IsToken()) {
+                return absl::OkStatus();
+              }
+              if (!subshape.IsArray()) {
+                return Internal("Unexpected subshape for infeed '%s' at %s",
+                                infeed->ToString(), index.ToString());
+              }
+              TF_ASSIGN_OR_RETURN(
+                  BufferAllocation::Slice data,
+                  buffer_assignment->GetUniqueSlice(infeed, index));
+              dest_slices.push_back(ShapedSlice{data, subshape});
+              return absl::OkStatus();
+            }));
+        thunks.push_back(std::make_unique<gpu::InfeedThunk>(
+            gpu::Thunk::ThunkInfo{}, std::move(dest_slices)));
+        break;
+      }
+
+      case HloOpcode::kOutfeed: {
+        const auto* outfeed = Cast<HloOutfeedInstruction>(instr);
+        const HloInstruction* source = outfeed->operand(0);
+        std::vector<ShapedSlice> source_slices;
+        TF_RETURN_IF_ERROR(ShapeUtil::ForEachSubshapeWithStatus(
+            source->shape(),
+            [&](const Shape& subshape,
+                const ShapeIndex& index) -> absl::Status {
+              if (subshape.IsTuple()) return absl::OkStatus();
+              if (!subshape.IsArray()) {
+                return Internal(
+                    "Unexpected subshape for outfeed source '%s' at %s",
+                    source->ToString(), index.ToString());
+              }
+              TF_ASSIGN_OR_RETURN(
+                  BufferAllocation::Slice data,
+                  buffer_assignment->GetUniqueSlice(source, index));
+              source_slices.push_back(ShapedSlice{data, subshape});
+              return absl::OkStatus();
+            }));
+        thunks.push_back(std::make_unique<gpu::OutfeedThunk>(
+            gpu::Thunk::ThunkInfo{}, std::move(source_slices)));
         break;
       }
 

@@ -22,6 +22,7 @@ cc_library(
         "//xla/backends/gpu/codegen/emitters/transforms:passes",
         "//xla/backends/gpu/runtime:device_to_device_copy_thunk",
         "//xla/backends/gpu/runtime:fft_thunk",
+        "//xla/backends/gpu/runtime:infeed_thunk",
         "//xla/backends/gpu/runtime:kernel_thunk",
         "//xla/backends/gpu/runtime:outfeed_thunk",
         "//xla/backends/gpu/runtime:thunk",
