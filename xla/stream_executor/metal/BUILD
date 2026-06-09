@@ -118,6 +118,7 @@ objc_library(
     target_compatible_with = ["@platforms//os:macos"],
     deps = [
         ":metal_compute_capability",
+        ":metal_device_handle",
         ":metal_event",
         ":metal_executor_header",
         ":metal_kernel",
@@ -214,6 +215,38 @@ objc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/time",
+    ],
+)
+
+# Compiles MSL → MTLLibrary → MTLFunction → MTLComputePipelineState at
+# compile time and returns the PSO together with its self-reported
+# maxTotalThreadsPerThreadgroup. The PSO is the artifact ultimately handed to
+# MetalKernelThunk at runtime — no MSL recompilation at first launch.
+objc_library(
+    name = "metal_pso_probe",
+    srcs = ["metal_pso_probe.mm"],
+    hdrs = ["metal_pso_probe.h"],
+    sdk_frameworks = [
+        "Foundation",
+        "Metal",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+# C++-clean header exposing GetMetalDeviceOpaque so that MetalCompiler (plain
+# C++) can fetch the id<MTLDevice> from a StreamExecutor* without including
+# the Obj-C MetalExecutor header. Implementation lives in metal_executor.mm.
+cc_library(
+    name = "metal_device_handle",
+    hdrs = ["metal_device_handle.h"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        "//xla/stream_executor:stream_executor_h",
     ],
 )
 
