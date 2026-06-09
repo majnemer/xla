@@ -537,14 +537,8 @@ void MergeModuleStatsInPlace(const ModuleStats& from, ModuleStats& to) {
 
 }  // namespace
 
-GpuCompiler::GpuCompiler(se::Platform::Id platform_id,
-                         const char* target_triple, const char* data_layout)
-    : platform_id_(platform_id),
-      target_triple_(target_triple),
-      data_layout_(data_layout),
-      pointer_size_(llvm::DataLayout(data_layout)
-                        .getPointerSize(0 /* default address space */)),
-      mlir_context_pool_([]() { return CreateMlirContext(); }) {}
+GpuCompiler::GpuCompiler(se::Platform::Id platform_id, int64_t pointer_size)
+    : platform_id_(platform_id), pointer_size_(pointer_size) {}
 
 namespace {
 // Adds the HloVerifier for GPU to the given pipeline.
@@ -1660,9 +1654,7 @@ absl::Status GpuCompiler::OptimizeHloModule(
   const se::DeviceDescription& device_description =
       gpu_topology.gpu_target_config().device_description;
 
-  ASSIGN_OR_RETURN(BorrowedMlirContext borrowed_context,
-                   mlir_context_pool_.GetOrCreate());
-  mlir::MLIRContext* mlir_context = borrowed_context->get();
+  mlir::MLIRContext* mlir_context = &mlir_context_;
 
   CheckNotScheduled(hlo_module);
   LogDebugOptions(hlo_module);
@@ -2555,293 +2547,26 @@ absl::Status RunPostSchedulingCopyInsertion(HloModule* module,
 
 }  // namespace
 
-using OutputInfoMap =
-    absl::flat_hash_map<ShapeIndex, GpuExecutable::OutputInfo>;
-
-static void NullDiagnosticHandler(const llvm::DiagnosticInfo* diag_info,
-                                  void* context) {
-  std::string error_string;
-  llvm::raw_string_ostream string_printer(error_string);
-  llvm::DiagnosticPrinterRawOStream diagnostic_printer(string_printer);
-  diag_info->print(diagnostic_printer);
-
-  VLOG(5) << error_string;
-}
-
-absl::StatusOr<GpuCompiler::BackendCompileResult>
-GpuCompiler::CompileSingleModule(
-    const HloModuleConfig& module_config,
-    const stream_executor::DeviceDescription& device_description,
-    const HloModule* debug_module, llvm::Module* llvm_module, bool relocatable,
-    std::optional<int> shard_number) {
-  tsl::profiler::TraceMe traceme("CompileSingleModule");
-  const DebugOptions& debug_options = module_config.debug_options();
-  {
-    // This may print multiple lines per HLO compilation because of the
-    // parallelized compilation of LLVM modules.
-    XLA_SCOPED_LOGGING_TIMER_IF(
-        absl::StrCat(
-            "GpuCompiler::RunBackend - Running LLVM verifier for ",
-            (debug_module != nullptr ? debug_module->name() : "(unknown)")),
-        VLOG_IS_ON(4) && debug_options.xla_enable_scoped_logging_timers());
-
-    llvm_module->getContext().setDiagnosticHandlerCallBack(
-        NullDiagnosticHandler, nullptr);
-
-    std::string err;
-    llvm::raw_string_ostream err_stream(err);
-
-    // verifyModule() returns true if the module is broken.
-    TF_RET_CHECK(!llvm::verifyModule(*llvm_module, &err_stream))
-        << "Invalid LLVM IR before optimizations:\n"
-        << err_stream.str()
-        << "\nThis probably indicates a bug in the HLO -> LLVM IR "
-           "lowering. Rerun with --xla_dump_to to get the IR"
-        << (debug_module
-                ? absl::StrCat(" and looks for files with name containing: *",
-                               FilenameFor(*debug_module, "", ""), "*")
-                : ".");
-  }
-
-  const std::string debug_name = debug_module ? debug_module->name() : "";
-  XlaScopedFatalErrorHandler fatal_error_handler([&debug_name](
-                                                     absl::string_view reason) {
-    LOG(ERROR) << "LLVM Fatal Error while compiling target binary for module: "
-               << debug_name << " Reason: " << reason;
-  });
-
-  ASSIGN_OR_RETURN(
-      BackendCompileResult result,
-      CompileTargetBinary(module_config, llvm_module, device_description,
-                          relocatable, debug_module, shard_number));
-
-  const bool should_dump = DumpingEnabledForHloModule(
-      debug_module ? debug_module->name() : "", debug_options);
-
-  if (should_dump) {
-    if (debug_module) {
-      llvm_ir::DumpIrIfEnabled(
-          *debug_module, *llvm_module,
-          /*optimized=*/true,
-          shard_number.has_value() ? std::to_string(*shard_number) : "");
-    } else {
-      LOG(ERROR) << "Dumping is not implemented since the file name cannot be "
-                    "inferred. Please implement (potentially MLIR) module -> "
-                    "filename heuristic.";
-    }
-  }
-
-  CallUserPostOptimizationHook(*llvm_module);
-
-  absl::MutexLock lock(user_asm_hook_m_);
-  if (user_asm_hook_ && !result.asm_text.empty()) {
-    user_asm_hook_(result.asm_text);
-  }
-
-  return result;
-}
-
-namespace {
-
-// Returns the name of the single function in the module or empty string if it's
-// not a single-function module.
-std::string SingleFunctionName(const llvm::Module& module) {
-  std::string name;
-  for (const llvm::Function& func : module.functions()) {
-    if (!func.isDeclaration() &&
-        func.getLinkage() == llvm::GlobalValue::LinkageTypes::ExternalLinkage) {
-      if (name.empty()) {
-        // First function in a module: name the module with it.
-        name = func.getName().str();
-      } else {
-        // Not the first function - the module is not cacheable.
-        return "";
-      }
-    }
-  }
-  return name;
-}
-}  // namespace
-
-namespace {
-absl::StatusOr<xla::cpu::CompilationResultProto> GetCpuCompilationResult(
-    const HloModuleProto& hlo_proto,
-    xla::cpu::TargetMachineOptions cpu_target_machine_options) {
-  xla::cpu::NanoRtClient client;
-  XlaComputation computation(hlo_proto);
-  Compiler::CompileOptions cpu_compile_options;
-  cpu_compile_options.cpu_target_config.emplace(
-      std::move(cpu_target_machine_options));
-
-  ASSIGN_OR_RETURN(std::unique_ptr<xla::cpu::NanoRtExecutable> executable,
-                   client.Compile(computation));
-  ASSIGN_OR_RETURN(std::unique_ptr<CompiledModule> result,
-                   client.Export(executable.get()));
-  xla::cpu::CpuAotCompilationResult* cpu_aot_compilation_result =
-      absl::down_cast<cpu::CpuAotCompilationResult*>(result.get());
-  return cpu_aot_compilation_result->proto();
-}
-}  // namespace
-
-absl::StatusOr<GpuCompiler::CompileResultWithMetadata>
-GpuCompiler::CompileToBackendResult(
-    HloModule* module, llvm::LLVMContext* llvm_context,
-    const GpuTopology& gpu_topology, const CompileOptions& options,
-    se::StreamExecutor* absl_nullable stream_exec,
-    mlir::MLIRContext* mlir_context) {
-  tsl::profiler::TraceMe traceme("CompileToBackendResult");
-
-  absl::string_view cache_path =
-      module->config().debug_options().xla_gpu_kernel_cache_file();
-  const bool use_cache = !cache_path.empty();
-
-  std::unique_ptr<GpuAliasInfo> alias_info =
-      GetAliasInfo(gpu_topology.gpu_target_config().device_description);
+absl::StatusOr<ScheduleMetadata> GpuCompiler::ScheduleAndVerify(
+    HloModule* module, const GpuTopology& gpu_topology,
+    const GpuAliasInfo* alias_info, mlir::MLIRContext* mlir_context) {
   RETURN_IF_ERROR(RunPreSchedulingPasses(
-      module, gpu_topology.gpu_target_config().device_description,
-      alias_info.get(), mlir_context));
+      module, gpu_topology.gpu_target_config().device_description, alias_info,
+      mlir_context));
   ASSIGN_OR_RETURN(
       ScheduleMetadata schedule_metadata,
       ScheduleGpuModule(module, pointer_size_,
                         gpu_topology.gpu_target_config().device_description,
-                        mlir_context, alias_info.get()));
+                        mlir_context, alias_info));
   HloPassPipeline pipeline("scheduled-gpu-module");
   AddHloVerifier(&pipeline);
   RETURN_IF_ERROR(pipeline.Run(module).status());
-  RETURN_IF_ERROR(
-      RunPostSchedulingPipelines(module, schedule_metadata.scheduler_mem_limit,
-                                 gpu_topology, alias_info.get(), mlir_context));
-
-  MaybeOwningThreadPool thread_pool = CreateMaybeOwningThreadPool(
-      /*parallelism=*/module->config()
-          .debug_options()
-          .xla_gpu_force_compilation_parallelism(),
-      /*default_thread_pool=*/options.thread_pool,
-      /*default_parallelism=*/tsl::port::MaxParallelism());
-
-  absl::Mutex module_stats_m_;
-  ModuleStats module_stats;
-  CompileModuleResults compile_module_results;
-  std::atomic<int> shard_number = 0;
-
-  {
-    xla::llvm_ir::LLVMCommandLineOptionsReleasableLock llvm_options_lock(
-        GetLLVMCommandLineOptions(module->config().debug_options()));
-    BufferValue::SizeFunction buffer_size_bytes_function =
-        BufferSizeBytesFunction();
-
-    auto llvm_compiler =
-        [&](llvm::Module& llvm_module, const se::DeviceDescription& descr,
-            const DebugOptions& opts) -> absl::StatusOr<std::vector<uint8_t>> {
-      ASSIGN_OR_RETURN(
-          BackendCompileResult result,
-          CompileSingleModule(module->config(), descr, module, &llvm_module,
-                              false, shard_number.fetch_add(1)));
-
-      absl::MutexLock lock(module_stats_m_);
-      MergeModuleStatsInPlace(result.module_stats, module_stats);
-
-      return std::move(result.binary);
-    };
-    CubinCustomKernelCompiler kernel_compiler(
-        std::move(llvm_compiler),
-        gpu_topology.gpu_target_config().device_description,
-        module->config().debug_options(), thread_pool.get_mutable());
-    kernel_compiler.SetPreOptimizationHook([&](const llvm::Module& module) {
-      CallUserPreOptimizationHook(module);
-    });
-
-    // Compile the module to thunks and llvm IR.
-    xla::cpu::TargetMachineOptions cpu_target_machine_options =
-        gpu_topology.host_target_machine_options().value();
-
-    ASSIGN_OR_RETURN(
-        compile_module_results,
-        CompileModuleToLlvmIr(
-            module, llvm_context, target_triple_, data_layout_, PlatformId(),
-            gpu_topology, alias_info.get(),
-            std::move(buffer_size_bytes_function), llvm_options_lock,
-            &kernel_compiler, std::move(cpu_target_machine_options),
-            &mlir_context_pool_));
-  }
-
-  if (compile_module_results.llvm_module_constants != nullptr) {
-    llvm_ir::DumpIrIfEnabled(*module,
-                             *compile_module_results.llvm_module_constants,
-                             /*optimized=*/false, "constants");
-    CallUserPreOptimizationHook(*compile_module_results.llvm_module_constants);
-  }
-
-  BackendCompileResult backend_result;
-  ASSIGN_OR_RETURN(
-      backend_result,
-      CompileSingleModule(
-          module->config(), gpu_topology.gpu_target_config().device_description,
-          module, &*compile_module_results.llvm_module_constants,
-          /*relocatable=*/false,
-          /*shard_number=*/shard_number.fetch_add(1)));
-
-  if (use_cache) {
-    std::string resolved_path;
-    if (!tsl::io::ResolveTestPrefixes(cache_path, resolved_path)) {
-      return FailedPrecondition("File path can not be resolved: %s",
-                                cache_path);
-    }
-    const bool cache_file_exists =
-        tsl::Env::Default()->FileExists(resolved_path).ok();
-
-    // current_cache contains new kernels from the current compilation and
-    // kernels to reuse from previous compilations if some were loaded from the
-    // cache file.
-    const CompilationCacheProto& current_cache =
-        compile_module_results.kernel_compilation_cache;
-    RETURN_IF_ERROR(UpdateDiskKernelCache(resolved_path,
-                                          /*do_append=*/cache_file_exists,
-                                          current_cache));
-  }
-
-  {
-    absl::MutexLock lock(module_stats_m_);
-    MergeModuleStatsInPlace(module_stats, backend_result.module_stats);
-  }
-  if (!backend_result.asm_text.empty()) {
-    backend_result.asm_text =
-        absl::StrCat(kGpuExecutablePtxMarker, backend_result.asm_text);
-  }
-
-  RecordXlaDeviceBinarySize(backend_result.binary.size());
-  if (DumpingEnabledForHloModule(*module)) {
-    DumpToFileInDirOrStdout(
-        *module, "", "thunk_sequence.txt",
-        compile_module_results.executable->ToString(/*indent=*/0));
-  }
-
-  // Host executable has to be compiled the GPU compilation is done to
-  // avoid a deadlock on the LLVM command line options lock. We can then load
-  // it.
-  compile_module_results.executable->Walk([&](Thunk* thunk) {
-    if (thunk->kind() == Thunk::Kind::kHostExecuteStart) {
-      auto* host_execute_start_thunk =
-          absl::down_cast<HostExecuteStartThunk*>(thunk);
-      absl::StatusOr<xla::cpu::CompilationResultProto> cpu_compilation_result =
-          GetCpuCompilationResult(
-              host_execute_start_thunk->executable_proto().hlo_module(),
-              gpu_topology.host_target_machine_options().value());
-
-      CHECK_OK(cpu_compilation_result) << "Failed to compile host executable.";
-
-      *host_execute_start_thunk->mutable_executable_proto()
-           ->mutable_aot_compilation_result() =
-          std::move(cpu_compilation_result.value());
-
-      CHECK_OK(host_execute_start_thunk->LoadExecutable())
-          << "Failed to load host executable.";
-    }
-  });
-
-  return CompileResultWithMetadata{std::move(backend_result),
-                                   std::move(compile_module_results)};
+  RETURN_IF_ERROR(RunPostSchedulingPipelines(
+      module, schedule_metadata.scheduler_mem_limit, gpu_topology, alias_info,
+      mlir_context));
+  return schedule_metadata;
 }
+
 
 absl::StatusOr<std::unique_ptr<Executable>> GpuCompiler::RunBackend(
     std::unique_ptr<HloModule> module, se::StreamExecutor* stream_exec,
@@ -2852,14 +2577,6 @@ absl::StatusOr<std::unique_ptr<Executable>> GpuCompiler::RunBackend(
   }};
 
   RecordGpuCompilerStacktrace();
-
-  BinaryMap dnn_compiled_graphs;
-  if (stream_exec) {
-    se::dnn::DnnSupport* dnn_support = stream_exec->AsDnn();
-    TF_RET_CHECK(dnn_support != nullptr);
-    RETURN_IF_ERROR(RunCudnnCompilerPasses(module.get(), *dnn_support,
-                                           &dnn_compiled_graphs));
-  }
 
   const DebugOptions& debug_opts = module->config().debug_options();
   ASSIGN_OR_RETURN(GpuTopology gpu_topology,
@@ -2880,10 +2597,8 @@ absl::StatusOr<std::unique_ptr<Executable>> GpuCompiler::RunBackend(
       absl::StrCat("Compiling module ", module->name(), " for GPU");
   auto slow_compile_alarm = SlowCompilationAlarm(slow_compilation_msg);
 
-  llvm::LLVMContext llvm_context;
   const se::DeviceDescription& gpu_device_info =
       gpu_topology.gpu_target_config().device_description;
-
   if (module->config().hlo_profiling_enabled() || VLOG_IS_ON(1)) {
     HloCostAnalysis::Options cost_analysis_options{ShapeSizeBytesFunction()};
     cost_analysis_options.set_bytes_per_second(
@@ -2896,90 +2611,10 @@ absl::StatusOr<std::unique_ptr<Executable>> GpuCompiler::RunBackend(
         tsl::strings::HumanReadableNumBytes(cost_analysis.bytes_accessed()));
   }
 
-  ASSIGN_OR_RETURN(BorrowedMlirContext borrowed_context,
-                   mlir_context_pool_.GetOrCreate());
-
-  ASSIGN_OR_RETURN(
-      CompileResultWithMetadata res,
-      CompileToBackendResult(module.get(), &llvm_context, gpu_topology, options,
-                             stream_exec, borrowed_context->get()));
-  ModuleStats module_stats = res.backend_result.module_stats;
-
-  if (DumpingEnabledForHloModule(*module)) {
-    DumpToFileInDirOrStdout(
-        *module, "", "thunk_sequence.txt",
-        res.compile_module_results.executable->ToString(/*indent=*/0));
-  }
-
-  // The module is being moved into the GpuExecutable below and we need to
-  // read a few config values from the module, before it becomes invalid.
-  bool embed_ir_in_executable = debug_opts.xla_embed_ir_in_executable();
-  bool embed_debug_info = debug_opts.xla_gpu_executable_embed_debug_info();
-
-  tsl::profiler::ScopedAnnotation annotation([&] {
-    return absl::StrFormat("XlaCreateGpuExecutable:#module=%s#",
-                           module->name());
-  });
-
-  std::unique_ptr<GpuAliasInfo> alias_info = GetAliasInfo(gpu_device_info);
-
-  ASSIGN_OR_RETURN(stream_executor::ExecutableAbiVersion executable_abi_version,
-                   stream_executor::ExecutableAbiVersion::FromDeviceDescription(
-                       gpu_device_info));
-
   ASSIGN_OR_RETURN(
       std::unique_ptr<GpuExecutable> gpu_executable,
-      GpuExecutable::Create(GpuExecutable::Params{
-          /*asm_text=*/embed_debug_info ? std::move(res.backend_result.asm_text)
-                                        : std::string(),
-          /*binary=*/std::move(res.backend_result.binary),
-          /*dnn_compiled_graphs=*/
-          std::move(dnn_compiled_graphs),
-          /*executable=*/
-          std::make_unique<ThunkExecutor>(
-              std::move(res.compile_module_results.executable->thunks())),
-          /*constants=*/std::move(res.compile_module_results.constants),
-          /*output_info=*/std::move(res.compile_module_results.output_info),
-          /*module_name=*/std::move(res.compile_module_results.module_name),
-          /*program_shape=*/
-          module->compute_computation_layout().ComputeProgramShape(),
-          /*mlir_allocations=*/
-          (res.compile_module_results.use_original_allocations
-               ? std::optional<std::vector<BufferAllocation>>()
-               : std::move(res.compile_module_results.allocations)),
-          /*buffer_assignment=*/
-          std::move(res.compile_module_results.buffer_assignment),
-          /*alias_info=*/std::move(alias_info),
-          /*debug_options=*/debug_opts,
-          /*device_description=*/gpu_device_info,
-          /*debug_module=*/options.embed_hlo_module
-              ? std::move(module)
-              : std::unique_ptr<HloModule>(),
-          /*enable_debug_info_manager=*/embed_debug_info,
-          /*module_stats=*/std::move(module_stats),
-          /*executable_abi_version=*/executable_abi_version,
-          /*cpu_target_machine_options=*/
-          options.cpu_target_config.has_value()
-              ? options.cpu_target_config->cpu_target_machine_options
-              : std::nullopt}));
-
-  if (embed_ir_in_executable) {
-    std::string ir_module_string_before_opt = llvm_ir::DumpToString(
-        *res.compile_module_results.llvm_module_constants);
-    gpu_executable->set_ir_module_string(ir_module_string_before_opt);
-    DCHECK_NE("", ir_module_string_before_opt);
-  }
-
-  IncrementCompiledProgramsCount();
-
-  if (embed_debug_info && gpu_executable->has_module()) {
-    // Dump computation proto state and buffer assignment for
-    // CompiledMemoryAnalysis.
-    auto hlo_proto = std::make_unique<HloProto>();
-    *hlo_proto->mutable_buffer_assignment() =
-        gpu_executable->buffer_assignment()->ToProto();
-    gpu_executable->set_hlo_proto(std::move(hlo_proto));
-  }
+      CompileToBackendResult(std::move(module), gpu_topology, options,
+                             stream_exec));
 
   return static_cast<std::unique_ptr<Executable>>(std::move(gpu_executable));
 }
@@ -3054,64 +2689,12 @@ GpuCompiler::NewCompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,
   return results;
 }
 
-absl::StatusOr<std::vector<std::unique_ptr<CompiledModule>>>
-GpuCompiler::LegacyCompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,
-                                      const AotCompilationOptions& options) {
-  CompileOptions compile_options;
-  compile_options.device_allocator = options.device_allocator();
-  compile_options.gpu_topology = options.gpu_topology();
-  ASSIGN_OR_RETURN(GpuTopology gpu_topology,
-                   InferGpuTopology(hlo_module->config(), options.executor(),
-                                    compile_options, options.debug_options(),
-                                    options.PlatformId()));
-  CHECK(gpu_topology.has_gpu_target_config());
-
-  llvm::LLVMContext llvm_context;
-  ASSIGN_OR_RETURN(BorrowedMlirContext borrowed_context,
-                   mlir_context_pool_.GetOrCreate());
-
-  ASSIGN_OR_RETURN(CompileResultWithMetadata res,
-                   CompileToBackendResult(hlo_module.get(), &llvm_context,
-                                          gpu_topology, compile_options,
-                                          nullptr, borrowed_context->get()));
-
-  std::vector<std::unique_ptr<CompiledModule>> results;
-  ASSIGN_OR_RETURN(
-      results.emplace_back(),
-      LegacyGpuAotCompilationResult::FromModule(
-          hlo_module.get(),
-          res.compile_module_results.buffer_assignment->ToProto(),
-          res.backend_result.asm_text, res.backend_result.binary,
-          res.backend_result.dnn_compiled_graphs, pointer_size_, this));
-
-  return std::move(results);
-}
 
 HloCostAnalysis::ShapeSizeFunction GpuCompiler::ShapeSizeBytesFunction() const {
   // Capture just the pointer size, not the entire GpuCompiler object.
   return gpu::ShapeSizeBytesFunction(pointer_size_);
 }
 
-absl::StatusOr<std::unique_ptr<CompiledModule>> GpuCompiler::Export(
-    Executable* executable) {
-  auto* gpu_executable = absl::down_cast<GpuExecutable*>(executable);
-  if (!gpu_executable) {
-    return Internal("GpuExecutable is null");
-  }
-
-  if (gpu_executable->module()
-          .config()
-          .debug_options()
-          .xla_gpu_experimental_aot_compiled_thunks()) {
-    ASSIGN_OR_RETURN(GpuExecutableProto proto, gpu_executable->ToProto());
-    return GpuAotCompilationResult::FromProto(std::move(proto));
-  }
-
-  return LegacyGpuAotCompilationResult::FromModule(
-      &gpu_executable->module(), gpu_executable->buffer_assignment()->ToProto(),
-      gpu_executable->text(), gpu_executable->binary(),
-      gpu_executable->dnn_compiled_graphs(), pointer_size_, this);
-}
 
 absl::Status GpuCompiler::RunPreSchedulingPasses(
     HloModule* module, const se::DeviceDescription& gpu_device_info,
@@ -3339,160 +2922,6 @@ absl::Status GpuCompiler::SerializeAutotuneResultsToFile(
   return absl::OkStatus();
 }
 
-absl::StatusOr<std::unique_ptr<CompiledModule>>
-GpuCompiler::LoadAotCompilationResult(
-    const std::string& serialized_aot_result) {
-  auto reader =
-      std::make_unique<riegeli::StringReader<>>(serialized_aot_result);
-  ASSIGN_OR_RETURN(bool is_split_proto, IsSplitProto(*reader));
-  if (is_split_proto) {
-    return GpuAotCompilationResult::FromSerialized(std::move(reader));
-  }
-
-  GpuExecutableProto gpu_executable_proto;
-  if (!gpu_executable_proto.ParseFromString(serialized_aot_result)) {
-    return InvalidArgument(
-        "Failed to parse serialized AOT result as GpuExecutableProto.");
-  }
-  return LegacyGpuAotCompilationResult::FromProto(gpu_executable_proto,
-                                                  pointer_size_, this);
-}
-
-absl::StatusOr<std::unique_ptr<Executable>>
-GpuCompiler::LoadExecutableFromAotResult(
-    const CompiledModule& aot_result,
-    const se::DeviceDescription& device_description) {
-  tsl::profiler::TraceMe traceme("LoadExecutableFromAotResult");
-
-  const auto* gpu_aot_result =
-      dynamic_cast<const LegacyGpuAotCompilationResult*>(&aot_result);
-  if (gpu_aot_result == nullptr) {
-    return Internal(
-        "AotCompilationResult is not a GpuThunkAotCompilationResult.");
-  }
-  const GpuExecutableProto& proto = gpu_aot_result->GetGpuExecutableProto();
-
-  // Recreate HloModule+HloModuleConfig from proto.
-  ASSIGN_OR_RETURN(
-      std::unique_ptr<HloModule> hlo_module,
-      HloModule::CreateFromProtoWithConfig(proto.hlo_module_with_config()));
-
-  ExecutionStreamAssignment execution_stream_assignment(
-      hlo_module.get(),
-      {
-          kDefaultNumComputeStreams,
-          hlo_module->config()
-                  .debug_options()
-                  .xla_gpu_experimental_enable_collective_multi_streaming()
-              ? kDefaultNumCommunicationStreams
-              : 1,
-      });
-
-  std::vector<uint8_t> binary(proto.binary().begin(), proto.binary().end());
-
-  // Build the executable, which should be a thunk sequence.
-  absl::string_view platform_name = PlatformId()->ToName();
-
-  llvm::LLVMContext llvm_context;
-
-  // Recreate BufferAssignment from proto.
-  std::unique_ptr<GpuAliasInfo> alias_info = GetAliasInfo(device_description);
-  ASSIGN_OR_RETURN(
-      std::unique_ptr<BufferAssignment> buffer_assignment,
-      BufferAssignment::FromProto(proto.buffer_assignment(), hlo_module.get(),
-                                  BufferSizeBytesFunction(), alias_info.get()));
-
-  std::atomic<int> shard_number = 0;
-  auto llvm_compiler =
-      [&](llvm::Module& llvm_module, const se::DeviceDescription& descr,
-          const DebugOptions& opts) -> absl::StatusOr<std::vector<uint8_t>> {
-    ASSIGN_OR_RETURN(
-        BackendCompileResult result,
-        CompileSingleModule(hlo_module->config(), descr, hlo_module.get(),
-                            &llvm_module, false, shard_number.fetch_add(1)));
-    return std::move(result.binary);
-  };
-  CubinCustomKernelCompiler kernel_compiler(
-      std::move(llvm_compiler), device_description,
-      hlo_module->config().debug_options());
-  kernel_compiler.SetPreOptimizationHook(
-      [&](const llvm::Module& module) { CallUserPreOptimizationHook(module); });
-
-  ASSIGN_OR_RETURN(BorrowedMlirContext borrowed_context,
-                   mlir_context_pool_.GetOrCreate());
-
-  IrEmitterContext ir_emitter_context(
-      hlo_module.get(), buffer_assignment.get(), &execution_stream_assignment,
-      platform_name, device_description, borrowed_context->get(), &llvm_context,
-      llvm::Triple(target_triple()), data_layout(), &kernel_compiler,
-      cpu::TargetMachineOptions(hlo_module->config().debug_options()),
-      &mlir_context_pool_);
-
-  absl::string_view cache_file_path =
-      hlo_module->config().debug_options().xla_gpu_kernel_cache_file();
-  if (!cache_file_path.empty()) {
-    RETURN_IF_ERROR(LoadCache(ir_emitter_context, cache_file_path));
-  }
-
-  xla::llvm_ir::LLVMCommandLineOptionsReleasableLock llvm_options_lock(
-      GetLLVMCommandLineOptions(hlo_module->config().debug_options()));
-
-  ThunkEmitter thunk_emitter(&ir_emitter_context, &llvm_options_lock);
-  ASSIGN_OR_RETURN(auto sequential_thunk,
-                   thunk_emitter.EmitHloEntryComputation(hlo_module.get()));
-
-  // Get all other fields required by GpuExecutable.
-  std::vector<GpuExecutable::ConstantInfo> constants =
-      std::move(ir_emitter_context.constants());
-  ASSIGN_OR_RETURN(auto output_info,
-                   GetOutputInfo(*hlo_module, *buffer_assignment));
-  ProgramShape program_shape =
-      hlo_module->entry_computation_layout().ComputeProgramShape();
-  *program_shape.mutable_result() = hlo_module->result_shape();
-  DebugOptions debug_options = hlo_module->config().debug_options();
-  std::string hlo_module_name = hlo_module->name();
-
-  ASSIGN_OR_RETURN(auto executable_abi_version,
-                   stream_executor::ExecutableAbiVersion::FromDeviceDescription(
-                       device_description));
-
-  std::optional<xla::cpu::TargetMachineOptions> cpu_target_machine_options =
-      std::nullopt;
-  if (proto.has_cpu_target_machine_options()) {
-    ASSIGN_OR_RETURN(cpu_target_machine_options,
-                     xla::cpu::TargetMachineOptions::FromProto(
-                         proto.cpu_target_machine_options()));
-  }
-  BufferAssignmentProto buffer_assignment_proto = buffer_assignment->ToProto();
-  {
-    tsl::profiler::TraceMe traceme("CreateGpuExecutable");
-    std::unique_ptr<GpuAliasInfo> alias_info = GetAliasInfo(device_description);
-    return GpuExecutable::Create(GpuExecutable::Params{
-        /*asm_text=*/proto.asm_text(),
-        /*binary=*/binary,
-        /*dnn_compiled_graphs=*/
-        BinaryMap(proto.dnn_compiled_graphs().cbegin(),
-                  proto.dnn_compiled_graphs().cend()),
-        /*executable=*/
-        std::make_unique<ThunkExecutor>(std::move(sequential_thunk->thunks())),
-        /*constants=*/std::move(constants),
-        /*output_info=*/std::move(output_info),
-        /*module_name=*/std::move(hlo_module_name),
-        /*program_shape=*/std::move(program_shape),
-        /*mlir_allocations=*/std::move(*buffer_assignment).TakeAllocations(),
-        /*buffer_assignment=*/nullptr,
-        /*alias_info=*/std::move(alias_info),
-        /*debug_options=*/std::move(debug_options),
-        /*device_description=*/device_description,
-        /*debug_module=*/std::move(hlo_module),
-        /*enable_debug_info_manager=*/true,
-        /*module_stats=*/{},
-        /*executable_abi_version=*/executable_abi_version,
-        /*cpu_target_machine_options=*/std::move(cpu_target_machine_options),
-        /*buffer_assignment_proto=*/std::move(buffer_assignment_proto),
-    });
-  }
-}
 
 absl::Status GpuCompiler::AddConvAndGemmAutotuningPass(
     HloPassPipeline* pipeline, HloModule* hlo_module,

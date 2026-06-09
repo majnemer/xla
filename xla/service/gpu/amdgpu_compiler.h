@@ -26,7 +26,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/service/compiler.h"
 #include "xla/service/gpu/alias_info.h"
-#include "xla/service/gpu/gpu_compiler.h"
+#include "xla/service/gpu/gpu_llvm_compiler.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/dnn.h"
@@ -39,7 +39,7 @@ namespace xla {
 namespace gpu {
 
 // AMDGPUCompiler generates efficient GPU executables for AMDGPU target.
-class AMDGPUCompiler : public GpuCompiler {
+class AMDGPUCompiler : public GpuLLVMCompiler {
  public:
   AMDGPUCompiler();
 
