@@ -71,14 +71,13 @@ class MetalCompiler : public xla::gpu::GpuCompiler {
       const se::SemanticVersion& toolkit_version) override;
 
   // Profiling infrastructure (Memset32, AutotuneCacheKey, RepeatBuffer/
-  // redzone/comparator kernels, per-call MLIRContext) is in place and the
-  // post-fusion AutotunerPass runs end-to-end with factory_metal's backends
-  // when this skip is removed. Two issues keep it off by default: exploring
-  // NativeEmitter unroll-factor configs exposes Metal lowering bugs (NaN
-  // results on a few dot_operation shards), and measurement-dependent
-  // winners make concurrent compiles non-deterministic
-  // (multithreaded_compilation proto comparison). Validate those, then drop
-  // this override.
+  // redzone/comparator kernels, per-call MLIRContext) is in place; with
+  // this skip removed the post-fusion AutotunerPass runs end-to-end with
+  // factory_metal's backends and the full xla_metal suite passes except
+  // multithreaded_compilation: measurement-dependent winners make
+  // concurrent compiles of one module non-deterministic (its optimized-HLO
+  // proto comparison fails). Decide a determinism policy (shared autotune
+  // cache keyed across compiles), then drop this override.
   absl::Status AddAutotunerPass(
       HloPassPipeline* pipeline, HloModule* hlo_module,
       const se::GpuComputeCapability& gpu_version,

@@ -198,6 +198,14 @@ class GraphBuilder {
                            permutation:ToNSNumbers(InversePermutation(*perm))
                                   name:nil];
     }
+    // Pure data-movement graphs (a solo transpose) otherwise compile to a
+    // view of the input placeholder, and MPSGraphExecutable ELIDES the
+    // result write when the destination MPSNDArray shares its MTLBuffer
+    // with that placeholder's binding — the alias check is buffer-granular
+    // and ignores the differing offsets. Under BFC pooling, feed and result
+    // routinely share one pool chunk, leaving the result slice unwritten.
+    // An identity forces a materializing kernel, which always writes.
+    result = [graph_ identityWithTensor:result name:nil];
     artifact->result.physical_dims = PhysicalDims(result_shape);
     artifact->result.mps_data_type = static_cast<uint32_t>(result_dtype);
 

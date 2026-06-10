@@ -392,6 +392,162 @@ TEST(MetalGraphExecutableTest, Conv2DMatchesHostReference) {
   ExpectNear(actual, expected, 1e-3f);
 }
 
+// The autotuner converts generic fusions to __metal_graph (the partitioner
+// only anchors at dots/convs), so pre-converted fusions must execute
+// correctly straight through RunBackend.
+TEST(MetalGraphExecutableTest, PreConvertedSoloTransposeCapture) {
+  se::StreamExecutor* executor = GetMetalExecutorOrFail();
+  ASSERT_NE(executor, nullptr);
+
+  constexpr absl::string_view kHlo = R"hlo(
+    HloModule t
+    fused {
+      p = f32[2,3,5] parameter(0)
+      ROOT t = f32[5,2,3] transpose(p), dimensions={2,0,1}
+    }
+    ENTRY e {
+      p0 = f32[2,3,5] parameter(0)
+      ROOT f = f32[5,2,3] fusion(p0), kind=kCustom, calls=fused,
+          backend_config={"fusion_backend_config":{"kind":"__metal_graph"}}
+    }
+  )hlo";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(kHlo));
+  MetalCompiler compiler;
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<Executable> executable,
+      compiler.RunBackend(std::move(module), executor,
+                          Compiler::CompileOptions{}));
+
+  std::vector<float> input(2 * 3 * 5);
+  for (size_t i = 0; i < input.size(); ++i) input[i] = static_cast<float>(i);
+  std::vector<float> expected(5 * 2 * 3);
+  for (int a = 0; a < 2; ++a) {
+    for (int b = 0; b < 3; ++b) {
+      for (int c = 0; c < 5; ++c) {
+        expected[(c * 2 + a) * 3 + b] = input[(a * 3 + b) * 5 + c];
+      }
+    }
+  }
+  std::vector<float> actual =
+      ExecuteF32(executor, executable.get(),
+                 {ShapeUtil::MakeShape(F32, {2, 3, 5})}, {input},
+                 expected.size());
+  ExpectNear(actual, expected, 0.0f);
+}
+
+// Same capture, but the result is an intermediate consumed by an MSL fusion
+// — the buffer-assignment shape the autotuner's conversions produce.
+TEST(MetalGraphExecutableTest, PreConvertedTransposeIntoMslConsumer) {
+  se::StreamExecutor* executor = GetMetalExecutorOrFail();
+  ASSERT_NE(executor, nullptr);
+
+  constexpr absl::string_view kHlo = R"hlo(
+    HloModule t
+    tfused {
+      p = f32[2,3,5] parameter(0)
+      ROOT t = f32[5,2,3] transpose(p), dimensions={2,0,1}
+    }
+    nfused {
+      p = f32[5,2,3] parameter(0)
+      ROOT n = f32[5,2,3] negate(p)
+    }
+    ENTRY e {
+      p0 = f32[2,3,5] parameter(0)
+      f = f32[5,2,3] fusion(p0), kind=kCustom, calls=tfused,
+          backend_config={"fusion_backend_config":{"kind":"__metal_graph"}}
+      ROOT g = f32[5,2,3] fusion(f), kind=kLoop, calls=nfused
+    }
+  )hlo";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(kHlo));
+  MetalCompiler compiler;
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<Executable> executable,
+      compiler.RunBackend(std::move(module), executor,
+                          Compiler::CompileOptions{}));
+
+  std::vector<float> input(2 * 3 * 5);
+  for (size_t i = 0; i < input.size(); ++i) input[i] = static_cast<float>(i);
+  std::vector<float> expected(5 * 2 * 3);
+  for (int a = 0; a < 2; ++a) {
+    for (int b = 0; b < 3; ++b) {
+      for (int c = 0; c < 5; ++c) {
+        expected[(c * 2 + a) * 3 + b] = -input[(a * 3 + b) * 5 + c];
+      }
+    }
+  }
+  std::vector<float> actual =
+      ExecuteF32(executor, executable.get(),
+                 {ShapeUtil::MakeShape(F32, {2, 3, 5})}, {input},
+                 expected.size());
+  ExpectNear(actual, expected, 0.0f);
+}
+
+// Full replication of the autotuned einsum module that regressed:
+// captured 3D transpose feeding a native broadcast*transpose chain.
+TEST(MetalGraphExecutableTest, PreConvertedEinsumMixReplication) {
+  se::StreamExecutor* executor = GetMetalExecutorOrFail();
+  ASSERT_NE(executor, nullptr);
+
+  constexpr absl::string_view kHlo = R"hlo(
+    HloModule t
+    tfused {
+      p = f32[2,3,77] parameter(0)
+      ROOT t = f32[77,2,3] transpose(p), dimensions={2,0,1}
+    }
+    bfused {
+      p = f32[77,2,3] parameter(0)
+      ROOT b = f32[55,77,2,3] broadcast(p), dimensions={1,2,3}
+    }
+    t2fused {
+      p = f32[77,2,3,55] parameter(0)
+      ROOT t = f32[55,77,2,3] transpose(p), dimensions={3,0,1,2}
+    }
+    mfused {
+      p0 = f32[55,77,2,3] parameter(0)
+      p1 = f32[55,77,2,3] parameter(1)
+      ROOT m = f32[55,77,2,3] multiply(p0, p1)
+    }
+    ENTRY e {
+      p0 = f32[2,3,77] parameter(0)
+      p1 = f32[77,2,3,55] parameter(1)
+      t1 = f32[77,2,3] fusion(p0), kind=kCustom, calls=tfused,
+          backend_config={"fusion_backend_config":{"kind":"__metal_graph"}}
+      b = f32[55,77,2,3] fusion(t1), kind=kLoop, calls=bfused
+      t2 = f32[55,77,2,3] fusion(p1), kind=kInput, calls=t2fused
+      ROOT m = f32[55,77,2,3] fusion(b, t2), kind=kLoop, calls=mfused
+    }
+  )hlo";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(kHlo));
+  MetalCompiler compiler;
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<Executable> executable,
+      compiler.RunBackend(std::move(module), executor,
+                          Compiler::CompileOptions{}));
+
+  std::vector<float> in1(2 * 3 * 77), in2(77 * 2 * 3 * 55);
+  for (size_t i = 0; i < in1.size(); ++i) in1[i] = 0.001f * i - 0.2f;
+  for (size_t i = 0; i < in2.size(); ++i) in2[i] = 0.0001f * (i % 997) - 0.05f;
+  // out[b,a,i,j] = in1[i,j,a] * in2[a,i,j,b]
+  std::vector<float> expected(55 * 77 * 2 * 3);
+  for (int b = 0; b < 55; ++b) {
+    for (int a = 0; a < 77; ++a) {
+      for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 3; ++j) {
+          float lhs = in1[(i * 3 + j) * 77 + a];
+          float rhs = in2[((a * 2 + i) * 3 + j) * 55 + b];
+          expected[((b * 77 + a) * 2 + i) * 3 + j] = lhs * rhs;
+        }
+      }
+    }
+  }
+  std::vector<float> actual = ExecuteF32(
+      executor, executable.get(),
+      {ShapeUtil::MakeShape(F32, {2, 3, 77}),
+       ShapeUtil::MakeShape(F32, {77, 2, 3, 55})},
+      {in1, in2}, expected.size());
+  ExpectNear(actual, expected, 1e-5f);
+}
+
 TEST(MetalGraphExecutableTest, IntegerDotFallsBackToElementalMsl) {
   se::StreamExecutor* executor = GetMetalExecutorOrFail();
   ASSERT_NE(executor, nullptr);
