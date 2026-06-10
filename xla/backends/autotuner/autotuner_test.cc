@@ -78,6 +78,7 @@ using ::testing::AtMost;
 using ::testing::ByMove;
 using ::testing::MatchesRegex;
 using ::testing::Return;
+using ::testing::ReturnArg;
 using ::testing::UnorderedElementsAre;
 using ::tsl::proto_testing::EqualsProto;
 using ::tsl::proto_testing::ParseTextProtoOrDie;
@@ -188,9 +189,14 @@ class MockProfiler : public Profiler {
 
 class MockAutotunerCache : public AutotunerCacheInterface {
  public:
+  MockAutotunerCache() {
+    // Insert echoes the inserted config (the won-the-race outcome) unless a
+    // test overrides it.
+    ON_CALL(*this, Insert).WillByDefault(ReturnArg<1>());
+  }
   MOCK_METHOD(std::optional<AutotunerCacheInterface::Config>, Lookup,
               (const HloInstruction* instr), (override));
-  MOCK_METHOD(absl::Status, Insert,
+  MOCK_METHOD(absl::StatusOr<AutotunerCacheInterface::Config>, Insert,
               (const HloInstruction* instr,
                const AutotunerCacheInterface::Config& best_config),
               (override));
@@ -297,7 +303,7 @@ TEST_F(AutotunerTest, NoCacheManager) {
 TEST_F(AutotunerTest, AutotuneSingleSupportedConfig) {
   auto cache_manager = std::make_unique<MockAutotunerCache>();
   EXPECT_CALL(*cache_manager, Lookup(_)).WillOnce(Return(std::nullopt));
-  EXPECT_CALL(*cache_manager, Insert(_, _)).WillOnce(Return(absl::OkStatus()));
+  EXPECT_CALL(*cache_manager, Insert(_, _)).WillOnce(ReturnArg<1>());
 
   std::vector<std::unique_ptr<BackendConfig>> configs;
   configs.push_back(GetTestConfig("only_config"));
@@ -382,7 +388,7 @@ TEST_F(AutotunerTest, AutotuneButNoCompiledConfigs) {
 TEST_F(AutotunerTest, AutotuneAppliesBestConfigAndSkipsNonCompilableConfig) {
   auto cache_manager = std::make_unique<MockAutotunerCache>();
   EXPECT_CALL(*cache_manager, Lookup(_)).WillOnce(Return(std::nullopt));
-  EXPECT_CALL(*cache_manager, Insert(_, _)).WillOnce(Return(absl::OkStatus()));
+  EXPECT_CALL(*cache_manager, Insert(_, _)).WillOnce(ReturnArg<1>());
 
   std::vector<std::unique_ptr<BackendConfig>> configs;
   configs.push_back(GetTestConfig("test_config_1"));
@@ -420,7 +426,7 @@ TEST_F(AutotunerTest, AutotuneAppliesBestConfigAndSkipsNonCompilableConfig) {
 TEST_F(AutotunerTest, AutotuneAppliesBestConfigUsingThreadPool) {
   auto cache_manager = std::make_unique<MockAutotunerCache>();
   EXPECT_CALL(*cache_manager, Lookup(_)).WillOnce(Return(std::nullopt));
-  EXPECT_CALL(*cache_manager, Insert(_, _)).WillOnce(Return(absl::OkStatus()));
+  EXPECT_CALL(*cache_manager, Insert(_, _)).WillOnce(ReturnArg<1>());
 
   std::vector<std::unique_ptr<BackendConfig>> configs;
   configs.push_back(GetTestConfig("test_config_1"));
@@ -517,7 +523,7 @@ TEST_F(AutotunerTest, AutotuneModuleWithDuplicateInstructions) {
 TEST_F(AutotunerTest, AutotuneButOneBackendFails) {
   auto cache_manager = std::make_unique<MockAutotunerCache>();
   EXPECT_CALL(*cache_manager, Lookup(_)).WillOnce(Return(std::nullopt));
-  EXPECT_CALL(*cache_manager, Insert(_, _)).WillOnce(Return(absl::OkStatus()));
+  EXPECT_CALL(*cache_manager, Insert(_, _)).WillOnce(ReturnArg<1>());
 
   std::vector<std::unique_ptr<BackendConfig>> configs;
   configs.push_back(GetTestConfig("test_config_1"));
@@ -1387,7 +1393,7 @@ TEST_F(AutotunerTest, ShardedAutotuning) {
       .WillOnce(Return(std::nullopt))                    // During autotuning.
       .WillOnce(Return(GetCacheConfig("best_config")));  // Config application.
   EXPECT_CALL(*cache, Insert(InstrPtrMatcher(HloOpcode::kAdd), _))
-      .WillOnce(Return(absl::OkStatus()));
+      .WillOnce(ReturnArg<1>());
   EXPECT_CALL(*cache, Serialize(_)).WillOnce(Return("kAdd_autotune_result"));
   // Stores the serialized results to the KV store if it does not exist.
   EXPECT_CALL(*kv_store, TryGet(testing::HasSubstr("_0")))
@@ -1436,7 +1442,7 @@ TEST_F(AutotunerTest, ShardedAutotuningTolerateLostSetRace) {
       .WillOnce(Return(std::nullopt))
       .WillOnce(Return(GetCacheConfig("best_config")));
   EXPECT_CALL(*cache, Insert(InstrPtrMatcher(HloOpcode::kAdd), _))
-      .WillOnce(Return(absl::OkStatus()));
+      .WillOnce(ReturnArg<1>());
   EXPECT_CALL(*cache, Serialize(_)).WillOnce(Return("kAdd_autotune_result"));
 
   // The KV store reports the slot as empty, so the shard tries to Set...
@@ -1488,7 +1494,7 @@ TEST_F(AutotunerTest, ShardedAutotuningPropagatesNonRaceSetError) {
   EXPECT_CALL(*cache, Lookup(InstrPtrMatcher(HloOpcode::kAdd)))
       .WillOnce(Return(std::nullopt));
   EXPECT_CALL(*cache, Insert(InstrPtrMatcher(HloOpcode::kAdd), _))
-      .WillOnce(Return(absl::OkStatus()));
+      .WillOnce(ReturnArg<1>());
   EXPECT_CALL(*cache, Serialize(_)).WillOnce(Return("kAdd_autotune_result"));
 
   // The KV store reports the slot as empty, so the shard tries to Set...
@@ -1624,7 +1630,7 @@ TEST_F(AutotunerTest, ProfileAllUnloadsCandidatesBeforeReleasingProfilerLock) {
   backends.push_back(std::move(backend));
   auto cache = std::make_unique<MockAutotunerCache>();
   EXPECT_CALL(*cache, Lookup(_)).WillRepeatedly(Return(std::nullopt));
-  EXPECT_CALL(*cache, Insert(_, _)).WillRepeatedly(Return(absl::OkStatus()));
+  EXPECT_CALL(*cache, Insert(_, _)).WillRepeatedly(ReturnArg<1>());
 
   ASSERT_OK_AND_ASSIGN(
       auto autotuner,

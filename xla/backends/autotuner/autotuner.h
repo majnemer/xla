@@ -201,9 +201,13 @@ class Autotuner {
 
   // TODO: b/407494653 - Directly use cache api when the configs are unified.
   // Translates from Autotuner::Config to AutotunerCacheInterface::Config and
-  // the other way around.
+  // the other way around. Insert returns the cache's canonical config —
+  // `config` if this call inserted it, the existing entry if another thread
+  // won the race — which the caller must apply so concurrent compiles
+  // converge.
   std::optional<Autotuner::Config> LookUp(const HloInstruction* instr);
-  absl::Status Insert(const HloInstruction* instr, Autotuner::Config& config);
+  absl::StatusOr<Autotuner::Config> Insert(const HloInstruction* instr,
+                                           Autotuner::Config& config);
 
   absl::StatusOr<std::vector<Config>> GetSupportedConfigs(
       HloInstruction* instr);

@@ -45,8 +45,8 @@ class LegacyCache : public AutotunerCacheInterface {
         cache_mode_(cache_mode),
         device_desc_(std::move(device_desc)) {}
   std::optional<Config> Lookup(const HloInstruction* instr) override;
-  absl::Status Insert(const HloInstruction* instr,
-                      const Config& best_config) override;
+  absl::StatusOr<Config> Insert(const HloInstruction* instr,
+                                const Config& best_config) override;
 
   absl::StatusOr<std::string> Serialize(absl::Span<const HloInstruction* const>
                                             instructions_to_serialize) override;

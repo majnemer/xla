@@ -58,8 +58,8 @@ std::optional<LegacyCache::Config> LegacyCache::Lookup(
   return GetConfig(result->value(), instr->opcode() == HloOpcode::kFusion);
 }
 
-absl::Status LegacyCache::Insert(const HloInstruction* instr,
-                                 const Config& best_config) {
+absl::StatusOr<LegacyCache::Config> LegacyCache::Insert(
+    const HloInstruction* instr, const Config& best_config) {
   AutotuneCacheKey key = GetAutotuneCacheKey(*instr);
   AutotuneResult autotune_result = GetAutotuneResult(best_config);
   absl::StatusOr<AutotunerCache::ResultAndInserted> result_and_inserted =
@@ -70,7 +70,18 @@ absl::Status LegacyCache::Insert(const HloInstruction* instr,
                << result_and_inserted.status();
     return result_and_inserted.status();
   }
-  return absl::OkStatus();
+  if (result_and_inserted->inserted) {
+    return best_config;
+  }
+  // Lost the insertion race; return the canonical entry so concurrent
+  // compiles converge on one config.
+  std::optional<Config> canonical = GetConfig(
+      result_and_inserted->result, instr->opcode() == HloOpcode::kFusion);
+  if (!canonical.has_value()) {
+    return absl::InternalError(
+        "Failed to translate the canonical autotune cache entry.");
+  }
+  return *std::move(canonical);
 }
 
 void LegacyCache::ClearCache() { AutotunerCache::ClearAutotuneResults(); }

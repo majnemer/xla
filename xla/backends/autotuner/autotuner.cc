@@ -333,8 +333,9 @@ tsl::Future<Autotuner::Config> Autotuner::GetConfig(HloInstruction* instr) {
   VLOG(1) << "Autotuning the HLO instruction to find best config.";
   return TuneBestConfig(instr).Map(
       [&, instr](Autotuner::Config best_config) -> absl::StatusOr<Config> {
-        RETURN_IF_ERROR(Insert(instr, best_config));
-        return best_config;
+        // Apply the cache's canonical config, not the local winner, so
+        // concurrent compiles of the same instruction converge.
+        return Insert(instr, best_config);
       });
 }
 
@@ -532,15 +533,35 @@ std::optional<Autotuner::Config> Autotuner::LookUp(
   return std::nullopt;
 }
 
-absl::Status Autotuner::Insert(const HloInstruction* instr,
-                               Autotuner::Config& config) {
-  if (cache_) {
-    AutotunerCacheInterface::Config cached_config;
-    cached_config.codegen_backend = config.codegen_backend->backend();
-    cached_config.backend_config = *config.backend_config;
-    return cache_->Insert(instr, cached_config);
+absl::StatusOr<Autotuner::Config> Autotuner::Insert(
+    const HloInstruction* instr, Autotuner::Config& config) {
+  if (!cache_) {
+    return std::move(config);
   }
-  return absl::OkStatus();
+  AutotunerCacheInterface::Config cached_config;
+  cached_config.codegen_backend = config.codegen_backend->backend();
+  cached_config.backend_config = *config.backend_config;
+  ASSIGN_OR_RETURN(AutotunerCacheInterface::Config canonical,
+                   cache_->Insert(instr, cached_config));
+  if (canonical.codegen_backend == cached_config.codegen_backend &&
+      canonical.backend_config.SerializeAsString() ==
+          cached_config.backend_config.SerializeAsString()) {
+    // Won the race (or the cache echoed our entry): keep the original config
+    // and its exact backend instance.
+    return std::move(config);
+  }
+  for (auto& codegen_backend : codegen_backends_) {
+    if (codegen_backend->backend() == canonical.codegen_backend) {
+      return Config{
+          codegen_backend.get(),
+          std::make_unique<BackendConfig>(canonical.backend_config)};
+    }
+  }
+  LOG(WARNING) << "Canonical cached config comes from backend "
+               << Backend_Name(canonical.codegen_backend)
+               << ", which is not registered with the autotuner; keeping the "
+                  "locally measured config.";
+  return std::move(config);
 }
 
 absl::StatusOr<std::vector<Autotuner::Config>> Autotuner::GetSupportedConfigs(

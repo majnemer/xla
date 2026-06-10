@@ -50,8 +50,13 @@ class AutotunerCacheInterface {
 
   virtual std::optional<Config> Lookup(const HloInstruction* instr) = 0;
 
-  virtual absl::Status Insert(const HloInstruction* instr,
-                              const Config& best_config) = 0;
+  // Inserts `best_config` for `instr` and returns the config that ended up
+  // in the cache: `best_config` if this call inserted it, or the existing
+  // entry if another thread won the race. Callers must apply the returned
+  // config rather than their local winner so concurrent compiles of
+  // identical instructions converge deterministically.
+  virtual absl::StatusOr<Config> Insert(const HloInstruction* instr,
+                                        const Config& best_config) = 0;
 
   virtual CacheStats GetCacheStats() const = 0;
 
