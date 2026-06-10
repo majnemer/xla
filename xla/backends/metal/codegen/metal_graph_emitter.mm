@@ -409,6 +409,9 @@ class GraphBuilder {
       case HloOpcode::kNot:
         return [graph_ notWithTensor:in name:nil];
       case HloOpcode::kRsqrt: {
+        if (@available(macOS 15.0, *)) {
+          return [graph_ reciprocalSquareRootWithTensor:in name:nil];
+        }
         MPSGraphTensor* sqrt = [graph_ squareRootWithTensor:in name:nil];
         return [graph_ reciprocalWithTensor:sqrt name:nil];
       }
