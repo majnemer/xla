@@ -21,6 +21,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
+#include "absl/functional/function_ref.h"
 #include "absl/log/check.h"
 #include "absl/status/statusor.h"
 #include "xla/backends/metal/transforms/metal_graph_support.h"
@@ -81,9 +82,9 @@ bool ParamOk(const HloInstruction* instr) {
 
 class RegionBuilder {
  public:
-  RegionBuilder(HloComputation* computation,
-                const MetalGraphCapabilities& caps)
-      : computation_(computation), caps_(caps) {}
+  RegionBuilder(HloComputation* computation, const MetalGraphCapabilities& caps,
+                absl::FunctionRef<bool(const HloInstruction*)> eligible)
+      : computation_(computation), caps_(caps), eligible_(eligible) {}
 
   // Builds the maximal region around `anchor` and returns its members in
   // reverse topological order (root first), ready for
@@ -135,6 +136,9 @@ class RegionBuilder {
   // leaves `region` unchanged. Scalar constants absorb unconditionally
   // (fusion clones them; duplication is free).
   bool TryAbsorbValue(HloInstruction* value, InstructionSet& region) {
+    if (!eligible_(value)) {
+      return false;
+    }
     // The gate accepts kParameter for fusion-body validation, but a
     // computation parameter is a region input by definition.
     if (value->opcode() == HloOpcode::kParameter) {
@@ -191,6 +195,9 @@ class RegionBuilder {
   }
 
   bool TryAbsorbUser(HloInstruction* user, InstructionSet& region) {
+    if (!eligible_(user)) {
+      return false;
+    }
     if (user->parent() != computation_ || user->HasSideEffect() ||
         !Translatable(user)) {
       return false;
@@ -302,6 +309,7 @@ class RegionBuilder {
 
   HloComputation* computation_;
   const MetalGraphCapabilities& caps_;
+  absl::FunctionRef<bool(const HloInstruction*)> eligible_;
 };
 
 absl::StatusOr<bool> PartitionComputation(
@@ -327,20 +335,31 @@ absl::StatusOr<bool> PartitionComputation(
       refused.insert(anchor);
       continue;
     }
-    RegionBuilder builder(computation, caps);
-    std::vector<HloInstruction*> region = builder.Build(anchor);
-    HloInstruction* fusion = computation->CreateFusionInstruction(
-        region, HloInstruction::FusionKind::kCustom);
-    gpu::GpuBackendConfig config;
-    config.mutable_fusion_backend_config()->set_kind(
-        std::string(gpu::kMetalGraphFusionKind));
-    TF_RETURN_IF_ERROR(fusion->set_backend_config(config));
+    TF_RETURN_IF_ERROR(
+        CaptureMetalGraphRegion(computation, anchor, caps,
+                                [](const HloInstruction*) { return true; })
+            .status());
     changed = true;
   }
   return changed;
 }
 
 }  // namespace
+
+absl::StatusOr<HloInstruction*> CaptureMetalGraphRegion(
+    HloComputation* computation, HloInstruction* anchor,
+    const MetalGraphCapabilities& caps,
+    absl::FunctionRef<bool(const HloInstruction*)> eligible) {
+  RegionBuilder builder(computation, caps, eligible);
+  std::vector<HloInstruction*> region = builder.Build(anchor);
+  HloInstruction* fusion = computation->CreateFusionInstruction(
+      region, HloInstruction::FusionKind::kCustom);
+  gpu::GpuBackendConfig config;
+  config.mutable_fusion_backend_config()->set_kind(
+      std::string(gpu::kMetalGraphFusionKind));
+  TF_RETURN_IF_ERROR(fusion->set_backend_config(config));
+  return fusion;
+}
 
 absl::StatusOr<bool> MetalGraphPartitioner::RunImpl(
     HloModule* module,

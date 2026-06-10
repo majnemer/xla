@@ -557,6 +557,58 @@ cc_library(
 )
 
 cc_library(
+    name = "metal_graph_partition",
+    srcs = ["metal_graph_partition.cc"],
+    hdrs = ["metal_graph_partition.h"],
+    tags = ["gpu"],
+    deps = [
+        ":gpu_codegen_backend",
+        "//xla:xla_proto_cc",
+        "//xla/backends/autotuner:backends_proto_cc",
+        "//xla/backends/autotuner:codegen_backend",
+        "//xla/backends/metal/transforms:metal_graph_partitioner",
+        "//xla/backends/metal/transforms:metal_graph_support",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:compiler",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_test(
+    name = "metal_graph_partition_test",
+    srcs = ["metal_graph_partition_test.cc"],
+    tags = ["gpu"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":metal_graph_partition",
+        "//xla:xla_proto_cc",
+        "//xla/backends/autotuner:backend_config_proto_cc",
+        "//xla/backends/metal/transforms:metal_graph_support",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/parser:hlo_parser",
+        "//xla/service:compiler",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/stream_executor:platform",
+        "//xla/stream_executor:platform_manager",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/metal:metal_platform",
+        "//xla/tsl/lib/core:status_test_util",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "factory_metal",
     srcs = ["factory_metal.cc"],
     tags = ["gpu"],
@@ -565,6 +617,7 @@ cc_library(
     deps = [
         ":factory",
         ":metal_graph",
+        ":metal_graph_partition",
         ":native_emitter",
         "//xla:xla_proto_cc",
         "//xla/backends/autotuner:backends_proto_cc",

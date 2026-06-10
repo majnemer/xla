@@ -17,14 +17,28 @@ limitations under the License.
 #define XLA_BACKENDS_METAL_TRANSFORMS_METAL_GRAPH_PARTITIONER_H_
 
 #include "absl/container/flat_hash_set.h"
+#include "absl/functional/function_ref.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "xla/backends/metal/transforms/metal_graph_support.h"
+#include "xla/hlo/ir/hlo_computation.h"
+#include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/pass/hlo_pass_interface.h"
 
 namespace xla {
 namespace metal {
+
+// Grows a region around `anchor` per the partitioner's rules, absorbing only
+// instructions for which `eligible` returns true, and replaces it with a
+// kCustom fusion of kind __metal_graph. `anchor` must pass the gate. Returns
+// the created fusion. Used by the partitioner pass (eligible = everything)
+// and by the autotuner's partition backend, which restricts growth to a
+// defused body and keeps anchors out of each other's regions.
+absl::StatusOr<HloInstruction*> CaptureMetalGraphRegion(
+    HloComputation* computation, HloInstruction* anchor,
+    const MetalGraphCapabilities& caps,
+    absl::FunctionRef<bool(const HloInstruction*)> eligible);
 
 // Forms MPSGraph-bound regions: kCustom fusions with
 // FusionBackendConfig.kind == "__metal_graph", anchored at translatable

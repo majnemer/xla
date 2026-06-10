@@ -24,6 +24,7 @@ limitations under the License.
 #include "xla/backends/autotuner/codegen_backend.h"
 #include "xla/backends/gpu/autotuner/factory.h"
 #include "xla/backends/gpu/autotuner/metal_graph.h"
+#include "xla/backends/gpu/autotuner/metal_graph_partition.h"
 #include "xla/backends/gpu/autotuner/native_emitter.h"
 #include "xla/hlo/analysis/alias_info.h"
 #include "xla/service/compiler.h"
@@ -51,6 +52,8 @@ std::vector<std::unique_ptr<CodegenBackend>> GetCodegenBackendsForMetal(
     absl::Span<const autotuner::Backend> backend_allowlist) {
   std::vector<std::unique_ptr<CodegenBackend>> backends;
   backends.push_back(std::make_unique<MetalGraphBackend>(
+      stream_executor, debug_options, compiler, target_config));
+  backends.push_back(std::make_unique<MetalGraphPartitionBackend>(
       stream_executor, debug_options, compiler, target_config));
   backends.push_back(std::make_unique<NativeEmitterBackend>(
       debug_options, compiler, target_config, stream_executor));

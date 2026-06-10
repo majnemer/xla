@@ -93,6 +93,14 @@ std::unique_ptr<Executable> CompileOrFail(se::StreamExecutor* executor,
     ADD_FAILURE() << "parse failed: " << parsed.status();
     return nullptr;
   }
+  // Profiling-based plan racing may legitimately re-partition captures;
+  // select-first keeps the deterministic partitioner output so the
+  // structural assertions below stay meaningful. The PJRT suites exercise
+  // racing at default flags.
+  (*parsed)
+      ->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_autotune_level(0);
   MetalCompiler compiler;
   auto optimized = compiler.RunHloPasses(*std::move(parsed), executor,
                                          Compiler::CompileOptions{});

@@ -19,5 +19,6 @@ message BackendConfig {
     xla.cpu.LlvmKernelOptions llvm_kernel = 5;
     xla.gpu.NativeEmitterBackendConfig native_emitter = 6;
     xla.gpu.MetalGraphFusionConfig metal_graph = 7;
+    xla.gpu.MetalGraphPartitionConfig metal_graph_partition = 8;
   }
 }

@@ -276,6 +276,14 @@ message DynamicMemcpyConfig {
 // the fusion as already configured by the autotuner.
 message MetalGraphFusionConfig {}
 
+// Partition plan for splitting a __metal_graph fusion: each named anchor (a
+// dot/convolution instruction in the fusion body) grows its own MPSGraph
+// subregion without absorbing other anchors; anchors not named become
+// single-op captures; remaining body ops return to native codegen.
+message MetalGraphPartitionConfig {
+  repeated string grown_anchors = 1;
+}
+
 // Next id: 9
 message FusionBackendConfig {
   // kLoop, kInput, or kOutput (from HloInstruction::FusionKind), or your own
