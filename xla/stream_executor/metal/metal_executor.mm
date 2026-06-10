@@ -90,7 +90,7 @@ MetalExecutor::MetalExecutor(Platform* platform, int ordinal)
 MetalExecutor::~MetalExecutor() = default;
 
 fft::FftSupport* MetalExecutor::AsFft() {
-  absl::MutexLock lock(&fft_mu_);
+  absl::MutexLock lock(&mu_);
   if (fft_ != nullptr) {
     return fft_.get();
   }

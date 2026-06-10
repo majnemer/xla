@@ -158,9 +158,8 @@ class MetalExecutor : public gpu::GpuExecutor {
   // The Metal device handle. Populated by Init() and immutable thereafter.
   id<MTLDevice> device_;
 
-  // Lazy-initialised FFT plugin.
-  absl::Mutex fft_mu_;
-  std::unique_ptr<fft::FftSupport> fft_ ABSL_GUARDED_BY(fft_mu_);
+  absl::Mutex mu_;
+  std::unique_ptr<fft::FftSupport> fft_ ABSL_GUARDED_BY(mu_);
 
   // Per-device allocator. Created in Init() once `device_` is set.
   std::unique_ptr<MetalAllocator> allocator_;
