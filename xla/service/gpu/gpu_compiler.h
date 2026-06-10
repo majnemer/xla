@@ -183,6 +183,16 @@ class GpuCompiler : public virtual Compiler {
       se::GpuComputeCapability gpu_version,
       const se::SemanticVersion& toolkit_version);
 
+  // Hook for backends that hand whole HLO regions to an external graph
+  // compiler (e.g. MPSGraph on Metal). Runs in the post-layout-assignment
+  // pipeline after layout normalization and reduce canonicalization, just
+  // before float normalization, so captured regions can keep low-precision
+  // types the surrounding pipeline widens. Default: no passes.
+  virtual void AddGraphCompilerFusionPasses(
+      HloPassPipeline& pipeline,
+      const se::DeviceDescription& device_description,
+      se::StreamExecutor* stream_exec) {}
+
   // During compilation with device, stream_exec != null and autotune_results
   // == null. During deviceless AOT compilation, stream_exec == null and
   // autotune_results != null.

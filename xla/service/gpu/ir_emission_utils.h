@@ -106,6 +106,10 @@ inline constexpr absl::string_view kTritonNestedGemmFusionKind =
 // Fusions that use Triton have FusionBackendConfig.kind equal to this string.
 inline constexpr absl::string_view kCuDnnFusionKind = "__cudnn$fusion";
 
+// Fusions handed to Apple's MPSGraph compiler (Metal backend) have
+// FusionBackendConfig.kind equal to this string.
+inline constexpr absl::string_view kMetalGraphFusionKind = "__metal_graph";
+
 // Fusions that can be emitted using a dynamic memcpy. A dynamic memcpy depends
 // on some loop induction variable.
 inline constexpr absl::string_view kDynamicMemcpyFusionKind =

@@ -116,7 +116,11 @@ HloFusionAnalysis::EmitterFusionKind GetEmitterFusionKind(
     absl::Span<const HloInstructionAdaptor> fusion_heroes,
     const std::optional<TransposeDescription>& tiled_transpose,
     const se::DeviceDescription& device_info) {
-  if (fusion_backend_config.kind() == kCustomFusionKind) {
+  // kMetalGraphFusionKind: the Metal backend intercepts these before emitter
+  // selection; classifying as kCustomFusion makes a missed dispatch fail loud
+  // instead of hero classification silently emitting an elemental kernel.
+  if (fusion_backend_config.kind() == kCustomFusionKind ||
+      fusion_backend_config.kind() == kMetalGraphFusionKind) {
     return HloFusionAnalysis::EmitterFusionKind::kCustomFusion;
   }
 

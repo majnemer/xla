@@ -271,7 +271,12 @@ message DynamicMemcpyConfig {
   repeated int64 dst_offset_bytes = 3;
 }
 
-// Next id: 8
+// Config for fusions handed to Apple's MPSGraph compiler (Metal backend).
+// Intentionally empty: MPSGraph exposes no tunable parameters. Presence marks
+// the fusion as already configured by the autotuner.
+message MetalGraphFusionConfig {}
+
+// Next id: 9
 message FusionBackendConfig {
   // kLoop, kInput, or kOutput (from HloInstruction::FusionKind), or your own
   // custom string.
@@ -300,6 +305,9 @@ message FusionBackendConfig {
   CuDnnFusionConfig cudnn_fusion_config = 5;
 
   DynamicMemcpyConfig dynamic_memcpy_config = 7;
+
+  // Only valid when kind == "__metal_graph".
+  MetalGraphFusionConfig metal_graph_fusion_config = 8;
 
   reserved 3;
 }

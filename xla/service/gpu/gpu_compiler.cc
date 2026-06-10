@@ -2017,6 +2017,12 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
 
   pipeline.AddPass<SubByteCollectiveNormalization>();
 
+  // Backends delegating regions to an external graph compiler form those
+  // fusions here, before float normalization widens low-precision types the
+  // captured regions can keep native.
+  AddGraphCompilerFusionPasses(pipeline, gpu_target_config.device_description,
+                               stream_exec);
+
   // Triton compilation needs normalized operations on bf16 (i.e. converted to
   // f32).
   add_float_normalization(pipeline);

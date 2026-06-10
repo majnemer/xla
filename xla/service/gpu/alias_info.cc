@@ -31,6 +31,7 @@ limitations under the License.
 #include "xla/primitive_util.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
+#include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/stream_executor/device_description.h"
@@ -42,6 +43,14 @@ std::optional<bool> FusionCanShareBufferHint(
     const HloInstruction* operand, const HloFusionInstruction* user,
     const ShapeIndex& user_index,
     const se::DeviceDescription& device_description) {
+  // MPSGraph executes captured regions as an opaque library call whose
+  // feed/result aliasing contract is unspecified; never share.
+  if (auto config = user->backend_config<GpuBackendConfig>();
+      config.ok() &&
+      config->fusion_backend_config().kind() == kMetalGraphFusionKind) {
+    return false;
+  }
+
   // First, do the trivial check: if the fusion operand and the fusion output
   // have a different number of elements or have a different element byte size,
   // the buffer cannot be shared.
