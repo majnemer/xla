@@ -382,14 +382,16 @@ class GraphBuilder {
         return [graph_ divisionWithPrimaryTensor:lhs
                                  secondaryTensor:rhs
                                             name:nil];
+      // XLA maximum/minimum propagate NaNs; the plain MPSGraph ops follow
+      // IEEE maxNum/minNum and return the non-NaN operand.
       case HloOpcode::kMaximum:
-        return [graph_ maximumWithPrimaryTensor:lhs
-                                secondaryTensor:rhs
-                                           name:nil];
+        return [graph_ maximumWithNaNPropagationWithPrimaryTensor:lhs
+                                                  secondaryTensor:rhs
+                                                             name:nil];
       case HloOpcode::kMinimum:
-        return [graph_ minimumWithPrimaryTensor:lhs
-                                secondaryTensor:rhs
-                                           name:nil];
+        return [graph_ minimumWithNaNPropagationWithPrimaryTensor:lhs
+                                                  secondaryTensor:rhs
+                                                             name:nil];
       case HloOpcode::kPower:
         return [graph_ powerWithPrimaryTensor:lhs
                               secondaryTensor:rhs

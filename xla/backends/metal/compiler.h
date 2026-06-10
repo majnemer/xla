@@ -70,28 +70,9 @@ class MetalCompiler : public xla::gpu::GpuCompiler {
       se::GpuComputeCapability gpu_version,
       const se::SemanticVersion& toolkit_version) override;
 
-  // Profiling infrastructure (Memset32, AutotuneCacheKey, RepeatBuffer/
-  // redzone/comparator kernels, per-call MLIRContext) is in place; with
-  // this skip removed the post-fusion AutotunerPass runs end-to-end with
-  // factory_metal's backends and the full xla_metal suite passes except
-  // multithreaded_compilation: measurement-dependent winners make
-  // concurrent compiles of one module non-deterministic (its optimized-HLO
-  // proto comparison fails). Decide a determinism policy (shared autotune
-  // cache keyed across compiles), then drop this override.
-  absl::Status AddAutotunerPass(
-      HloPassPipeline* pipeline, HloModule* hlo_module,
-      const se::GpuComputeCapability& gpu_version,
-      const CompileOptions& options, tsl::thread::ThreadPool* thread_pool,
-      stream_executor::StreamExecutor* stream_executor,
-      const xla::gpu::GpuTargetConfig* target_config,
-      const AliasInfo* alias_info, mlir::MLIRContext* mlir_context,
-      HloCostAnalysis::ShapeSizeFunction shape_size_fn,
-      const MultiProcessKeyValueStore& key_value_store) override {
-    return absl::OkStatus();
-  }
-
-  // The legacy conv+GEMM autotuner tunes gpublas/cudnn custom calls Metal
-  // will never have; skip it.
+  // The post-fusion AutotunerPass (added by the base AddAutotunerPass) runs
+  // with factory_metal's backends. The legacy conv+GEMM autotuner below
+  // tunes gpublas/cudnn custom calls Metal will never have; skip it.
   absl::Status AddConvAndGemmAutotuningPass(
       HloPassPipeline* pipeline, HloModule* hlo_module,
       const se::GpuComputeCapability& gpu_version,
