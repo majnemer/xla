@@ -31,6 +31,7 @@ limitations under the License.
 #include "xla/stream_executor/kernel_args.h"
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/metal/metal_executor.h"
+#include "xla/stream_executor/metal/metal_stream.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/tsl/platform/statusor.h"
 
@@ -172,10 +173,22 @@ absl::Status MetalKernel::Launch(const ThreadDim& thread_dims,
           expected, " (arity=", Arity(),
           ", shmem_bytes=", packed.number_of_shared_bytes(), ")."));
     }
-    void** params = const_cast<void**>(packed.argument_addresses().data());
-    return stream->LaunchKernel(
-        thread_dims, block_dims, cluster_dims, this, name(), params,
-        static_cast<int64_t>(packed.number_of_shared_bytes()), use_pdl());
+    if (cluster_dims.has_value()) {
+      return absl::UnimplementedError(
+          "MetalKernel::Launch: cluster dimensions are not supported on "
+          "Metal.");
+    }
+    auto* metal_stream = dynamic_cast<MetalStream*>(stream);
+    if (metal_stream == nullptr) {
+      return absl::InvalidArgumentError(
+          "MetalKernel::Launch: stream is not a MetalStream.");
+    }
+    // Sized binding lets registry kernels pass by-value scalars (setBytes);
+    // packers without size metadata keep the all-buffers contract.
+    return metal_stream->LaunchKernelPacked(
+        thread_dims, block_dims, this, name(), packed.argument_addresses(),
+        packed.argument_sizes(),
+        static_cast<int64_t>(packed.number_of_shared_bytes()));
   };
 
   if (auto* packed = DynCast<KernelArgsPackedArrayBase>(&args)) {

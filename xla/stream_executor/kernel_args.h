@@ -263,6 +263,12 @@ class KernelArgsPackedArrayBase : public KernelArgs {
   // Gets the list of argument addresses.
   virtual absl::Span<const void* const> argument_addresses() const = 0;
 
+  // Sizes of the packed arguments, parallel to `argument_addresses`, or an
+  // empty span when unknown (legacy packers). CUDA-style launches don't need
+  // them (the driver knows parameter sizes from the kernel signature);
+  // backends that bind by-value scalars explicitly (Metal setBytes) do.
+  virtual absl::Span<const size_t> argument_sizes() const { return {}; }
+
   static bool classof(const KernelArgs* args) {
     return args->kind() == Kind::kPackedArray;
   }
@@ -557,6 +563,12 @@ class KernelArgsPackedTuple : public KernelArgsPackedArrayBase {
 
   absl::Span<const void* const> argument_addresses() const final {
     return absl::Span<const void* const>(argument_addresses_.data(), kSize);
+  }
+
+  absl::Span<const size_t> argument_sizes() const final {
+    static constexpr std::array<size_t, kSize> kArgumentSizes{
+        sizeof(typename KernelArgPacking<absl::remove_cvref_t<Args>>::Type)...};
+    return absl::Span<const size_t>(kArgumentSizes.data(), kSize);
   }
 
   // Compile time check that KernelArgsPackedTuple is compatible with

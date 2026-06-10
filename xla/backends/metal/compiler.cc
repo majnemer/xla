@@ -264,12 +264,19 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
       gpu_topology.gpu_target_config().device_description;
   std::unique_ptr<gpu::GpuAliasInfo> alias_info = GetAliasInfo(gpu_device_info);
 
+  // Compiler instances are per-platform singletons and the autotuner
+  // compiles candidates concurrently through RunBackend, so this function
+  // must not touch the shared member MLIRContext (dialect loading races).
+  // Phase-2 fusion workers already build their own contexts; this one serves
+  // scheduling and the top-level dialect setup.
+  mlir::MLIRContext local_mlir_context;
+
   // Schedule via the inherited GpuCompiler helper (pre-scheduling passes,
   // scheduler, scheduled-module verifier, post-scheduling pipelines), then
   // use SequentialHloOrdering off the resulting schedule for buffer
   // assignment — same shape as the LLVM-flavored GPU path.
   TF_RETURN_IF_ERROR(ScheduleAndVerify(hlo_module.get(), gpu_topology,
-                                       alias_info.get(), mlir_context())
+                                       alias_info.get(), &local_mlir_context)
                          .status());
 
   BufferAssigner::Options buffer_assigner_options;
@@ -293,9 +300,9 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
   // MlirKernelEmitter → metal::EmitMslKernel → KernelThunk; per-fusion MSL
   // accumulates into GpuExecutable::Params::asm_text (NVPTX uses the same
   // slot for PTX). Dialect registry mirrors MlirKernelFusion's needs.
-  mlir_context()->appendDialectRegistry(
+  local_mlir_context.appendDialectRegistry(
       gpu::MlirKernelEmitter::GetDialectRegistry());
-  mlir_context()->loadAllAvailableDialects();
+  local_mlir_context.loadAllAvailableDialects();
   std::unique_ptr<CallGraph> call_graph = CallGraph::Build(hlo_module.get());
   std::vector<gpu::GpuExecutable::ConstantInfo> constants;
   // Backend-synthesized module globals (RNG state). Slices captured by

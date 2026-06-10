@@ -562,6 +562,20 @@ MetalStream::LaunchKernel(const ThreadDim &thread_dims,
         "Metal.");
   }
   auto *kernel = static_cast<MetalKernel *>(function);
+  if (kernel == nullptr) {
+    return absl::InvalidArgumentError("MetalStream::LaunchKernel: null kernel.");
+  }
+  return LaunchKernelPacked(
+      thread_dims, block_dims, kernel, name,
+      absl::Span<const void *const>(args, kernel->Arity()),
+      /*arg_sizes=*/{}, shmem_bytes);
+}
+
+absl::Status MetalStream::LaunchKernelPacked(
+    const ThreadDim &thread_dims, const BlockDim &block_dims,
+    MetalKernel *kernel, absl::string_view name,
+    absl::Span<const void *const> args, absl::Span<const size_t> arg_sizes,
+    int64_t shmem_bytes) {
   if (kernel == nullptr || kernel->pipeline_state() == nil) {
     return absl::InvalidArgumentError(
         "MetalStream::LaunchKernel: null kernel or pipeline state.");
@@ -599,20 +613,35 @@ MetalStream::LaunchKernel(const ThreadDim &thread_dims,
     MetalAllocator *allocator = executor_->allocator();
     const unsigned arity = kernel->Arity();
     for (unsigned i = 0; i < arity; ++i) {
-      void *arg_ptr = *static_cast<void *const *>(args[i]);
-      if (arg_ptr == nullptr) {
-        [encoder endEncoding];
-        return absl::InvalidArgumentError(absl::StrCat(
-            "MetalStream::LaunchKernel: argument ", i, " is null."));
+      const size_t arg_size =
+          arg_sizes.empty() ? sizeof(void *) : arg_sizes[i];
+      bool bound = false;
+      if (arg_size == sizeof(void *)) {
+        void *arg_ptr = *static_cast<void *const *>(args[i]);
+        if (arg_ptr != nullptr) {
+          auto resolved = allocator->Resolve(arg_ptr);
+          if (resolved.has_value()) {
+            [encoder setBuffer:resolved->buffer
+                        offset:resolved->offset
+                       atIndex:i];
+            bound = true;
+          }
+        }
+        // Without size metadata every argument must be an owned address.
+        if (!bound && arg_sizes.empty()) {
+          [encoder endEncoding];
+          return absl::InvalidArgumentError(absl::StrCat(
+              "MetalStream::LaunchKernel: argument ", i,
+              arg_ptr == nullptr
+                  ? " is null."
+                  : " is not owned by this executor's allocator."));
+        }
       }
-      auto resolved = allocator->Resolve(arg_ptr);
-      if (!resolved.has_value()) {
-        [encoder endEncoding];
-        return absl::InvalidArgumentError(
-            absl::StrCat("MetalStream::LaunchKernel: argument ", i,
-                         " is not owned by this executor's allocator."));
+      if (!bound) {
+        // Pointer-sized-but-unresolved (an int64 scalar) or a smaller
+        // by-value scalar: bind the packed bytes directly.
+        [encoder setBytes:args[i] length:arg_size atIndex:i];
       }
-      [encoder setBuffer:resolved->buffer offset:resolved->offset atIndex:i];
     }
     if (shmem_bytes > 0) {
       [encoder setThreadgroupMemoryLength:static_cast<NSUInteger>(shmem_bytes)

@@ -329,6 +329,7 @@ objc_library(
         ":metal_executor",
         ":metal_fft",
         ":metal_platform_id",
+        ":metal_profiling_kernels",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:executor_cache",
         "//xla/stream_executor:platform",
@@ -391,4 +392,33 @@ objc_library(
         "MetalPerformanceShadersGraph",
     ],
     target_compatible_with = ["@platforms//os:macos"],
+)
+
+# MSL implementations of the GpuKernelRegistry platform kernels the
+# autotuner's profiling path needs: repeat-buffer init, redzone checking,
+# and buffer comparison. f64/bf16/f8 comparator variants are intentionally
+# unregistered (no MSL double; bf16 pending); lookups fail with NOT_FOUND
+# and profiling skips correctness checking for those instructions.
+cc_library(
+    name = "metal_profiling_kernels",
+    srcs = [
+        "buffer_comparator_kernel_metal.cc",
+        "redzone_allocator_kernel_metal.cc",
+        "repeat_buffer_kernel_metal.cc",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":metal_platform_id",
+        "//xla:types",
+        "//xla/stream_executor:kernel_spec",
+        "//xla/stream_executor/gpu:buffer_comparator_kernel",
+        "//xla/stream_executor/gpu:gpu_kernel_registry",
+        "//xla/stream_executor/gpu:redzone_allocator_kernel",
+        "//xla/stream_executor/gpu:repeat_buffer_kernel",
+        "//xla/stream_executor/platform:initialize",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+    ],
+    alwayslink = True,
 )

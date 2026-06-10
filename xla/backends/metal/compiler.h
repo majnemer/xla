@@ -70,15 +70,15 @@ class MetalCompiler : public xla::gpu::GpuCompiler {
       se::GpuComputeCapability gpu_version,
       const se::SemanticVersion& toolkit_version) override;
 
-  // The post-fusion AutotunerPass profiles by default (autotune_level=4 +
-  // xla_gpu_experimental_autotune_post_fusion), and GpuProfiler's buffer
-  // setup needs platform kernels Metal does not register yet:
-  // RepeatBufferKernel (stream_executor_util.cc) and, behind it, the
-  // redzone-checker and buffer-comparator kernels. factory_metal's backends
-  // (MetalGraphBackend, NativeEmitterBackend) are registered and the
-  // deterministic partitioner already captures every translatable dot/conv
-  // region, so skipping costs nothing today. Drop this once the profiling
-  // kernels exist for kMetalPlatformId.
+  // Profiling infrastructure (Memset32, AutotuneCacheKey, RepeatBuffer/
+  // redzone/comparator kernels, per-call MLIRContext) is in place and the
+  // post-fusion AutotunerPass runs end-to-end with factory_metal's backends
+  // when this skip is removed. Two issues keep it off by default: exploring
+  // NativeEmitter unroll-factor configs exposes Metal lowering bugs (NaN
+  // results on a few dot_operation shards), and measurement-dependent
+  // winners make concurrent compiles non-deterministic
+  // (multithreaded_compilation proto comparison). Validate those, then drop
+  // this override.
   absl::Status AddAutotunerPass(
       HloPassPipeline* pipeline, HloModule* hlo_module,
       const se::GpuComputeCapability& gpu_version,

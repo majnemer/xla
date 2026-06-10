@@ -30,6 +30,7 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/span.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/event.h"
 #include "xla/stream_executor/launch_dim.h"
@@ -42,6 +43,7 @@ limitations under the License.
 namespace stream_executor {
 namespace metal {
 
+class MetalKernel;
 struct MetalStreamAsyncErrorState;
 
 // Per-stream wrapper around an MTLCommandQueue.
@@ -81,6 +83,19 @@ class MetalStream : public StreamCommon {
   absl::Status MemZero(DeviceAddressBase* location, uint64_t size) override;
   absl::Status Memset32(DeviceAddressBase* location, uint32_t pattern,
                         uint64_t size) override;
+
+  // Launch with per-argument packed sizes (KernelArgsPackedArrayBase::
+  // argument_sizes). Pointer-sized arguments that resolve in the executor's
+  // allocator bind as buffers; everything else binds by value via setBytes —
+  // how registry kernels (RepeatBufferKernel, redzone checker, buffer
+  // comparator) pass their scalar parameters. An empty `arg_sizes` keeps the
+  // legacy contract: every argument must be an allocator-owned address.
+  absl::Status LaunchKernelPacked(const ThreadDim& thread_dims,
+                                  const BlockDim& block_dims,
+                                  MetalKernel* kernel, absl::string_view name,
+                                  absl::Span<const void* const> args,
+                                  absl::Span<const size_t> arg_sizes,
+                                  int64_t shmem_bytes);
 
   absl::Status DoHostCallbackWithStatus(
       absl::AnyInvocable<absl::Status() &&> callback) override;
