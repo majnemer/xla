@@ -75,6 +75,13 @@ class MetalStream : public StreamCommon {
   absl::Status Memcpy(DeviceAddressBase* gpu_dst,
                       const DeviceAddressBase& gpu_src, uint64_t size) override;
 
+  // Drain-then-write fills: stream-ordered by virtue of draining first, and
+  // writing shared-storage buffers directly is valid on unified memory. Used
+  // by the autotuner's profiling buffer initialization; not on a hot path.
+  absl::Status MemZero(DeviceAddressBase* location, uint64_t size) override;
+  absl::Status Memset32(DeviceAddressBase* location, uint32_t pattern,
+                        uint64_t size) override;
+
   absl::Status DoHostCallbackWithStatus(
       absl::AnyInvocable<absl::Status() &&> callback) override;
 

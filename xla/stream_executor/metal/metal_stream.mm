@@ -445,6 +445,57 @@ absl::Status MetalStream::Memcpy(DeviceAddressBase *gpu_dst,
   return absl::OkStatus();
 }
 
+namespace {
+
+// Drains the stream and resolves `location` to a host-writable pointer
+// (shared storage on unified memory). The drain makes a subsequent direct
+// host write stream-ordered.
+absl::StatusOr<void *> DrainAndResolveForHostWrite(MetalStream *stream,
+                                                   MetalExecutor *executor,
+                                                   DeviceAddressBase *location,
+                                                   absl::string_view op) {
+  if (location == nullptr || location->opaque() == nullptr) {
+    return absl::InvalidArgumentError(absl::StrCat(op, ": null pointer."));
+  }
+  auto resolved = executor->allocator()->Resolve(location->opaque());
+  if (!resolved.has_value()) {
+    return absl::InvalidArgumentError(
+        absl::StrCat(op, ": destination not owned by this allocator."));
+  }
+  if (resolved->buffer.storageMode != MTLStorageModeShared) {
+    return absl::FailedPreconditionError(
+        absl::StrCat(op, ": requires Shared storage on Apple Silicon."));
+  }
+  TF_RETURN_IF_ERROR(stream->BlockHostUntilDone());
+  return static_cast<void *>(static_cast<char *>(resolved->buffer.contents) +
+                             resolved->offset);
+}
+
+}  // namespace
+
+absl::Status MetalStream::MemZero(DeviceAddressBase *location, uint64_t size) {
+  if (size == 0) return absl::OkStatus();
+  TF_ASSIGN_OR_RETURN(void *dst,
+                      DrainAndResolveForHostWrite(this, executor_, location,
+                                                  "MetalStream::MemZero"));
+  std::memset(dst, 0, size);
+  return absl::OkStatus();
+}
+
+absl::Status MetalStream::Memset32(DeviceAddressBase *location,
+                                   uint32_t pattern, uint64_t size) {
+  if (size == 0) return absl::OkStatus();
+  if (size % sizeof(uint32_t) != 0) {
+    return absl::InvalidArgumentError(
+        "MetalStream::Memset32: size must be a multiple of 4 bytes.");
+  }
+  TF_ASSIGN_OR_RETURN(void *dst,
+                      DrainAndResolveForHostWrite(this, executor_, location,
+                                                  "MetalStream::Memset32"));
+  memset_pattern4(dst, &pattern, size);
+  return absl::OkStatus();
+}
+
 absl::Status MetalStream::DoHostCallbackWithStatus(
     absl::AnyInvocable<absl::Status() &&> callback) {
   // Two-cmd_buf design: callback_cmd's completion handler runs the host

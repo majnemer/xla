@@ -64,6 +64,10 @@ std::string AutotuneCacheKey::DeviceDescriptionToCacheKey(
   } else if (auto* oneapi_cc = device_description.gpu_compute_capability()
                                    .oneapi_compute_capability()) {
     compute_capability = absl::StrCat("oneAPI: ", oneapi_cc->ToString());
+  } else if (auto* mcc = device_description.gpu_compute_capability()
+                             .metal_compute_capability()) {
+    compute_capability =
+        absl::StrCat("Metal: Apple", mcc->family_generation());
   } else {
     LOG(FATAL) << "Unknown compute capability type";
   }

@@ -70,10 +70,15 @@ class MetalCompiler : public xla::gpu::GpuCompiler {
       se::GpuComputeCapability gpu_version,
       const se::SemanticVersion& toolkit_version) override;
 
-  // Metal has no cuDNN / cuBLAS / Triton-style backends to autotune over —
-  // factory_metal returns an empty backend list. The shared AutotunerPass::
-  // Create rejects empty backends as an error, so we short-circuit here and
-  // skip adding the autotuner pass altogether.
+  // The post-fusion AutotunerPass profiles by default (autotune_level=4 +
+  // xla_gpu_experimental_autotune_post_fusion), and GpuProfiler's buffer
+  // setup needs platform kernels Metal does not register yet:
+  // RepeatBufferKernel (stream_executor_util.cc) and, behind it, the
+  // redzone-checker and buffer-comparator kernels. factory_metal's backends
+  // (MetalGraphBackend, NativeEmitterBackend) are registered and the
+  // deterministic partitioner already captures every translatable dot/conv
+  // region, so skipping costs nothing today. Drop this once the profiling
+  // kernels exist for kMetalPlatformId.
   absl::Status AddAutotunerPass(
       HloPassPipeline* pipeline, HloModule* hlo_module,
       const se::GpuComputeCapability& gpu_version,
@@ -86,8 +91,8 @@ class MetalCompiler : public xla::gpu::GpuCompiler {
     return absl::OkStatus();
   }
 
-  // Conv+GEMM autotuner shares the same empty-backends rejection; skip it on
-  // Metal for the same reason.
+  // The legacy conv+GEMM autotuner tunes gpublas/cudnn custom calls Metal
+  // will never have; skip it.
   absl::Status AddConvAndGemmAutotuningPass(
       HloPassPipeline* pipeline, HloModule* hlo_module,
       const se::GpuComputeCapability& gpu_version,

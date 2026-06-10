@@ -13,14 +13,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <algorithm>
 #include <memory>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/types/span.h"
 #include "mlir/IR/MLIRContext.h"
 #include "xla/backends/autotuner/backends.pb.h"
 #include "xla/backends/autotuner/codegen_backend.h"
 #include "xla/backends/gpu/autotuner/factory.h"
+#include "xla/backends/gpu/autotuner/metal_graph.h"
+#include "xla/backends/gpu/autotuner/native_emitter.h"
 #include "xla/hlo/analysis/alias_info.h"
 #include "xla/service/compiler.h"
 #include "xla/service/hlo_cost_analysis.h"
@@ -32,20 +36,38 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
-// Metal has no cuDNN / cuBLAS / Triton-style backends to autotune over —
-// the kFusion path goes straight through MlirKernelEmitter to MSL. Returning
-// an empty vector keeps the autotuner pass a no-op rather than crashing on
-// a missing platform registration. Matches the GetCodegenBackends signature
-// for symmetry with the CUDA / ROCm factories.
+// Backend order is select-first order when not profiling: graph capture
+// first (no fused MSL competitor exists for the regions the deterministic
+// partitioner forms), native MSL emitters second. A METAL_GRAPH_FISSION
+// backend racing non-isomorphic partition plans slots between them once
+// implemented.
 std::vector<std::unique_ptr<CodegenBackend>> GetCodegenBackendsForMetal(
-    stream_executor::StreamExecutor* /*stream_executor*/,
+    stream_executor::StreamExecutor* stream_executor,
     stream_executor::DeviceAddressAllocator* /*device_allocator*/,
-    const DebugOptions* /*debug_options*/, Compiler* /*compiler*/,
-    const Compiler::GpuTargetConfig* /*target_config*/,
+    const DebugOptions* debug_options, Compiler* compiler,
+    const Compiler::GpuTargetConfig* target_config,
     const AliasInfo* /*alias_info*/, mlir::MLIRContext* /*mlir_context*/,
     HloCostAnalysis::ShapeSizeFunction /*shape_size_fn*/,
-    absl::Span<const autotuner::Backend> /*backend_allowlist*/) {
-  return {};
+    absl::Span<const autotuner::Backend> backend_allowlist) {
+  std::vector<std::unique_ptr<CodegenBackend>> backends;
+  backends.push_back(std::make_unique<MetalGraphBackend>(
+      stream_executor, debug_options, compiler, target_config));
+  backends.push_back(std::make_unique<NativeEmitterBackend>(
+      debug_options, compiler, target_config, stream_executor));
+
+  if (!backend_allowlist.empty()) {
+    backends.erase(
+        std::remove_if(backends.begin(), backends.end(),
+                       [&](const std::unique_ptr<CodegenBackend>& backend) {
+                         return !absl::c_any_of(
+                             backend_allowlist,
+                             [&](autotuner::Backend backend_id) {
+                               return backend->backend() == backend_id;
+                             });
+                       }),
+        backends.end());
+  }
+  return backends;
 }
 
 STREAM_EXECUTOR_REGISTER_OBJECT_STATICALLY(

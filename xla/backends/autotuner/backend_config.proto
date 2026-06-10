@@ -18,5 +18,6 @@ message BackendConfig {
     stream_executor.dnn.AlgorithmProto algorithm = 4;
     xla.cpu.LlvmKernelOptions llvm_kernel = 5;
     xla.gpu.NativeEmitterBackendConfig native_emitter = 6;
+    xla.gpu.MetalGraphFusionConfig metal_graph = 7;
   }
 }

@@ -535,6 +535,28 @@ cc_library(
 )
 
 cc_library(
+    name = "metal_graph",
+    srcs = ["metal_graph.cc"],
+    hdrs = ["metal_graph.h"],
+    tags = ["gpu"],
+    deps = [
+        ":gpu_codegen_backend",
+        "//xla:xla_proto_cc",
+        "//xla/backends/autotuner:backends_proto_cc",
+        "//xla/backends/autotuner:codegen_backend",
+        "//xla/backends/metal/transforms:metal_graph_support",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:compiler",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+cc_library(
     name = "factory_metal",
     srcs = ["factory_metal.cc"],
     tags = ["gpu"],
@@ -542,6 +564,8 @@ cc_library(
     visibility = ["//xla/backends/metal:__subpackages__"],
     deps = [
         ":factory",
+        ":metal_graph",
+        ":native_emitter",
         "//xla:xla_proto_cc",
         "//xla/backends/autotuner:backends_proto_cc",
         "//xla/backends/autotuner:codegen_backend",
@@ -552,6 +576,7 @@ cc_library(
         "//xla/stream_executor:stream_executor_h",
         "//xla/stream_executor/metal:metal_platform_id",
         "//xla/stream_executor/platform:platform_object_registry",
+        "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/types:span",
         "@llvm-project//mlir:IR",
     ],

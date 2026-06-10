@@ -1,4 +1,4 @@
-/* Copyright 2025 The OpenXLA Authors.
+/* Copyright 2026 The OpenXLA Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,14 +13,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef XLA_BACKENDS_GPU_AUTOTUNER_NATIVE_EMITTER_H_
-#define XLA_BACKENDS_GPU_AUTOTUNER_NATIVE_EMITTER_H_
+#ifndef XLA_BACKENDS_GPU_AUTOTUNER_METAL_GRAPH_H_
+#define XLA_BACKENDS_GPU_AUTOTUNER_METAL_GRAPH_H_
 
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "absl/base/nullability.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "xla/backends/autotuner/backends.pb.h"
@@ -28,47 +27,40 @@ limitations under the License.
 #include "xla/backends/gpu/autotuner/gpu_codegen_backend.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/service/compiler.h"
-#include "xla/stream_executor/stream_executor.h"
 #include "xla/xla.pb.h"
 
 namespace xla {
 namespace gpu {
 
-// Codegen backend for XLA's native fusion emitters.
-//
-// This backend enables us to autotune XLA's native emitters against other
-// backends.
-class NativeEmitterBackend : public GpuCodegenBackend {
+// Codegen backend for MPSGraph-bound regions (__metal_graph kCustom
+// fusions). Exposes exactly one config — the empty MetalGraphFusionConfig
+// marker — because MPSGraph self-tunes and publishes no parameters. Also
+// claims non-custom fusions whose bodies pass the translatability gate,
+// which is how reduce/elementwise fusions become capture candidates raced
+// against the native MSL emitter.
+class MetalGraphBackend : public GpuCodegenBackend {
  public:
-  // `stream_executor` may be null for compilers whose RunBackend is
-  // deviceless (CUDA/ROCm AOT); Metal requires a live device to compile.
-  explicit NativeEmitterBackend(
-      const DebugOptions* absl_nonnull debug_options,
-      Compiler* absl_nonnull compiler,
-      const Compiler::GpuTargetConfig* target_config,
-      stream_executor::StreamExecutor* stream_executor = nullptr)
-      : GpuCodegenBackend(autotuner::Backend::NATIVE_EMITTER, debug_options,
+  MetalGraphBackend(stream_executor::StreamExecutor* stream_executor,
+                    const DebugOptions* debug_options, Compiler* compiler,
+                    const Compiler::GpuTargetConfig* target_config)
+      : GpuCodegenBackend(autotuner::Backend::METAL_GRAPH, debug_options,
                           compiler, target_config, stream_executor) {}
 
-  // Returns all supported configurations for the given instruction.
   absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
   GetSupportedConfigs(const HloInstruction& instr) override;
 
-  // Returns a default configuration for the instruction.
   absl::StatusOr<std::unique_ptr<BackendConfig>> GetDefaultConfig(
       const HloInstruction& instr) override;
 
-  // Applies a given fusion config to the instruction.
   absl::Status ApplyConfig(HloInstruction& instr,
                            const BackendConfig& config) override;
 
  private:
   bool IsSupported(const HloInstruction& instr) override;
-  // TODO(b/514330710): use valid version
   std::string version() const override { return "unknown"; }
 };
 
 }  // namespace gpu
 }  // namespace xla
 
-#endif  // XLA_BACKENDS_GPU_AUTOTUNER_NATIVE_EMITTER_H_
+#endif  // XLA_BACKENDS_GPU_AUTOTUNER_METAL_GRAPH_H_

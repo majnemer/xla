@@ -163,6 +163,12 @@ AutotuneDecision ShouldAutotuneGemmFusion(const HloInstruction& instruction) {
     }
     return AutotuneDecision::Allow();
   }
+  if (backend_config.kind() == kMetalGraphFusionKind) {
+    if (backend_config.has_metal_graph_fusion_config()) {
+      return AutotuneDecision::Forbid("Metal graph fusion already has a config");
+    }
+    return AutotuneDecision::Allow();
+  }
   return AutotuneDecision::Forbid(
       "Fusion kind is not supported for GEMM autotuning");
 }
@@ -217,7 +223,8 @@ AutotuneDecision ShouldAutotuneInstruction(bool do_not_autotune_cublas,
         gpu_config->fusion_backend_config();
     if (backend_config.kind() == kTritonGemmFusionKind ||
         backend_config.kind() == kCuDnnFusionKind ||
-        backend_config.kind() == kCustomFusionKind) {
+        backend_config.kind() == kCustomFusionKind ||
+        backend_config.kind() == kMetalGraphFusionKind) {
       // TODO(b/511979384): Remove this condition once
       // xla_gpu_experimental_autotune_post_fusion is enabled by default.
       if (!autotune_post_fusion && has_native_or_ble_backends) {
