@@ -17,7 +17,6 @@ limitations under the License.
 
 #include <functional>
 #include <memory>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -90,6 +89,7 @@ limitations under the License.
 #include "xla/tsl/util/maybe_owning.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
+#include "tsl/platform/cpu_info.h"
 
 namespace xla {
 namespace metal {
@@ -223,7 +223,7 @@ void MetalCompiler::AddGemmRewriteCustomCallPasses(
 absl::StatusOr<std::unique_ptr<xla::gpu::GpuExecutable>>
 MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
                                       const GpuTopology& gpu_topology,
-                                      const CompileOptions& /*options*/,
+                                      const CompileOptions& options,
                                       se::StreamExecutor* stream_exec) {
   VLOG(1) << "MetalCompiler::CompileToBackendResult on " << hlo_module->name();
   if (stream_exec == nullptr) {
@@ -714,11 +714,8 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
       hlo_module->config()
           .debug_options()
           .xla_gpu_force_compilation_parallelism(),
-      /*default_thread_pool=*/nullptr,
-      /*default_parallelism=*/static_cast<int>(
-          std::thread::hardware_concurrency() > 0
-              ? std::thread::hardware_concurrency()
-              : 1));
+      /*default_thread_pool=*/options.thread_pool,
+      /*default_parallelism=*/tsl::port::MaxParallelism());
 
   struct BuildResult {
     std::unique_ptr<xla::metal::MetalKernelArtifact> artifact;

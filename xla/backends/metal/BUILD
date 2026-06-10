@@ -77,6 +77,7 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@llvm-project//mlir:IR",
+        "@tsl//tsl/platform:platform_port",
     ],
     alwayslink = True,  # Contains compiler registration
 )
