@@ -321,21 +321,86 @@ class GraphBuilder {
       case HloOpcode::kExp:
         return [graph_ exponentWithTensor:in name:nil];
       case HloOpcode::kExpm1: {
-        MPSGraphTensor* exp = [graph_ exponentWithTensor:in name:nil];
-        return [graph_ subtractionWithPrimaryTensor:exp
-                                    secondaryTensor:OnesLike(instr)
-                                               name:nil];
+        // Kahan: u = e^x; x when u == 1 (tiny |x|, exact), -1 when u == 0
+        // (x -> -inf), u when u == inf (overflow), else (u-1) * x / log(u).
+        // The naive e^x - 1 loses all precision for tiny |x|.
+        MPSGraphTensor* one = ScalarLike(instr, 1.0);
+        MPSGraphTensor* u = [graph_ exponentWithTensor:in name:nil];
+        MPSGraphTensor* um1 = [graph_ subtractionWithPrimaryTensor:u
+                                                   secondaryTensor:one
+                                                              name:nil];
+        MPSGraphTensor* log_u = [graph_ logarithmWithTensor:u name:nil];
+        MPSGraphTensor* kahan = [graph_
+            divisionWithPrimaryTensor:[graph_
+                                          multiplicationWithPrimaryTensor:um1
+                                                          secondaryTensor:in
+                                                                     name:nil]
+                      secondaryTensor:log_u
+                                 name:nil];
+        MPSGraphTensor* result = [graph_
+            selectWithPredicateTensor:[graph_ equalWithPrimaryTensor:u
+                                                     secondaryTensor:one
+                                                                name:nil]
+                  truePredicateTensor:in
+                 falsePredicateTensor:kahan
+                                 name:nil];
+        result = [graph_
+            selectWithPredicateTensor:
+                [graph_ equalWithPrimaryTensor:u
+                               secondaryTensor:ScalarLike(instr, 0.0)
+                                          name:nil]
+                  truePredicateTensor:ScalarLike(instr, -1.0)
+                 falsePredicateTensor:result
+                                 name:nil];
+        return [graph_
+            selectWithPredicateTensor:
+                [graph_ equalWithPrimaryTensor:u
+                               secondaryTensor:ScalarLike(
+                                                   instr, INFINITY)
+                                          name:nil]
+                  truePredicateTensor:u
+                 falsePredicateTensor:result
+                                 name:nil];
       }
       case HloOpcode::kFloor:
         return [graph_ floorWithTensor:in name:nil];
       case HloOpcode::kLog:
         return [graph_ logarithmWithTensor:in name:nil];
       case HloOpcode::kLog1p: {
-        MPSGraphTensor* one_plus =
-            [graph_ additionWithPrimaryTensor:in
-                              secondaryTensor:OnesLike(instr)
-                                         name:nil];
-        return [graph_ logarithmWithTensor:one_plus name:nil];
+        // Kahan: u = 1 + x; x when u == 1 (tiny |x|, exact), x when
+        // x == inf, else log(u) * x / (u - 1). The naive log(1 + x) returns
+        // 0 for any |x| below the f32 epsilon.
+        MPSGraphTensor* one = ScalarLike(instr, 1.0);
+        MPSGraphTensor* u = [graph_ additionWithPrimaryTensor:in
+                                              secondaryTensor:one
+                                                         name:nil];
+        MPSGraphTensor* log_u = [graph_ logarithmWithTensor:u name:nil];
+        MPSGraphTensor* um1 = [graph_ subtractionWithPrimaryTensor:u
+                                                   secondaryTensor:one
+                                                              name:nil];
+        MPSGraphTensor* kahan = [graph_
+            divisionWithPrimaryTensor:
+                [graph_ multiplicationWithPrimaryTensor:log_u
+                                        secondaryTensor:in
+                                                   name:nil]
+                      secondaryTensor:um1
+                                 name:nil];
+        MPSGraphTensor* result = [graph_
+            selectWithPredicateTensor:[graph_ equalWithPrimaryTensor:u
+                                                     secondaryTensor:one
+                                                                name:nil]
+                  truePredicateTensor:in
+                 falsePredicateTensor:kahan
+                                 name:nil];
+        return [graph_
+            selectWithPredicateTensor:
+                [graph_ equalWithPrimaryTensor:in
+                               secondaryTensor:ScalarLike(
+                                                   instr, INFINITY)
+                                          name:nil]
+                  truePredicateTensor:in
+                 falsePredicateTensor:result
+                                 name:nil];
       }
       case HloOpcode::kLogistic:
         return [graph_ sigmoidWithTensor:in name:nil];
@@ -685,9 +750,9 @@ class GraphBuilder {
                             name:nil];
   }
 
-  MPSGraphTensor* OnesLike(const HloInstruction* instr) {
+  MPSGraphTensor* ScalarLike(const HloInstruction* instr, double value) {
     MPSDataType dtype = MpsDataTypeFor(instr->shape().element_type()).value();
-    return [graph_ constantWithScalar:1.0
+    return [graph_ constantWithScalar:value
                                 shape:ToNSShape(LogicalDims(instr->shape()))
                              dataType:dtype];
   }
