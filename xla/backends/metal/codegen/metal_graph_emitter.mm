@@ -736,11 +736,17 @@ class GraphBuilder {
       case HloOpcode::kMultiply:
         reduced = [graph_ reductionProductWithTensor:in axes:axes name:nil];
         break;
+      // XLA reduces fold with the combiner, and maximum/minimum propagate
+      // NaNs; the plain MPSGraph reductions follow IEEE maxNum/minNum.
       case HloOpcode::kMaximum:
-        reduced = [graph_ reductionMaximumWithTensor:in axes:axes name:nil];
+        reduced = [graph_ reductionMaximumPropagateNaNWithTensor:in
+                                                            axes:axes
+                                                            name:nil];
         break;
       case HloOpcode::kMinimum:
-        reduced = [graph_ reductionMinimumWithTensor:in axes:axes name:nil];
+        reduced = [graph_ reductionMinimumPropagateNaNWithTensor:in
+                                                            axes:axes
+                                                            name:nil];
         break;
       default:
         return absl::InternalError(absl::StrCat(
