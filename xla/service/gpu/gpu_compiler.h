@@ -69,9 +69,12 @@ class GpuExecutable;
 // base for all GPU backends: it owns HLO pipeline orchestration and exposes
 // a CompileToBackendResult pure-virtual seam that subclasses fill in. LLVM-
 // flavored GPU backends (CUDA, ROCm, SYCL/Intel) inherit GpuLLVMCompiler,
-// which inherits this and implements the seam via LLVM-module codegen.
-// Non-LLVM GPU backends (e.g. Metal) inherit this directly.
-class GpuCompiler : public Compiler {
+// which inherits this and LLVMCompiler and implements the seam via LLVM-
+// module codegen. Non-LLVM GPU backends (e.g. Metal) inherit this directly.
+//
+// Compiler is a virtual base so that GpuLLVMCompiler — which is both a
+// GpuCompiler and an LLVMCompiler — holds a single Compiler subobject.
+class GpuCompiler : public virtual Compiler {
  public:
   using AsmModuleHook = absl::AnyInvocable<void(absl::string_view)>;
 

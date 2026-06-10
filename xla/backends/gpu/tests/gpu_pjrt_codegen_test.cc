@@ -21,7 +21,6 @@ limitations under the License.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
-#include "absl/base/casts.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_replace.h"
@@ -118,7 +117,10 @@ GpuPjRtCodegenTest::CompileToExecutable(std::unique_ptr<HloModule> hlo_module,
 absl::Status GpuPjRtCodegenTest::CompileAndVerifyIr(
     std::unique_ptr<HloModule> hlo_module, absl::string_view expected_llvm_ir,
     bool match_optimized_ir, bool run_optimization_passes) {
-  auto llvm_compiler = absl::down_cast<LLVMCompiler*>(compiler());
+  auto* llvm_compiler = dynamic_cast<LLVMCompiler*>(compiler());
+  if (llvm_compiler == nullptr) {
+    return absl::InternalError("compiler is not LLVM-based");
+  }
   return xla::CompileAndVerifyIr(llvm_compiler, compile_options_,
                                  std::move(hlo_module), expected_llvm_ir,
                                  match_optimized_ir, run_optimization_passes);

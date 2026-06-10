@@ -22,8 +22,8 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "absl/base/casts.h"
 #include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "xla/tsl/platform/status_macros.h"
@@ -216,7 +216,11 @@ class GpuOptProvider : public CompiledOptProvider {
     ASSIGN_OR_RETURN(std::unique_ptr<Compiler> compiler, GetCompiler());
 
     LLVMCompiler* llvm_compiler =
-        absl::down_cast<LLVMCompiler*>(compiler.get());
+        dynamic_cast<LLVMCompiler*>(compiler.get());
+    if (llvm_compiler == nullptr) {
+      return absl::UnimplementedError(
+          "platform compiler is not LLVM-based; no LLVM IR to dump");
+    }
 
     llvm::LLVMContext context;
     std::vector<std::unique_ptr<llvm::Module>> modules;
@@ -254,7 +258,11 @@ class GpuOptProvider : public CompiledOptProvider {
     ASSIGN_OR_RETURN(std::unique_ptr<Compiler> compiler, GetCompiler());
 
     gpu::GpuCompiler* gpu_compiler =
-        absl::down_cast<gpu::GpuCompiler*>(compiler.get());
+        dynamic_cast<gpu::GpuCompiler*>(compiler.get());
+    if (gpu_compiler == nullptr) {
+      return absl::UnimplementedError(
+          "platform compiler is not a GpuCompiler");
+    }
 
     std::string ptx_str = "// GPU Executable\n";
     gpu_compiler->SetAsmHook([&](absl::string_view ptx) { ptx_str += ptx; });

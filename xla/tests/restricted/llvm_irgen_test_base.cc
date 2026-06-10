@@ -97,7 +97,11 @@ void LlvmIrGenTestBase::CompileAndVerifyIr(const std::string& hlo_text,
 }
 
 LLVMCompiler* LlvmIrGenTestBase::GetLLVMCompiler() {
-  return static_cast<LLVMCompiler*>(backend().compiler());
+  // Compiler is a virtual base of LLVMCompiler, so the downcast must be
+  // dynamic. Tests using this base require an LLVM-based backend.
+  auto* compiler = dynamic_cast<LLVMCompiler*>(backend().compiler());
+  CHECK(compiler != nullptr) << "backend compiler is not LLVM-based";
+  return compiler;
 }
 
 absl::Status LlvmIrGenTestBase::IrHook(const llvm::Module& module) {

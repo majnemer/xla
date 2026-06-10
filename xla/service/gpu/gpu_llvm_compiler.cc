@@ -380,6 +380,7 @@ GpuLLVMCompiler::CompileToBackendResult(
           (compile_module_results.use_original_allocations
                ? std::optional<std::vector<BufferAllocation>>()
                : std::move(compile_module_results.allocations)),
+          /*extra_allocations=*/{},
           /*buffer_assignment=*/
           std::move(compile_module_results.buffer_assignment),
           /*alias_info=*/std::move(alias_info),
@@ -584,6 +585,7 @@ GpuLLVMCompiler::LoadExecutableFromAotResult(
       /*module_name=*/std::move(hlo_module_name),
       /*program_shape=*/std::move(program_shape),
       /*mlir_allocations=*/std::move(*buffer_assignment).TakeAllocations(),
+      /*extra_allocations=*/{},
       /*buffer_assignment=*/nullptr,
       /*alias_info=*/std::move(alias_info),
       /*debug_options=*/std::move(debug_options),

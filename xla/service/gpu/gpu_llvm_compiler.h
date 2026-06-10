@@ -20,15 +20,12 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include <functional>
-
 #include "absl/base/nullability.h"
-#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/synchronization/mutex.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "mlir/IR/MLIRContext.h"
@@ -38,6 +35,7 @@ limitations under the License.
 #include "xla/service/executable.h"
 #include "xla/service/gpu/compile_module_to_llvm_ir.h"
 #include "xla/service/gpu/gpu_compiler.h"
+#include "xla/service/llvm_compiler.h"
 #include "xla/service/gpu_topology.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/stream_executor/device_description.h"
@@ -51,17 +49,43 @@ namespace gpu {
 
 // Intermediate base for LLVM-flavored GPU compilers (CUDA / ROCm / SYCL).
 // Holds everything LLVM-specific that GpuCompiler used to own: the LLVM
-// target_triple / data_layout, the LLVM-module hooks, the LLVM-binary
-// compile pipeline (CompileSingleModule / CompileToBackendResult), and
-// AOT serialization that round-trips through LLVM binaries.
+// target_triple / data_layout, the LLVM-binary compile pipeline
+// (CompileSingleModule / CompileToBackendResult), and AOT serialization
+// that round-trips through LLVM binaries.
+//
+// Inherits both GpuCompiler (the GPU pipeline) and LLVMCompiler (the
+// IR-inspection hook surface); both inherit Compiler virtually, so there is
+// a single Compiler subobject and a GpuLLVMCompiler is usable wherever an
+// LLVMCompiler is expected (IR-dump tooling, hook-based tests).
 //
 // Non-LLVM GPU backends (e.g. Metal) inherit GpuCompiler directly and
 // implement its CompileToBackendResult pure virtual without touching
 // any of this surface.
-class GpuLLVMCompiler : public GpuCompiler {
+class GpuLLVMCompiler : public GpuCompiler, public LLVMCompiler {
  public:
   GpuLLVMCompiler(se::Platform::Id platform_id, const char* target_triple,
                   const char* data_layout);
+
+  // Re-declare names visible through both direct bases (GpuCompiler's
+  // overrides; LLVMCompiler's `using Compiler::...` re-exports) so member
+  // lookup is unambiguous. Naming the virtual base keeps every Compiler
+  // overload visible; virtual dispatch still lands on the GpuCompiler
+  // overrides.
+  using Compiler::Compile;
+  using Compiler::RunBackend;
+  using Compiler::RunHloPasses;
+
+  // GpuCompiler::Compile and LLVMCompiler::Compile both override
+  // Compiler::Compile (identical bodies: denormal scoping around
+  // RunHloPasses + RunBackend); a unique final overrider is required here.
+  // Defer to LLVMCompiler's.
+  absl::StatusOr<std::vector<std::unique_ptr<Executable>>> Compile(
+      std::unique_ptr<HloModule> hlo_module,
+      std::vector<se::StreamExecutor*> stream_execs,
+      const CompileOptions& options) override {
+    return LLVMCompiler::Compile(std::move(hlo_module),
+                                 std::move(stream_execs), options);
+  }
 
   std::string target_triple() const { return target_triple_; }
   std::string data_layout() const { return data_layout_; }
@@ -143,53 +167,6 @@ class GpuLLVMCompiler : public GpuCompiler {
     return mlir_context_pool_;
   }
 
- public:
-  // LLVM IR hook surface, mirroring xla::LLVMCompiler. Kept on the LLVM-
-  // flavored intermediate so non-LLVM GPU backends (Metal) don't carry the
-  // mutex + std::function members.
-  using ModuleHook = std::function<void(const llvm::Module&)>;
-
-  void SetPreOptimizationHook(ModuleHook hook) {
-    absl::MutexLock lock(hooks_m_);
-    CHECK(!user_pre_optimization_hook_)
-        << "Pre-optimization hook is already set";
-    CHECK(hook) << "hook cannot be null";
-    user_pre_optimization_hook_ = hook;
-  }
-
-  void RemovePreOptimizationHook() {
-    absl::MutexLock lock(hooks_m_);
-    user_pre_optimization_hook_ = nullptr;
-  }
-
-  void SetPostOptimizationHook(ModuleHook hook) {
-    absl::MutexLock lock(hooks_m_);
-    CHECK(!user_post_optimization_hook_)
-        << "Post-optimization hook is already set";
-    CHECK(hook) << "hook cannot be null";
-    user_post_optimization_hook_ = hook;
-  }
-
-  void RemovePostOptimizationHook() {
-    absl::MutexLock lock(hooks_m_);
-    user_post_optimization_hook_ = nullptr;
-  }
-
- protected:
-  void CallUserPreOptimizationHook(const llvm::Module& module) {
-    absl::MutexLock lock(hooks_m_);
-    if (user_pre_optimization_hook_) {
-      user_pre_optimization_hook_(module);
-    }
-  }
-
-  void CallUserPostOptimizationHook(const llvm::Module& module) {
-    absl::MutexLock lock(hooks_m_);
-    if (user_post_optimization_hook_) {
-      user_post_optimization_hook_(module);
-    }
-  }
-
  private:
   // The triple that represents our target.
   const char* target_triple_;
@@ -201,10 +178,6 @@ class GpuLLVMCompiler : public GpuCompiler {
   GpuLLVMCompiler& operator=(const GpuLLVMCompiler&) = delete;
 
   ObjectPool<std::unique_ptr<mlir::MLIRContext>> mlir_context_pool_;
-
-  absl::Mutex hooks_m_;
-  ModuleHook user_pre_optimization_hook_ ABSL_GUARDED_BY(hooks_m_);
-  ModuleHook user_post_optimization_hook_ ABSL_GUARDED_BY(hooks_m_);
 };
 
 }  // namespace gpu

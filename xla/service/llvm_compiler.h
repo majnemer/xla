@@ -43,7 +43,11 @@ namespace xla {
 //   status.
 //
 // Hooks are only called one at a time.
-class LLVMCompiler : public Compiler {
+//
+// Compiler is a virtual base so that compilers which are both LLVM-based and
+// members of another compiler hierarchy (GpuLLVMCompiler inherits GpuCompiler
+// and LLVMCompiler) hold a single Compiler subobject.
+class LLVMCompiler : public virtual Compiler {
  public:
   ~LLVMCompiler() override {}
 

@@ -65,8 +65,13 @@ TEST_F(LLVMCompilerTest, HooksTest) {
   // 'add' instruction), otherwise the hooks are never called.
   auto hlo_module = ParseAndReturnVerifiedModule(kHloText).value();
 
-  // Create and run the compiler.
-  LLVMCompiler* compiler = absl::down_cast<LLVMCompiler*>(backend().compiler());
+  // Create and run the compiler. Compiler is a virtual base of LLVMCompiler,
+  // so the downcast must be dynamic; non-LLVM backends (e.g. Metal) have no
+  // IR hooks to test.
+  LLVMCompiler* compiler = dynamic_cast<LLVMCompiler*>(backend().compiler());
+  if (compiler == nullptr) {
+    GTEST_SKIP() << "backend compiler is not LLVM-based";
+  }
   compiler->SetPreOptimizationHook(pre_opt_hook);
   compiler->SetPostOptimizationHook(post_opt_hook);
 

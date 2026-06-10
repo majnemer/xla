@@ -40,6 +40,7 @@ limitations under the License.
 #include "xla/service/compiler.h"
 #include "xla/service/executable.h"
 #include "xla/service/gpu/gpu_compiler.h"
+#include "xla/service/gpu/gpu_llvm_compiler.h"
 #include "xla/service/gpu/kernel_reuse_cache.pb.h"
 #include "xla/service/gpu_topology.h"
 #include "xla/service/hlo_module_config.h"
@@ -213,10 +214,14 @@ class KernelCacheTest : public HloLegacyGpuTestBase {
     config.set_debug_options(GetDebugOptionsForTest());
     ASSERT_OK_AND_ASSIGN(auto stream_exec,
                          GetTestPlatform()->ExecutorForDevice(0));
+    auto* llvm_compiler = dynamic_cast<GpuLLVMCompiler*>(compiler());
+    if (llvm_compiler == nullptr) {
+      GTEST_SKIP() << "Kernel caching requires an LLVM-based GPU compiler.";
+    }
     ASSERT_OK_AND_ASSIGN(
         bool can_use_link_modules,
-        dynamic_cast<GpuCompiler*>(compiler())
-            ->CanUseLinkModules(config, device_description(), stream_exec));
+        llvm_compiler->CanUseLinkModules(config, device_description(),
+                                         stream_exec));
     if (!can_use_link_modules) {
       GTEST_SKIP() << "Caching compiled kernels requires support of linking.";
     }

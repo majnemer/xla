@@ -1653,6 +1653,7 @@ cc_library(
         "//xla/service:executable",
         "//xla/service:gpu_topology",
         "//xla/service:hlo_module_config",
+        "//xla/service:llvm_compiler",
         "//xla/service:hlo_proto_cc",
         "//xla/service/cpu:cpu_aot_compilation_result",
         "//xla/service/llvm_ir:llvm_command_line_options",
@@ -2161,6 +2162,7 @@ xla_test(
     use_legacy_runtime = True,
     deps = [
         ":gpu_compiler",
+        ":gpu_llvm_compiler",
         ":kernel_reuse_cache_proto_cc",
         "//xla:literal",
         "//xla:literal_util",

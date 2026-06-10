@@ -19,7 +19,6 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "absl/base/casts.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -99,7 +98,10 @@ absl::Status Autotune(HloModule& module) {
   ASSIGN_OR_RETURN(std::unique_ptr<Compiler> compiler,
                    xla::Compiler::GetForPlatform(platform->id()));
   se::StreamExecutor* stream_executor = platform->ExecutorForDevice(0).value();
-  auto* gpu_compiler = absl::down_cast<GpuCompiler*>(compiler.get());
+  auto* gpu_compiler = dynamic_cast<GpuCompiler*>(compiler.get());
+  if (gpu_compiler == nullptr) {
+    return absl::InternalError("platform compiler is not a GpuCompiler");
+  }
   auto alias_info =
       gpu_compiler->GetAliasInfo(stream_executor->GetDeviceDescription());
   DebugOptions debug_options = GetDebugOptionsFromFlags();

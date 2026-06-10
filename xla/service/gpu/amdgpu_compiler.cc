@@ -231,10 +231,10 @@ absl::Status AMDGPUCompiler::OptimizeHloPostLayoutAssignment(
 }
 
 AMDGPUCompiler::AMDGPUCompiler()
-    : GpuCompiler(stream_executor::rocm::kROCmPlatformId,
-                  amdgpu::TargetTriple(), amdgpu::DataLayout()) {}
+    : GpuLLVMCompiler(stream_executor::rocm::kROCmPlatformId,
+                      amdgpu::TargetTriple(), amdgpu::DataLayout()) {}
 
-absl::StatusOr<GpuCompiler::BackendCompileResult>
+absl::StatusOr<GpuLLVMCompiler::BackendCompileResult>
 AMDGPUCompiler::CompileTargetBinary(
     const HloModuleConfig& module_config, llvm::Module* llvm_module,
     const se::DeviceDescription& device_description, bool relocatable,

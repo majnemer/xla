@@ -485,15 +485,15 @@ NVPTXCompiler::GetCompilationProvider(const DebugOptions& debug_options,
 }
 
 NVPTXCompiler::NVPTXCompiler()
-    : GpuCompiler(stream_executor::cuda::kCudaPlatformId, nvptx::TargetTriple(),
-                  nvptx::DataLayout()) {}
+    : GpuLLVMCompiler(stream_executor::cuda::kCudaPlatformId,
+                      nvptx::TargetTriple(), nvptx::DataLayout()) {}
 
 std::unique_ptr<GpuAliasInfo> NVPTXCompiler::GetAliasInfo(
     const se::DeviceDescription& device_description) const {
   return std::make_unique<NVPTXAliasInfo>(device_description);
 }
 
-absl::StatusOr<GpuCompiler::BackendCompileResult>
+absl::StatusOr<GpuLLVMCompiler::BackendCompileResult>
 NVPTXCompiler::CompileTargetBinary(
     const HloModuleConfig& module_config, llvm::Module* llvm_module,
     const stream_executor::DeviceDescription& device_description,

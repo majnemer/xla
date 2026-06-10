@@ -24,7 +24,6 @@ limitations under the License.
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/algorithm/container.h"
-#include "absl/base/casts.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
@@ -101,8 +100,9 @@ class AnalyticalLatencyHidingSchedulerTest : public HloPjRtGpuTestBase {
     return device_description().gpu_compute_capability();
   }
   std::unique_ptr<GpuAliasInfo> GetAliasInfo() {
-    return absl::down_cast<GpuCompiler*>(compiler())
-        ->GetAliasInfo(device_description());
+    auto* gpu_compiler = dynamic_cast<GpuCompiler*>(compiler());
+    CHECK(gpu_compiler != nullptr);
+    return gpu_compiler->GetAliasInfo(device_description());
   }
 };
 

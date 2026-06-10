@@ -20,7 +20,6 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 #include "absl/algorithm/container.h"
-#include "absl/base/casts.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/str_cat.h"
@@ -144,7 +143,8 @@ TEST_P(CpuVectorizationTest, DoIt) {
   std::string check_lines{spec.check_lines.data(), spec.check_lines.size()};
 
   auto compiler = GetCpuCompiler();
-  auto llvm_compiler = absl::down_cast<LLVMCompiler*>(compiler.get());
+  auto* llvm_compiler = dynamic_cast<LLVMCompiler*>(compiler.get());
+  ASSERT_NE(llvm_compiler, nullptr);
   TF_ASSERT_OK(CompileAheadOfTimeAndVerifyIr(llvm_compiler, options,
                                              std::move(hlo_module), check_lines,
                                              /*match_optimized_ir=*/true));
@@ -335,7 +335,8 @@ TEST_P(JitVectorizationTest, JitX86UpToIsa) {
   hlo_module->AddEntryComputation(std::move(computation));
 
   auto compiler = GetCpuCompiler();
-  auto llvm_compiler = absl::down_cast<LLVMCompiler*>(compiler.get());
+  auto* llvm_compiler = dynamic_cast<LLVMCompiler*>(compiler.get());
+  ASSERT_NE(llvm_compiler, nullptr);
   Compiler::CompileOptions compile_options;
   compile_options.device_allocator = nullptr;
   TF_ASSERT_OK(CompileAndVerifyIr(llvm_compiler, compile_options,
