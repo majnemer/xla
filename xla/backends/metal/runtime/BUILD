@@ -94,3 +94,49 @@ objc_library(
         "@com_google_absl//absl/synchronization",
     ],
 )
+
+# Compiled MPSGraph region: opaque executable + feed/result binding
+# descriptors. Pure C++ carrier shared by the compiler-side emitter and
+# MetalGraphThunk.
+cc_library(
+    name = "metal_graph_artifact",
+    hdrs = ["metal_graph_artifact.h"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = ["//xla/stream_executor/metal:metal_graph_executable"],
+)
+
+# Thunk executing a compiled MPSGraph region: binds fusion-operand slices as
+# feeds, the fusion slice as the result, and encodes onto the stream's
+# command buffer via EncodeWithCommandBuffer (the MetalFft pattern).
+objc_library(
+    name = "metal_graph_thunk",
+    srcs = ["metal_graph_thunk.mm"],
+    hdrs = ["metal_graph_thunk.h"],
+    sdk_frameworks = [
+        "Foundation",
+        "Metal",
+        "MetalPerformanceShaders",
+        "MetalPerformanceShadersGraph",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":metal_graph_artifact",
+        "//xla/backends/gpu/runtime:thunk",
+        "//xla/runtime:buffer_use",
+        "//xla/service:shaped_slice",
+        "//xla/service/gpu:buffer_allocations",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/metal:metal_allocator",
+        "//xla/stream_executor/metal:metal_executor_header",
+        "//xla/stream_executor/metal:metal_graph_executable",
+        "//xla/stream_executor/metal:metal_stream",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
+    ],
+)

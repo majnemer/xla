@@ -164,3 +164,36 @@ cc_test(
         "@llvm-project//mlir:VectorDialect",
     ],
 )
+
+# Translates __metal_graph fusion bodies into MPSGraph and compiles the
+# MPSGraphExecutable at MetalCompiler compile time. C++-clean header; must
+# accept everything //xla/backends/metal/transforms:metal_graph_support's
+# gate accepts (plus float-normalization rewrites thereof).
+objc_library(
+    name = "metal_graph_emitter",
+    srcs = ["metal_graph_emitter.mm"],
+    hdrs = ["metal_graph_emitter.h"],
+    sdk_frameworks = [
+        "Foundation",
+        "Metal",
+        "MetalPerformanceShaders",
+        "MetalPerformanceShadersGraph",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        "//xla:literal",
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/backends/metal/runtime:metal_graph_artifact",
+        "//xla/backends/metal/transforms:metal_graph_support",
+        "//xla/hlo/ir:hlo",
+        "//xla/stream_executor/metal:metal_graph_executable",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+    ],
+)

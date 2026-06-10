@@ -28,6 +28,7 @@ limitations under the License.
 #include "absl/strings/substitute.h"
 #include "absl/synchronization/blocking_counter.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/span.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -43,13 +44,18 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/thunk_executor.h"
 #include "xla/backends/gpu/runtime/while_thunk.h"
+#include "xla/backends/metal/codegen/metal_graph_emitter.h"
 #include "xla/backends/metal/codegen/msl_kernel_emitter.h"
 #include "xla/backends/metal/codegen/msl_kernel_source.h"
 #include "xla/backends/metal/codegen/sort_emitter.h"
+#include "xla/backends/metal/runtime/metal_graph_artifact.h"
+#include "xla/backends/metal/runtime/metal_graph_thunk.h"
 #include "xla/backends/metal/runtime/metal_kernel_artifact.h"
 #include "xla/backends/metal/runtime/metal_kernel_thunk.h"
 #include "xla/backends/metal/runtime/metal_triangular_solve_thunk.h"
 #include "xla/backends/metal/transforms/expand_complex_triangular_solve.h"
+#include "xla/backends/metal/transforms/metal_graph_partitioner.h"
+#include "xla/backends/metal/transforms/metal_graph_support.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/codegen/mlir_kernel_source.h"
 #include "xla/hlo/analysis/hlo_ordering.h"
@@ -145,6 +151,14 @@ struct DeferredSortStage {
   xla::metal::MetalKernelThunk* thunk;
 };
 
+// One __metal_graph fusion queued for Phase-2 MPSGraph translation and
+// compilation.
+struct DeferredGraphFusion {
+  std::string fusion_name;
+  const HloFusionInstruction* fusion_instr;  // not owned
+  xla::metal::MetalGraphThunk* thunk;        // owned by ThunkExecutor
+};
+
 }  // namespace
 
 MetalCompiler::MetalCompiler()
@@ -168,49 +182,57 @@ absl::Status MetalCompiler::OptimizeHloConvolutionCanonicalization(
       .status();
 }
 
-absl::Status MetalCompiler::OptimizeHloPostLayoutAssignment(
-    HloModule* hlo_module, se::StreamExecutor* stream_exec,
-    const CompileOptions& options,
-    const xla::gpu::GpuTargetConfig& gpu_target_config,
-    const xla::gpu::GpuAliasInfo* alias_info,
-    tsl::thread::ThreadPool* thread_pool, CompilationStats* compilation_stats,
-    mlir::MLIRContext* mlir_context) {
-  // Widen low-precision types the MSL emitter cannot lower. The base
-  // GpuCompiler's float_normalization sub-pipeline keys its decisions off
-  // CUDA/ROCm compute capabilities and would otherwise leave many of these
-  // types (BF16 data movement, F8 data movement, BF16 dot) in HLO when run
-  // against a MetalComputeCapability. Mirrors AMDGPUCompiler's pattern of
-  // running a target-specific FloatNormalization pre-pipeline before
-  // delegating to the base.
-  HloPassPipeline pre("metal_pre_normalization", compilation_stats);
-  FloatSupport bf16(BF16);
-  FloatSupport f8e5m2(F8E5M2, F16);
-  FloatSupport f8e4m3(F8E4M3, F16);
-  FloatSupport f8e3m4(F8E3M4, F16);
-  FloatSupport f8e4m3fn(F8E4M3FN, F16);
-  FloatSupport f8e4m3fnuz(F8E4M3FNUZ, F16);
-  FloatSupport f8e5m2fnuz(F8E5M2FNUZ, F16);
-  FloatSupport f8e4m3b11fnuz(F8E4M3B11FNUZ, F16);
-  FloatSupport f4e2m1fn(F4E2M1FN, F16);
-  FloatSupport f8e8m0fnu(F8E8M0FNU, F16);
-  pre.AddPass<FloatNormalization>(&bf16);
-  pre.AddPass<FloatNormalization>(&f8e5m2);
-  pre.AddPass<FloatNormalization>(&f8e4m3);
-  pre.AddPass<FloatNormalization>(&f8e3m4);
-  pre.AddPass<FloatNormalization>(&f8e4m3fn);
-  pre.AddPass<FloatNormalization>(&f8e4m3fnuz);
-  pre.AddPass<FloatNormalization>(&f8e5m2fnuz);
-  pre.AddPass<FloatNormalization>(&f8e4m3b11fnuz);
-  pre.AddPass<FloatNormalization>(&f4e2m1fn);
-  pre.AddPass<FloatNormalization>(&f8e8m0fnu);
-  TF_RETURN_IF_ERROR(
-      pre.Run(hlo_module,
-              /*execution_threads=*/{HloInstruction::kMainExecutionThread})
-          .status());
+namespace {
 
-  return xla::gpu::GpuCompiler::OptimizeHloPostLayoutAssignment(
-      hlo_module, stream_exec, options, gpu_target_config, alias_info,
-      thread_pool, compilation_stats, mlir_context);
+// Widens a low-precision type everywhere except inside kCustom fusion
+// bodies: __metal_graph regions keep what MPSGraph handles natively. Same
+// shape as CpuFloatSupport's oneDNN-fusion skip.
+class MetalFloatSupport : public FloatSupport {
+ public:
+  using FloatSupport::FloatSupport;
+
+  bool ShouldSkipComputationsOf(const HloInstruction& hlo) const override {
+    return hlo.opcode() == HloOpcode::kFusion &&
+           Cast<HloFusionInstruction>(&hlo)->fusion_kind() ==
+               HloInstruction::FusionKind::kCustom;
+  }
+};
+
+// The supports must outlive the pipeline they are added to (the base runs
+// the pipeline after this hook returns), so hand out process-lifetime
+// constants.
+absl::Span<const FloatSupport* const> MetalFloatSupports() {
+  static const auto* supports = new std::vector<const FloatSupport*>{
+      new MetalFloatSupport(BF16),          new MetalFloatSupport(F8E5M2, F16),
+      new MetalFloatSupport(F8E4M3, F16),   new MetalFloatSupport(F8E3M4, F16),
+      new MetalFloatSupport(F8E4M3FN, F16),
+      new MetalFloatSupport(F8E4M3FNUZ, F16),
+      new MetalFloatSupport(F8E5M2FNUZ, F16),
+      new MetalFloatSupport(F8E4M3B11FNUZ, F16),
+      new MetalFloatSupport(F4E2M1FN, F16),
+      new MetalFloatSupport(F8E8M0FNU, F16),
+  };
+  return *supports;
+}
+
+}  // namespace
+
+void MetalCompiler::AddGraphCompilerFusionPasses(
+    HloPassPipeline& pipeline, const se::DeviceDescription& /*device_description*/,
+    se::StreamExecutor* stream_exec) {
+  MetalGraphCapabilities caps;
+  if (stream_exec != nullptr) {
+    caps = ProbeMetalGraphCapabilities(
+        stream_executor::metal::GetMetalDeviceOpaque(stream_exec));
+  }
+  pipeline.AddPass<MetalGraphPartitioner>(caps);
+  // Widen the low-precision types the MSL emitter cannot lower. The base
+  // GpuCompiler's float_normalization runs after this and keys its decisions
+  // off CUDA/ROCm compute capabilities, leaving e.g. BF16 dots and data
+  // movement in HLO; these passes clean up everything outside captures.
+  for (const FloatSupport* support : MetalFloatSupports()) {
+    pipeline.AddPass<FloatNormalization>(support);
+  }
 }
 
 void MetalCompiler::AddGemmRewriteCustomCallPasses(
@@ -284,6 +306,7 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
   NameUniquer msl_function_name_uniquer;
   std::vector<DeferredFusion> deferred_fusions;
   std::vector<DeferredSortStage> deferred_sort_stages;
+  std::vector<DeferredGraphFusion> deferred_graph_fusions;
   std::optional<BufferAllocation::Slice> rng_state_slice;
   // PSO compilation needs a live id<MTLDevice>; MetalCompiler rejects null
   // stream_exec at entry so the cast is safe here.
@@ -615,6 +638,30 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
 
       case HloOpcode::kFusion: {
         const auto* fusion_instr = Cast<HloFusionInstruction>(instr);
+        // __metal_graph regions bypass the MLIR/MSL path: feeds bind in
+        // operand order, the fusion's slice is the single result, and the
+        // MPSGraphExecutable is built in Phase 2 alongside the PSOs.
+        if (IsMetalGraphFusion(*instr)) {
+          std::vector<ShapedSlice> graph_feeds;
+          graph_feeds.reserve(instr->operand_count());
+          for (const HloInstruction* operand : instr->operands()) {
+            TF_ASSIGN_OR_RETURN(
+                BufferAllocation::Slice slice,
+                buffer_assignment->GetUniqueSlice(operand, /*index=*/{}));
+            graph_feeds.push_back(ShapedSlice{slice, operand->shape()});
+          }
+          TF_ASSIGN_OR_RETURN(
+              BufferAllocation::Slice result_slice,
+              buffer_assignment->GetUniqueSlice(instr, /*index=*/{}));
+          auto graph_thunk = std::make_unique<xla::metal::MetalGraphThunk>(
+              gpu::Thunk::ThunkInfo{}, std::move(graph_feeds),
+              ShapedSlice{result_slice, instr->shape()});
+          deferred_graph_fusions.push_back(DeferredGraphFusion{
+              std::string(fusion_instr->name()), fusion_instr,
+              graph_thunk.get()});
+          thunks.push_back(std::move(graph_thunk));
+          break;
+        }
         TF_ASSIGN_OR_RETURN(
             emitters::KernelArguments kernel_args,
             emitters::KernelArguments::Create(*buffer_assignment,
@@ -937,6 +984,31 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
         std::move(build_result.artifact));
     if (!msl_blob.empty()) msl_blob.append("\n");
     msl_blob.append(build_result.msl);
+  }
+
+  // Phase 2/3 for __metal_graph regions: translate each fusion body and
+  // compile its MPSGraphExecutable, then install on the thunk.
+  std::vector<absl::StatusOr<std::unique_ptr<xla::metal::MetalGraphArtifact>>>
+      graph_results(deferred_graph_fusions.size());
+  if (thread_pool && !deferred_graph_fusions.empty()) {
+    absl::BlockingCounter counter(deferred_graph_fusions.size());
+    for (size_t i = 0; i < deferred_graph_fusions.size(); ++i) {
+      thread_pool.get_mutable()->Schedule([&, i] {
+        graph_results[i] = xla::metal::BuildMetalGraphArtifact(
+            metal_device, *deferred_graph_fusions[i].fusion_instr);
+        counter.DecrementCount();
+      });
+    }
+    counter.Wait();
+  } else {
+    for (size_t i = 0; i < deferred_graph_fusions.size(); ++i) {
+      graph_results[i] = xla::metal::BuildMetalGraphArtifact(
+          metal_device, *deferred_graph_fusions[i].fusion_instr);
+    }
+  }
+  for (size_t i = 0; i < deferred_graph_fusions.size(); ++i) {
+    TF_RETURN_IF_ERROR(graph_results[i].status());
+    deferred_graph_fusions[i].thunk->SetArtifact(*std::move(graph_results[i]));
   }
 
   TF_ASSIGN_OR_RETURN(auto output_info,

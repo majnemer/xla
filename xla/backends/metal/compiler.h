@@ -52,19 +52,18 @@ class MetalCompiler : public xla::gpu::GpuCompiler {
       const se::SemanticVersion& toolkit_version,
       CompilationStats* compilation_stats) override;
 
-  // Normalizes BF16, all F8 variants, F4E2M1FN, and F8E8M0FNU away before
-  // delegating to the GpuCompiler base. The MSL emitter cannot lower those
-  // types, and the inherited float_normalization sub-pipeline gates many of
-  // them on CUDA/ROCm compute capabilities that don't apply here. Mirrors
-  // AMDGPUCompiler's pre-pipeline pattern (see amdgpu_compiler.cc).
-  absl::Status OptimizeHloPostLayoutAssignment(
-      HloModule* hlo_module, se::StreamExecutor* stream_exec,
-      const CompileOptions& options,
-      const xla::gpu::GpuTargetConfig& gpu_target_config,
-      const xla::gpu::GpuAliasInfo* alias_info,
-      tsl::thread::ThreadPool* thread_pool,
-      CompilationStats* compilation_stats,
-      mlir::MLIRContext* mlir_context) override;
+  // Forms __metal_graph fusions (MetalGraphPartitioner), then normalizes
+  // BF16, all F8 variants, F4E2M1FN, and F8E8M0FNU away from everything
+  // OUTSIDE those regions. The MSL emitter cannot lower these types, but
+  // MPSGraph keeps capability-gated ones (bf16) native inside captures, so
+  // normalization runs post-capture with ShouldSkipComputationsOf skipping
+  // kCustom fusion bodies (the CPU/oneDNN pattern). The base pipeline's own
+  // float normalization treats bf16 dots and data movement as supported and
+  // leaves capture bodies intact.
+  void AddGraphCompilerFusionPasses(
+      HloPassPipeline& pipeline,
+      const se::DeviceDescription& device_description,
+      se::StreamExecutor* stream_exec) override;
 
   void AddGemmRewriteCustomCallPasses(
       HloPassPipeline& pipeline, const DebugOptions& debug_options,

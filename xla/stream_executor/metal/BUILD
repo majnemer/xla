@@ -376,3 +376,19 @@ objc_library(
     ],
     alwayslink = 1,
 )
+
+# Opaque retained holder for a compiled MPSGraphExecutable. C++-clean header
+# so compiler-side .cc code can own one; the .mm owns the ARC bridging.
+# Mirrors metal_pso_probe's PipelineStateRef.
+objc_library(
+    name = "metal_graph_executable",
+    srcs = ["metal_graph_executable.mm"],
+    hdrs = ["metal_graph_executable.h"],
+    sdk_frameworks = [
+        "Foundation",
+        "Metal",
+        "MetalPerformanceShaders",
+        "MetalPerformanceShadersGraph",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+)
