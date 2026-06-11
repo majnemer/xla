@@ -126,6 +126,11 @@ class SpecializeTopkVisitor : public DfsHloRewriteVisitor {
       return absl::OkStatus();
     }
     TF_RET_CHECK(topk->operand_count() == 1);
+    // The __gpu$TopK runtime kernel only exists for CUDA and ROCm; other
+    // platforms keep the sort+slice lowering from TopkDecomposer.
+    if (!compute_capability_.IsCuda() && !compute_capability_.IsRocm()) {
+      return absl::OkStatus();
+    }
     bool is_cuda = compute_capability_.IsCuda();
 
     if (auto small_topk = SmallBufferOptimization(
