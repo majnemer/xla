@@ -176,6 +176,9 @@ absl::StatusOr<MPSGraphTensorData*> MakeTensorData(MetalAllocator* allocator,
   if (descriptor == nil) {
     return absl::InternalError("MetalFft: MPSNDArrayDescriptor init returned nil");
   }
+  // XLA buffers are densely packed; without this MPSNDArray pads rowBytes to
+  // 16 and rejects buffers whose innermost dimension isn't a multiple of it.
+  descriptor.preferPackedRows = YES;
   MPSNDArray* ndarray =
       [[MPSNDArray alloc] initWithBuffer:resolved->buffer
                                   offset:resolved->offset
