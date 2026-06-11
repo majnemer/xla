@@ -20,11 +20,13 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/functional/function_ref.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/strings/substitute.h"
 #include "absl/synchronization/blocking_counter.h"
 #include "absl/synchronization/mutex.h"
@@ -44,6 +46,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/thunk_executor.h"
 #include "xla/backends/gpu/runtime/while_thunk.h"
+#include "xla/backends/metal/codegen/dynamic_shape_emitter.h"
 #include "xla/backends/metal/codegen/metal_graph_emitter.h"
 #include "xla/backends/metal/codegen/msl_kernel_emitter.h"
 #include "xla/backends/metal/codegen/msl_kernel_source.h"
@@ -157,6 +160,19 @@ struct DeferredGraphFusion {
   std::string fusion_name;
   const HloFusionInstruction* fusion_instr;  // not owned
   xla::metal::MetalGraphThunk* thunk;        // owned by ThunkExecutor
+};
+
+// One PadToStatic/SliceToDynamic custom-call kernel queued for Phase-2 MLIR
+// emission.
+struct DeferredDynamicShapeKernel {
+  xla::metal::DynamicShapeKernelDescription desc;
+  xla::metal::MetalKernelThunk* thunk;  // owned by ThunkExecutor
+};
+
+// One sort iota-operand fill kernel queued for Phase-2 MLIR emission.
+struct DeferredIotaFill {
+  xla::metal::IotaFillDescription desc;
+  xla::metal::MetalKernelThunk* thunk;  // owned by ThunkExecutor
 };
 
 }  // namespace
@@ -314,6 +330,8 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
   std::vector<DeferredFusion> deferred_fusions;
   std::vector<DeferredSortStage> deferred_sort_stages;
   std::vector<DeferredGraphFusion> deferred_graph_fusions;
+  std::vector<DeferredDynamicShapeKernel> deferred_dynamic_shape_kernels;
+  std::vector<DeferredIotaFill> deferred_iota_fills;
   std::optional<BufferAllocation::Slice> rng_state_slice;
   // PSO compilation needs a live id<MTLDevice>; MetalCompiler rejects null
   // stream_exec at entry so the cast is safe here.
@@ -342,6 +360,83 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
     }
     return local;
   };
+  // Shared by standalone kSort and sort-fusions (fused root kSort with
+  // parameter/iota operands): copy/fill the output buffers, then plan the
+  // bitonic stages for Phase-2 emission. Iota operands inside a fusion have
+  // no buffer of their own; a fill kernel materializes them before stage 0.
+  auto emit_sort = [&](gpu::ThunkSequence& thunks,
+                       const HloSortInstruction* sort,
+                       const HloFusionInstruction* fusion) -> absl::Status {
+    if (sort->is_stable()) {
+      return Internal(
+          "Metal: stable sort not supported here. Did stable_sort_expander "
+          "run? Sort '%s'",
+          sort->name());
+    }
+    const HloInstruction* slices_instr =
+        fusion != nullptr ? static_cast<const HloInstruction*>(fusion) : sort;
+    for (int64_t i = 0; i < sort->operand_count(); ++i) {
+      const HloInstruction* operand = sort->operand(i);
+      ShapeIndex shape_index =
+          sort->operand_count() > 1 ? ShapeIndex({i}) : ShapeIndex({});
+      TF_ASSIGN_OR_RETURN(
+          BufferAllocation::Slice dst,
+          buffer_assignment->GetUniqueSlice(slices_instr, shape_index));
+      if (fusion != nullptr && HloPredicateIsOp<HloOpcode::kIota>(operand)) {
+        std::string entry_name = msl_function_name_uniquer.GetUniqueName(
+            llvm_ir::SanitizeFunctionName(std::string(operand->name())));
+        TF_ASSIGN_OR_RETURN(
+            xla::metal::IotaFillDescription fill_desc,
+            xla::metal::PlanIotaFill(Cast<HloIotaInstruction>(operand), dst,
+                                     gpu_device_info,
+                                     gpu::GetDefaultBufferAlignment(),
+                                     std::move(entry_name)));
+        auto fill_thunk = std::make_unique<xla::metal::MetalKernelThunk>(
+            gpu::Thunk::ThunkInfo{}, fill_desc.kernel_args);
+        deferred_iota_fills.push_back(
+            DeferredIotaFill{std::move(fill_desc), fill_thunk.get()});
+        thunks.push_back(std::move(fill_thunk));
+        continue;
+      }
+      const HloInstruction* src_instr = operand;
+      if (fusion != nullptr) {
+        TF_RET_CHECK(operand->opcode() == HloOpcode::kParameter)
+            << "sort-fusion operand must be a parameter or iota: "
+            << operand->ToString();
+        src_instr = fusion->operand(operand->parameter_number());
+      }
+      TF_ASSIGN_OR_RETURN(BufferAllocation::Slice src,
+                          buffer_assignment->GetUniqueSlice(src_instr, {}));
+      if (src == dst) continue;
+      const Shape& shape = operand->shape();
+      thunks.push_back(std::make_unique<gpu::DeviceToDeviceCopyThunk>(
+          gpu::Thunk::ThunkInfo{},
+          /*source_buffer=*/ShapedSlice{src, shape},
+          /*destination_buffer=*/ShapedSlice{dst, shape},
+          /*mem_size=*/src.size()));
+    }
+    std::string entry_name_prefix = msl_function_name_uniquer.GetUniqueName(
+        llvm_ir::SanitizeFunctionName(std::string(sort->name())));
+    TF_ASSIGN_OR_RETURN(
+        std::vector<xla::metal::SortStageDescription> stages,
+        xla::metal::PlanBitonicSort(sort, fusion, *buffer_assignment,
+                                    gpu_device_info,
+                                    gpu::GetDefaultBufferAlignment(),
+                                    entry_name_prefix));
+    for (auto& stage : stages) {
+      auto stage_thunk = std::make_unique<xla::metal::MetalKernelThunk>(
+          gpu::Thunk::ThunkInfo{}, stage.kernel_args);
+      auto* stage_thunk_ptr = stage_thunk.get();
+      thunks.push_back(std::move(stage_thunk));
+      deferred_sort_stages.push_back(DeferredSortStage{
+          /*sort_name=*/std::string(sort->name()),
+          /*stage=*/std::move(stage),
+          /*thunk=*/stage_thunk_ptr,
+      });
+    }
+    return absl::OkStatus();
+  };
+
   emit_instruction = [&](const HloInstruction* instr,
                          gpu::ThunkSequence* thunks_out) -> absl::Status {
     gpu::ThunkSequence& thunks = *thunks_out;
@@ -594,52 +689,34 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
       }
 
       case HloOpcode::kSort: {
-        const auto* sort = Cast<HloSortInstruction>(instr);
-        if (sort->is_stable()) {
-          return Internal(
-              "Metal: stable sort not supported here. Did stable_sort_expander "
-              "run? Sort '%s'",
-              sort->name());
+        TF_RETURN_IF_ERROR(emit_sort(thunks, Cast<HloSortInstruction>(instr),
+                                     /*fusion=*/nullptr));
+        break;
+      }
+
+      case HloOpcode::kCustomCall: {
+        const auto* custom_call = Cast<HloCustomCallInstruction>(instr);
+        const std::string& target = custom_call->custom_call_target();
+        if (target != "PadToStatic" && target != "SliceToDynamic") {
+          return Unimplemented(
+              "MetalCompiler::CompileToBackendResult: custom-call target '%s' "
+              "is not supported on Metal.",
+              target);
         }
-        // Sort runs in-place on the output buffer; copy non-iota, non-aliased
-        // operands in first.
-        for (int64_t i = 0; i < sort->operand_count(); ++i) {
-          const HloInstruction* operand = sort->operand(i);
-          if (HloPredicateIsOp<HloOpcode::kIota>(operand)) continue;
-          ShapeIndex shape_index =
-              sort->operand_count() > 1 ? ShapeIndex({i}) : ShapeIndex({});
-          TF_ASSIGN_OR_RETURN(
-              BufferAllocation::Slice src,
-              buffer_assignment->GetUniqueSlice(operand, {}));
-          TF_ASSIGN_OR_RETURN(
-              BufferAllocation::Slice dst,
-              buffer_assignment->GetUniqueSlice(sort, shape_index));
-          if (src == dst) continue;
-          const Shape& shape = operand->shape();
-          thunks.push_back(std::make_unique<gpu::DeviceToDeviceCopyThunk>(
-              gpu::Thunk::ThunkInfo{},
-              /*source_buffer=*/ShapedSlice{src, shape},
-              /*destination_buffer=*/ShapedSlice{dst, shape},
-              /*mem_size=*/src.size()));
-        }
-        std::string entry_name_prefix = msl_function_name_uniquer.GetUniqueName(
-            llvm_ir::SanitizeFunctionName(std::string(sort->name())));
+        // DynamicPadder's runtime residue. Dedicated MLIR-built kernels like
+        // the sort stages; CUDA hand-emits LLVM IR for the same two targets.
+        std::string entry_name = msl_function_name_uniquer.GetUniqueName(
+            llvm_ir::SanitizeFunctionName(std::string(instr->name())));
         TF_ASSIGN_OR_RETURN(
-            std::vector<xla::metal::SortStageDescription> stages,
-            xla::metal::PlanBitonicSort(sort, *buffer_assignment, gpu_device_info,
-                                        gpu::GetDefaultBufferAlignment(),
-                                        entry_name_prefix));
-        for (auto& stage : stages) {
-          auto stage_thunk = std::make_unique<xla::metal::MetalKernelThunk>(
-              gpu::Thunk::ThunkInfo{}, stage.kernel_args);
-          auto* stage_thunk_ptr = stage_thunk.get();
-          thunks.push_back(std::move(stage_thunk));
-          deferred_sort_stages.push_back(DeferredSortStage{
-              /*sort_name=*/std::string(sort->name()),
-              /*stage=*/std::move(stage),
-              /*thunk=*/stage_thunk_ptr,
-          });
-        }
+            xla::metal::DynamicShapeKernelDescription desc,
+            xla::metal::PlanDynamicShapeKernel(
+                custom_call, *buffer_assignment, gpu_device_info,
+                gpu::GetDefaultBufferAlignment(), std::move(entry_name)));
+        auto thunk = std::make_unique<xla::metal::MetalKernelThunk>(
+            gpu::Thunk::ThunkInfo{}, desc.kernel_args);
+        deferred_dynamic_shape_kernels.push_back(
+            DeferredDynamicShapeKernel{std::move(desc), thunk.get()});
+        thunks.push_back(std::move(thunk));
         break;
       }
 
@@ -667,6 +744,18 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
               std::string(fusion_instr->name()), fusion_instr,
               graph_thunk.get()});
           thunks.push_back(std::move(graph_thunk));
+          break;
+        }
+        // Sort-fusions (fused root kSort, parameter/iota operands) bypass
+        // the MLIR fusion emitter — GetFusionEmitter would pick the
+        // non-MLIR SortFusion — and reuse the standalone bitonic path with
+        // the fusion's buffers.
+        if (fusion_instr->fused_expression_root()->opcode() ==
+            HloOpcode::kSort) {
+          TF_RETURN_IF_ERROR(emit_sort(
+              thunks,
+              Cast<HloSortInstruction>(fusion_instr->fused_expression_root()),
+              fusion_instr));
           break;
         }
         TF_ASSIGN_OR_RETURN(
@@ -989,6 +1078,158 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
     BuildResult build_result = *std::move(sort_results[i]);
     deferred_sort_stages[i].thunk->SetArtifact(
         std::move(build_result.artifact));
+    if (!msl_blob.empty()) msl_blob.append("\n");
+    msl_blob.append(build_result.msl);
+  }
+
+  // Phase 2/3 for hand-built MLIR kernels (PadToStatic/SliceToDynamic, sort
+  // iota fills): emit the module from its description, lower, translate,
+  // compile + probe. PSO-retry recomputes the launch under a capped
+  // threads-per-block limit and re-emits (the kernels bake their launch
+  // constants into the gid computation).
+  auto build_hand_kernel_artifact =
+      [&](absl::string_view entry_name, absl::string_view dump_category,
+          const emitters::KernelArguments& kernel_args,
+          const gpu::LaunchDimensions& launch_dimensions,
+          absl::FunctionRef<absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>>(
+              mlir::MLIRContext*)>
+              emit,
+          absl::FunctionRef<void(const se::DeviceDescription&)>
+              recompute_launch) -> absl::StatusOr<BuildResult> {
+    const int64_t simd_width = gpu_device_info.threads_per_warp();
+    for (;;) {
+      auto context = std::make_unique<mlir::MLIRContext>();
+      context->appendDialectRegistry(
+          gpu::MlirKernelEmitter::GetDialectRegistry());
+      context->loadAllAvailableDialects();
+
+      TF_ASSIGN_OR_RETURN(mlir::OwningOpRef<mlir::ModuleOp> owning_module,
+                          emit(context.get()));
+      mlir::ModuleOp module = *owning_module;
+
+      TF_RETURN_IF_ERROR(metal::RunMetalLoweringPipeline(
+          module, gpu_device_info, /*max_unroll_factor=*/0, *hlo_module,
+          entry_name, dump_category));
+      NameUniquer per_kernel_uniquer;
+      TF_ASSIGN_OR_RETURN(
+          metal::MslKernelSource msl_source,
+          metal::EmitMslKernel(module, &per_kernel_uniquer, *hlo_module,
+                               entry_name));
+      std::string msl_src = std::move(msl_source).source();
+
+      const int64_t requested = launch_dimensions.num_threads_per_block();
+      TF_ASSIGN_OR_RETURN(
+          stream_executor::metal::CompiledPipeline compiled,
+          stream_executor::metal::CompileAndProbe(
+              metal_device, msl_src, std::string(entry_name), requested));
+      if (compiled.pso_max_threads >= requested) {
+        const unsigned arity =
+            static_cast<unsigned>(kernel_args.args().size());
+        auto artifact = std::make_unique<xla::metal::MetalKernelArtifact>(
+            std::string(entry_name), arity, launch_dimensions,
+            std::move(compiled.pso));
+        return BuildResult{std::move(artifact), std::move(msl_src)};
+      }
+      int64_t next = (compiled.pso_max_threads / simd_width) * simd_width;
+      if (next < simd_width || next >= requested) {
+        return absl::ResourceExhaustedError(absl::StrCat(
+            "Kernel '", entry_name, "': requested ", requested,
+            " threads per threadgroup, but the device's PSO grants only ",
+            compiled.pso_max_threads, "."));
+      }
+      VLOG(1) << "Kernel '" << entry_name << "': requested " << requested
+              << " threads, PSO ceiling " << compiled.pso_max_threads
+              << "; retrying with limit " << next;
+      se::DeviceDescription dev = gpu_device_info;
+      dev.set_threads_per_block_limit(next);
+      recompute_launch(dev);
+    }
+  };
+
+  auto build_dynamic_shape_artifact =
+      [&](xla::metal::DynamicShapeKernelDescription desc)
+      -> absl::StatusOr<BuildResult> {
+    const bool pad_to_static =
+        desc.custom_call->custom_call_target() == "PadToStatic";
+    return build_hand_kernel_artifact(
+        desc.entry_name, "mlir-dynamic-shape", desc.kernel_args,
+        desc.launch_dimensions,
+        [&](mlir::MLIRContext* context) {
+          return pad_to_static
+                     ? xla::metal::EmitPadToStaticMLIR(context, desc)
+                     : xla::metal::EmitSliceToDynamicMLIR(context, desc);
+        },
+        [&](const se::DeviceDescription& dev) {
+          xla::metal::RecomputeDynamicShapeLaunch(desc, dev);
+        });
+  };
+
+  std::vector<absl::StatusOr<BuildResult>> dynamic_shape_results(
+      deferred_dynamic_shape_kernels.size());
+  if (thread_pool && !deferred_dynamic_shape_kernels.empty()) {
+    absl::BlockingCounter counter(deferred_dynamic_shape_kernels.size());
+    for (size_t i = 0; i < deferred_dynamic_shape_kernels.size(); ++i) {
+      thread_pool.get_mutable()->Schedule([&, i] {
+        dynamic_shape_results[i] = build_dynamic_shape_artifact(
+            std::move(deferred_dynamic_shape_kernels[i].desc));
+        counter.DecrementCount();
+      });
+    }
+    counter.Wait();
+  } else {
+    for (size_t i = 0; i < deferred_dynamic_shape_kernels.size(); ++i) {
+      dynamic_shape_results[i] = build_dynamic_shape_artifact(
+          std::move(deferred_dynamic_shape_kernels[i].desc));
+    }
+  }
+  for (size_t i = 0; i < deferred_dynamic_shape_kernels.size(); ++i) {
+    TF_RETURN_IF_ERROR(dynamic_shape_results[i].status());
+  }
+  for (size_t i = 0; i < deferred_dynamic_shape_kernels.size(); ++i) {
+    BuildResult build_result = *std::move(dynamic_shape_results[i]);
+    deferred_dynamic_shape_kernels[i].thunk->SetArtifact(
+        std::move(build_result.artifact));
+    if (!msl_blob.empty()) msl_blob.append("\n");
+    msl_blob.append(build_result.msl);
+  }
+
+  auto build_iota_fill_artifact =
+      [&](xla::metal::IotaFillDescription desc) -> absl::StatusOr<BuildResult> {
+    return build_hand_kernel_artifact(
+        desc.entry_name, "mlir-iota-fill", desc.kernel_args,
+        desc.launch_dimensions,
+        [&](mlir::MLIRContext* context) {
+          return xla::metal::EmitIotaFillMLIR(context, desc);
+        },
+        [&](const se::DeviceDescription& dev) {
+          xla::metal::RecomputeIotaFillLaunch(desc, dev);
+        });
+  };
+
+  std::vector<absl::StatusOr<BuildResult>> iota_fill_results(
+      deferred_iota_fills.size());
+  if (thread_pool && !deferred_iota_fills.empty()) {
+    absl::BlockingCounter counter(deferred_iota_fills.size());
+    for (size_t i = 0; i < deferred_iota_fills.size(); ++i) {
+      thread_pool.get_mutable()->Schedule([&, i] {
+        iota_fill_results[i] =
+            build_iota_fill_artifact(std::move(deferred_iota_fills[i].desc));
+        counter.DecrementCount();
+      });
+    }
+    counter.Wait();
+  } else {
+    for (size_t i = 0; i < deferred_iota_fills.size(); ++i) {
+      iota_fill_results[i] =
+          build_iota_fill_artifact(std::move(deferred_iota_fills[i].desc));
+    }
+  }
+  for (size_t i = 0; i < deferred_iota_fills.size(); ++i) {
+    TF_RETURN_IF_ERROR(iota_fill_results[i].status());
+  }
+  for (size_t i = 0; i < deferred_iota_fills.size(); ++i) {
+    BuildResult build_result = *std::move(iota_fill_results[i]);
+    deferred_iota_fills[i].thunk->SetArtifact(std::move(build_result.artifact));
     if (!msl_blob.empty()) msl_blob.append("\n");
     msl_blob.append(build_result.msl);
   }

@@ -121,7 +121,8 @@ gpu::LaunchDimensions ComputeTiledLaunchDimensions(
 }  // namespace
 
 absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
-    const HloSortInstruction* sort, const BufferAssignment& buffer_assignment,
+    const HloSortInstruction* sort, const HloFusionInstruction* fusion,
+    const BufferAssignment& buffer_assignment,
     const se::DeviceDescription& device,
     const emitters::KernelArguments::BufferAlignment& buffer_alignment,
     const std::string& entry_name_prefix) {
@@ -138,18 +139,6 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
     TF_RET_CHECK(LayoutUtil::LayoutsInShapesEqual(
         keys_shape, ShapeUtil::GetSubshape(sort->shape(), shape_index),
         Layout::Equal().IgnoreMemorySpace().IgnoreElementSize()));
-  }
-  // TODO(majnemer): emit iota inline. EmitCompareLoopBody (sort_util.cc)
-  // checks `emit_iota_operands && operand is kIota` and calls EmitIota
-  // instead of reading from the buffer. The MLIR version would inline an
-  // iota_op_from_index call on the first stage that touches each iota
-  // operand and then read from the output buffer on subsequent stages.
-  for (int64_t i = 0; i < sort->operand_count(); ++i) {
-    if (HloPredicateIsOp<HloOpcode::kIota>(sort->operand(i))) {
-      return absl::UnimplementedError(absl::StrCat(
-          "MetalCompiler::PlanBitonicSort: iota operand at index ", i,
-          " is not yet supported by the MLIR sort kernel."));
-    }
   }
 
   const int64_t dimension_to_sort = sort->sort_dimension();
@@ -192,22 +181,25 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
       keys_shape, dimension_to_sort, dimension_to_sort_bound, tile_size,
       kBitonicTileUnroll, &tiled_num_tiles_in_sort_dim);
 
+  // Sort runs in place on the output buffers; the input buffers alias the
+  // outputs after the copies/fills emitted earlier, so the kernel only takes
+  // the output buffers. Drop the operand prefix (for a sort-fusion that is
+  // the fusion's own operands) so we stay under Metal's 31-buffer-argument
+  // limit for wide many-input sorts.
+  const HloInstruction* slices_instr =
+      fusion != nullptr ? static_cast<const HloInstruction*>(fusion) : sort;
   TF_ASSIGN_OR_RETURN(
       emitters::KernelArguments full_kernel_args,
       emitters::KernelArguments::Create(buffer_assignment, buffer_alignment,
-                                        sort));
-  // Sort runs in place on the output buffers; the input buffers alias the
-  // outputs after the D2D copy emitted earlier, so the kernel only takes the
-  // output buffers. Drop the operand half (the first operand_count args) so
-  // we stay under Metal's 31-buffer-argument limit for wide many-input sorts.
-  TF_RET_CHECK(full_kernel_args.args().size() == 2 * sort->operand_count());
+                                        slices_instr));
+  TF_RET_CHECK(full_kernel_args.args().size() ==
+               slices_instr->operand_count() + sort->operand_count());
   std::vector<emitters::KernelArgument> output_args(
-      full_kernel_args.args().begin() + sort->operand_count(),
+      full_kernel_args.args().begin() + slices_instr->operand_count(),
       full_kernel_args.args().end());
   emitters::KernelArguments kernel_args(std::move(output_args));
 
   std::vector<SortStageDescription> stages;
-  bool emit_iota_operands = true;
   auto emit_stage = [&](std::vector<int64_t> xor_masks, bool tiled) {
     SortStageDescription stage{
         /*sort=*/sort,
@@ -219,13 +211,11 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
         tiled ? tiled_num_tiles_in_sort_dim
               : static_cast<int64_t>(standard_num_iterations_in_sort_dim),
         /*launch_dimensions=*/tiled ? tiled_launch : standard_launch,
-        /*emit_iota_operands=*/emit_iota_operands,
         /*kernel_args=*/kernel_args,
         /*entry_name=*/
         absl::StrCat(entry_name_prefix, "_stage", stages.size()),
     };
     stages.push_back(std::move(stage));
-    emit_iota_operands = false;
   };
 
   // Adjacent xor_masks below tile_size accumulate into one tiled stage
@@ -854,6 +844,144 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
   b.setInsertionPointToEnd(entry_block);
   mlir::func::ReturnOp::create(b, if_op.getResults());
 
+  return module;
+}
+
+absl::StatusOr<IotaFillDescription> PlanIotaFill(
+    const HloIotaInstruction* iota, BufferAllocation::Slice out_slice,
+    const se::DeviceDescription& device,
+    const emitters::KernelArguments::BufferAlignment& buffer_alignment,
+    std::string entry_name) {
+  const Shape& shape = iota->shape();
+  TF_RET_CHECK(shape.IsArray() && !shape.dimensions().empty());
+  emitters::KernelArgument out_arg(shape, out_slice);
+  out_arg.set_written(true);
+  out_arg.set_slice_index(0);
+  const BufferAllocation* allocation = out_slice.allocation();
+  out_arg.set_alignment(
+      allocation->is_entry_computation_parameter()
+          ? buffer_alignment.entry_parameter_align_bytes
+          : (allocation->is_constant()
+                 ? buffer_alignment.constant_buffer_align_bytes
+                 : buffer_alignment.xla_allocated_buffer_align_bytes));
+  std::vector<emitters::KernelArgument> args;
+  args.push_back(std::move(out_arg));
+  IotaFillDescription desc{iota, emitters::KernelArguments(std::move(args)),
+                           gpu::LaunchDimensions(), std::move(entry_name)};
+  RecomputeIotaFillLaunch(desc, device);
+  return desc;
+}
+
+void RecomputeIotaFillLaunch(IotaFillDescription& desc,
+                             const se::DeviceDescription& device) {
+  gpu::LaunchDimensions launch =
+      gpu::CalculateLaunchDimensions(desc.iota->shape(), device);
+  const int64_t limit = device.threads_per_block_limit();
+  if (limit > 0 && launch.num_threads_per_block() > limit) {
+    const int64_t elements =
+        std::max<int64_t>(ShapeUtil::ElementsIn(desc.iota->shape()), 1);
+    launch = gpu::LaunchDimensions(CeilOfRatio(elements, limit), limit);
+  }
+  desc.launch_dimensions = launch;
+}
+
+absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitIotaFillMLIR(
+    mlir::MLIRContext* context, const IotaFillDescription& desc) {
+  namespace ma = mlir::arith;
+  mlir::OpBuilder builder(context);
+  auto loc = mlir::NameLoc::get(builder.getStringAttr(desc.entry_name));
+  mlir::OwningOpRef<mlir::ModuleOp> module = llvm_ir::CreateMlirModuleOp(loc);
+  mlir::ImplicitLocOpBuilder b(loc, *module);
+
+  const emitters::KernelArgument& arg = desc.kernel_args.args().front();
+  mlir::Type tensor_type = emitters::TensorShapeToMlirType(arg.shape(), b);
+  llvm::SmallVector<mlir::NamedAttribute> attrs;
+  attrs.push_back(b.getNamedAttr(kXlaSliceIndexAttr, b.getIndexAttr(0)));
+  attrs.push_back(b.getNamedAttr(mlir::LLVM::LLVMDialect::getAlignAttrName(),
+                                 b.getIndexAttr(arg.alignment())));
+  attrs.push_back(
+      b.getNamedAttr(mlir::LLVM::LLVMDialect::getDereferenceableAttrName(),
+                     b.getIndexAttr(arg.slice().size())));
+
+  b.setInsertionPointToStart(module->getBody());
+  auto entry_func = mlir::func::FuncOp::create(
+      b, desc.entry_name,
+      mlir::FunctionType::get(context, {tensor_type}, {tensor_type}),
+      /*sym_visibility=*/mlir::StringAttr{},
+      mlir::ArrayAttr::get(context,
+                           {mlir::DictionaryAttr::get(context, attrs)}),
+      /*res_attrs=*/mlir::ArrayAttr{});
+  entry_func->setAttr(kXlaEntryAttr, mlir::UnitAttr::get(context));
+
+  mlir::Block* block = entry_func.addEntryBlock();
+  b.setInsertionPointToStart(block);
+  mlir::Value out = block->getArgument(0);
+  auto const_idx = [&](int64_t v) {
+    return ma::ConstantIndexOp::create(b, v).getResult();
+  };
+
+  // gid covers the full grid; the launch may carry a y block dimension when
+  // num_blocks exceeds the device's x grid limit.
+  mlir::Value tid = mlir::gpu::ThreadIdOp::create(b, mlir::gpu::Dimension::x);
+  mlir::Value bid_x = mlir::gpu::BlockIdOp::create(b, mlir::gpu::Dimension::x);
+  mlir::Value bid_y = mlir::gpu::BlockIdOp::create(b, mlir::gpu::Dimension::y);
+  mlir::Value block_linear = ma::AddIOp::create(
+      b,
+      ma::MulIOp::create(b, bid_y,
+                         const_idx(desc.launch_dimensions.block_counts().x)),
+      bid_x);
+  mlir::Value gid = ma::AddIOp::create(
+      b,
+      ma::MulIOp::create(
+          b, block_linear,
+          const_idx(desc.launch_dimensions.num_threads_per_block())),
+      tid);
+
+  const Shape& shape = desc.iota->shape();
+  const int64_t rank = shape.dimensions().size();
+  llvm::SmallVector<mlir::Value> coords(rank);
+  int64_t divisor = 1;
+  for (int64_t i = 0; i < rank; ++i) {
+    const int64_t dim = shape.layout().minor_to_major(i);
+    mlir::Value quot = ma::DivUIOp::create(b, gid, const_idx(divisor));
+    coords[dim] =
+        i == rank - 1
+            ? quot
+            : ma::RemUIOp::create(b, quot, const_idx(shape.dimensions(dim)))
+                  .getResult();
+    divisor *= shape.dimensions(dim);
+  }
+
+  mlir::Value value_idx = coords[desc.iota->iota_dimension()];
+  mlir::Type elem_type =
+      mlir::cast<mlir::RankedTensorType>(tensor_type).getElementType();
+  mlir::Value value;
+  if (mlir::isa<mlir::IntegerType>(elem_type)) {
+    value = ma::IndexCastOp::create(b, elem_type, value_idx);
+  } else if (mlir::isa<mlir::FloatType>(elem_type)) {
+    mlir::Value as_int = ma::IndexCastOp::create(b, b.getI64Type(), value_idx);
+    value = ma::SIToFPOp::create(b, elem_type, as_int);
+  } else {
+    return absl::UnimplementedError(
+        absl::StrCat("Iota fill: unsupported element type for ",
+                     ShapeUtil::HumanStringWithLayout(shape)));
+  }
+
+  mlir::Value in_bounds =
+      ma::CmpIOp::create(b, ma::CmpIPredicate::ult, gid,
+                         const_idx(ShapeUtil::ElementsIn(shape)));
+  auto if_op = mlir::scf::IfOp::create(b, {tensor_type}, in_bounds,
+                                       /*withElseRegion=*/true);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(if_op.thenBlock());
+    mlir::scf::YieldOp::create(
+        b,
+        mlir::Value(mlir::tensor::InsertOp::create(b, value, out, coords)));
+    b.setInsertionPointToStart(if_op.elseBlock());
+    mlir::scf::YieldOp::create(b, out);
+  }
+  mlir::func::ReturnOp::create(b, if_op.getResults());
   return module;
 }
 

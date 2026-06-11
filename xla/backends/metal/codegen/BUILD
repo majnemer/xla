@@ -83,6 +83,37 @@ cc_library(
 # kSort here, gets back a list of stage descriptions, and feeds each through
 # the standard MSL lowering+translation pipeline.
 cc_library(
+    name = "dynamic_shape_emitter",
+    srcs = ["dynamic_shape_emitter.cc"],
+    hdrs = ["dynamic_shape_emitter.h"],
+    deps = [
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/codegen/emitters:kernel_arguments",
+        "//xla/codegen/emitters:type_util",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:buffer_assignment",
+        "//xla/service/gpu:launch_dimensions",
+        "//xla/service/llvm_ir:llvm_util",
+        "//xla/stream_executor:device_description",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:GPUDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:LLVMDialect",
+        "@llvm-project//mlir:SCFDialect",
+        "@llvm-project//mlir:TensorDialect",
+    ],
+)
+
+cc_library(
     name = "sort_emitter",
     srcs = ["sort_emitter.cc"],
     hdrs = ["sort_emitter.h"],

@@ -64,9 +64,6 @@ struct SortStageDescription {
   int64_t num_iterations_in_sort_dim = 0;
   // Launch dimensions chosen for this stage.
   gpu::LaunchDimensions launch_dimensions;
-  // True only on the first stage that touches an iota operand. Subsequent
-  // stages read the same operand from the output buffer it was written to.
-  bool emit_iota_operands = false;
   // Kernel arguments (slice + alignment) for this stage's buffers.
   emitters::KernelArguments kernel_args;
   // Globally unique MSL entry-function name.
@@ -78,10 +75,15 @@ struct SortStageDescription {
 // algorithm the LLVM GPU backend's `EmitBitonicSortLLVMIR` uses, but with
 // Metal-flavored device limits.
 //
+// `fusion`, when non-null, is the sort-fusion wrapping `sort` (its fused
+// expression root); the stages then bind the fusion's output buffers. Null
+// for a standalone sort.
+//
 // `entry_name_prefix` is the MSL function-name prefix to use for each stage's
 // emitted entry; the planner appends a stage suffix to make each name unique.
 absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
-    const HloSortInstruction* sort, const BufferAssignment& buffer_assignment,
+    const HloSortInstruction* sort, const HloFusionInstruction* fusion,
+    const BufferAssignment& buffer_assignment,
     const se::DeviceDescription& device,
     const emitters::KernelArguments::BufferAlignment& buffer_alignment,
     const std::string& entry_name_prefix);
@@ -104,6 +106,34 @@ bool ShrinkSortStageTile(SortStageDescription& desc,
 // fed through Metal's standard MSL lowering + translation pipeline.
 absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
     mlir::MLIRContext* context, const SortStageDescription& desc);
+
+// One iota-materialization kernel: sort-fusion bodies may feed the sort iota
+// operands (StableSortExpander tiebreakers and DynamicPadder's reshape sorts
+// do); the sort stages read every operand from its output buffer, so the
+// buffer is pre-filled with the iota values before stage 0. CUDA instead
+// inlines iota values into the first stage's loads — candidate optimization.
+struct IotaFillDescription {
+  const HloIotaInstruction* iota = nullptr;
+  emitters::KernelArguments kernel_args;  // single written output buffer
+  gpu::LaunchDimensions launch_dimensions;
+  // Globally unique MSL entry-function name.
+  std::string entry_name;
+};
+
+absl::StatusOr<IotaFillDescription> PlanIotaFill(
+    const HloIotaInstruction* iota, BufferAllocation::Slice out_slice,
+    const se::DeviceDescription& device,
+    const emitters::KernelArguments::BufferAlignment& buffer_alignment,
+    std::string entry_name);
+
+// Recomputes `desc.launch_dimensions` for a (possibly capped) device, for
+// PSO-retry like the fusion path.
+void RecomputeIotaFillLaunch(IotaFillDescription& desc,
+                             const se::DeviceDescription& device);
+
+// out[coords] = coords[iota_dimension] for every in-bounds thread.
+absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitIotaFillMLIR(
+    mlir::MLIRContext* context, const IotaFillDescription& desc);
 
 }  // namespace xla::metal
 
