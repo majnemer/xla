@@ -169,12 +169,6 @@ struct DeferredDynamicShapeKernel {
   xla::metal::MetalKernelThunk* thunk;  // owned by ThunkExecutor
 };
 
-// One sort iota-operand fill kernel queued for Phase-2 MLIR emission.
-struct DeferredIotaFill {
-  xla::metal::IotaFillDescription desc;
-  xla::metal::MetalKernelThunk* thunk;  // owned by ThunkExecutor
-};
-
 }  // namespace
 
 MetalCompiler::MetalCompiler()
@@ -331,7 +325,6 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
   std::vector<DeferredSortStage> deferred_sort_stages;
   std::vector<DeferredGraphFusion> deferred_graph_fusions;
   std::vector<DeferredDynamicShapeKernel> deferred_dynamic_shape_kernels;
-  std::vector<DeferredIotaFill> deferred_iota_fills;
   std::optional<BufferAllocation::Slice> rng_state_slice;
   // PSO compilation needs a live id<MTLDevice>; MetalCompiler rejects null
   // stream_exec at entry so the cast is safe here.
@@ -361,9 +354,11 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
     return local;
   };
   // Shared by standalone kSort and sort-fusions (fused root kSort with
-  // parameter/iota operands): copy/fill the output buffers, then plan the
-  // bitonic stages for Phase-2 emission. Iota operands inside a fusion have
-  // no buffer of their own; a fill kernel materializes them before stage 0.
+  // parameter/iota operands): copy operands into the in-place output buffers,
+  // then plan the bitonic stages for Phase-2 emission. Iota operands have no
+  // input buffer; the first stage computes them from the index and writes
+  // them out (EmitBitonicSortLLVMIR's emit_iota_operands), so they need no
+  // copy here.
   auto emit_sort = [&](gpu::ThunkSequence& thunks,
                        const HloSortInstruction* sort,
                        const HloFusionInstruction* fusion) -> absl::Status {
@@ -377,27 +372,12 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
         fusion != nullptr ? static_cast<const HloInstruction*>(fusion) : sort;
     for (int64_t i = 0; i < sort->operand_count(); ++i) {
       const HloInstruction* operand = sort->operand(i);
+      if (HloPredicateIsOp<HloOpcode::kIota>(operand)) continue;
       ShapeIndex shape_index =
           sort->operand_count() > 1 ? ShapeIndex({i}) : ShapeIndex({});
       TF_ASSIGN_OR_RETURN(
           BufferAllocation::Slice dst,
           buffer_assignment->GetUniqueSlice(slices_instr, shape_index));
-      if (fusion != nullptr && HloPredicateIsOp<HloOpcode::kIota>(operand)) {
-        std::string entry_name = msl_function_name_uniquer.GetUniqueName(
-            llvm_ir::SanitizeFunctionName(std::string(operand->name())));
-        TF_ASSIGN_OR_RETURN(
-            xla::metal::IotaFillDescription fill_desc,
-            xla::metal::PlanIotaFill(Cast<HloIotaInstruction>(operand), dst,
-                                     gpu_device_info,
-                                     gpu::GetDefaultBufferAlignment(),
-                                     std::move(entry_name)));
-        auto fill_thunk = std::make_unique<xla::metal::MetalKernelThunk>(
-            gpu::Thunk::ThunkInfo{}, fill_desc.kernel_args);
-        deferred_iota_fills.push_back(
-            DeferredIotaFill{std::move(fill_desc), fill_thunk.get()});
-        thunks.push_back(std::move(fill_thunk));
-        continue;
-      }
       const HloInstruction* src_instr = operand;
       if (fusion != nullptr) {
         TF_RET_CHECK(operand->opcode() == HloOpcode::kParameter)
@@ -1189,47 +1169,6 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
     BuildResult build_result = *std::move(dynamic_shape_results[i]);
     deferred_dynamic_shape_kernels[i].thunk->SetArtifact(
         std::move(build_result.artifact));
-    if (!msl_blob.empty()) msl_blob.append("\n");
-    msl_blob.append(build_result.msl);
-  }
-
-  auto build_iota_fill_artifact =
-      [&](xla::metal::IotaFillDescription desc) -> absl::StatusOr<BuildResult> {
-    return build_hand_kernel_artifact(
-        desc.entry_name, "mlir-iota-fill", desc.kernel_args,
-        desc.launch_dimensions,
-        [&](mlir::MLIRContext* context) {
-          return xla::metal::EmitIotaFillMLIR(context, desc);
-        },
-        [&](const se::DeviceDescription& dev) {
-          xla::metal::RecomputeIotaFillLaunch(desc, dev);
-        });
-  };
-
-  std::vector<absl::StatusOr<BuildResult>> iota_fill_results(
-      deferred_iota_fills.size());
-  if (thread_pool && !deferred_iota_fills.empty()) {
-    absl::BlockingCounter counter(deferred_iota_fills.size());
-    for (size_t i = 0; i < deferred_iota_fills.size(); ++i) {
-      thread_pool.get_mutable()->Schedule([&, i] {
-        iota_fill_results[i] =
-            build_iota_fill_artifact(std::move(deferred_iota_fills[i].desc));
-        counter.DecrementCount();
-      });
-    }
-    counter.Wait();
-  } else {
-    for (size_t i = 0; i < deferred_iota_fills.size(); ++i) {
-      iota_fill_results[i] =
-          build_iota_fill_artifact(std::move(deferred_iota_fills[i].desc));
-    }
-  }
-  for (size_t i = 0; i < deferred_iota_fills.size(); ++i) {
-    TF_RETURN_IF_ERROR(iota_fill_results[i].status());
-  }
-  for (size_t i = 0; i < deferred_iota_fills.size(); ++i) {
-    BuildResult build_result = *std::move(iota_fill_results[i]);
-    deferred_iota_fills[i].thunk->SetArtifact(std::move(build_result.artifact));
     if (!msl_blob.empty()) msl_blob.append("\n");
     msl_blob.append(build_result.msl);
   }
