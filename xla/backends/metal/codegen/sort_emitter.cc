@@ -27,6 +27,7 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/raw_ostream.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -87,15 +88,22 @@ uint64_t Pow2Floor(uint64_t value) {
 
 namespace {
 
+Shape ComputeStandardIterationShape(const Shape& keys_shape,
+                                    int64_t dimension_to_sort,
+                                    int64_t num_iterations_in_sort_dim) {
+  Shape shape = keys_shape;
+  shape.set_dimensions(dimension_to_sort,
+                       CeilOfRatio<int64_t>(num_iterations_in_sort_dim,
+                                            kBitonicSortUnrollFactor));
+  return shape;
+}
+
 gpu::LaunchDimensions ComputeStandardLaunchDimensions(
     const Shape& keys_shape, int64_t dimension_to_sort,
     int64_t standard_num_iterations_in_sort_dim,
     const se::DeviceDescription& device) {
-  Shape standard_iteration_shape = keys_shape;
-  standard_iteration_shape.set_dimensions(
-      dimension_to_sort,
-      CeilOfRatio<int64_t>(standard_num_iterations_in_sort_dim,
-                           kBitonicSortUnrollFactor));
+  Shape standard_iteration_shape = ComputeStandardIterationShape(
+      keys_shape, dimension_to_sort, standard_num_iterations_in_sort_dim);
   return gpu::CalculateLaunchDimensions(standard_iteration_shape, device);
 }
 
@@ -114,8 +122,7 @@ gpu::LaunchDimensions ComputeTiledLaunchDimensions(
   Shape iteration_shape = keys_shape;
   iteration_shape.set_dimensions(dimension_to_sort, num_tiles);
   uint64_t num_blocks = ShapeUtil::ElementsIn(iteration_shape);
-  uint64_t threads_per_block =
-      std::max<uint64_t>(1, tile_size / unroll_factor);
+  uint64_t threads_per_block = std::max<uint64_t>(1, tile_size / unroll_factor);
   *num_tiles_in_sort_dim_out = num_tiles;
   return gpu::LaunchDimensions(num_blocks, threads_per_block);
 }
@@ -154,9 +161,8 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
     total_element_size += ShapeUtil::ByteSizeOfPrimitiveType(
         sort->operand(i)->shape().element_type());
   }
-  const uint64_t max_tile_in_shmem =
-      device.shared_memory_per_block() /
-      std::max<uint64_t>(total_element_size, 1);
+  const uint64_t max_tile_in_shmem = device.shared_memory_per_block() /
+                                     std::max<uint64_t>(total_element_size, 1);
   const uint64_t max_threads_per_block = device.threads_per_block_limit();
 
   // Tile size: power-of-two upper-bounded by
@@ -164,17 +170,16 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
   // 2^num_stages. The unroll factor reflects elements per thread for the
   // tiled body's load/store (so tile_size = kBitonicTileUnroll *
   // threads_per_block).
-  uint64_t tile_size = std::min(
-      {max_threads_per_block * kBitonicTileUnroll, max_tile_in_shmem,
-       uint64_t{1} << num_stages});
+  uint64_t tile_size = std::min({max_threads_per_block * kBitonicTileUnroll,
+                                 max_tile_in_shmem, uint64_t{1} << num_stages});
   tile_size = Pow2Floor(std::max<uint64_t>(tile_size, kBitonicTileUnroll));
 
   // Standard (non-tiled) launch covers ceil(2^(num_stages-1)/unroll) element
   // pairs per thread along the sort dimension; one element pair compared per
   // iteration. Tiled launch processes one tile_size-wide tile per block, so
   // threads_per_block = tile_size / 2.
-  const uint64_t standard_num_iterations_in_sort_dim =
-      uint64_t{1} << (num_stages - 1);
+  const uint64_t standard_num_iterations_in_sort_dim = uint64_t{1}
+                                                       << (num_stages - 1);
   gpu::LaunchDimensions standard_launch = ComputeStandardLaunchDimensions(
       keys_shape, dimension_to_sort, standard_num_iterations_in_sort_dim,
       device);
@@ -190,10 +195,9 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
   // limit for wide many-input sorts.
   const HloInstruction* slices_instr =
       fusion != nullptr ? static_cast<const HloInstruction*>(fusion) : sort;
-  TF_ASSIGN_OR_RETURN(
-      emitters::KernelArguments full_kernel_args,
-      emitters::KernelArguments::Create(buffer_assignment, buffer_alignment,
-                                        slices_instr));
+  TF_ASSIGN_OR_RETURN(emitters::KernelArguments full_kernel_args,
+                      emitters::KernelArguments::Create(
+                          buffer_assignment, buffer_alignment, slices_instr));
   TF_RET_CHECK(full_kernel_args.args().size() ==
                slices_instr->operand_count() + sort->operand_count());
   std::vector<emitters::KernelArgument> output_args(
@@ -233,9 +237,9 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
   };
   for (int64_t stage_idx = 0; stage_idx < num_stages; ++stage_idx) {
     for (int64_t mask = stage_idx; mask >= 0; --mask) {
-      int64_t xor_mask =
-          (mask == stage_idx) ? ((int64_t{1} << (stage_idx + 1)) - 1)
-                              : (int64_t{1} << mask);
+      int64_t xor_mask = (mask == stage_idx)
+                             ? ((int64_t{1} << (stage_idx + 1)) - 1)
+                             : (int64_t{1} << mask);
       if (static_cast<uint64_t>(xor_mask) < tile_size) {
         pending.push_back(xor_mask);
       } else {
@@ -333,32 +337,32 @@ mlir::Value DeriveCurrentTileIndex(mlir::ImplicitLocOpBuilder& b,
   return ma::AddIOp::create(b, first_in_block, idx_in_blk);
 }
 
-// -1 if sort operand `i` is not a kIota; otherwise its iota_dimension. The
-// first stage materializes iota operands from the index rather than loading
-// them (they have no input buffer of their own).
-int64_t SortIotaDim(const HloSortInstruction* sort, int64_t i) {
-  const HloInstruction* operand = sort->operand(i);
-  if (!HloPredicateIsOp<HloOpcode::kIota>(operand)) {
-    return -1;
-  }
-  return Cast<HloIotaInstruction>(operand)->iota_dimension();
-}
-
 // The iota value at `coord` (the index along the iota dimension), cast to the
 // operand's element type.
 absl::StatusOr<mlir::Value> EmitSortIotaValue(mlir::ImplicitLocOpBuilder& b,
                                               mlir::Value coord,
                                               mlir::Type elem_type) {
   namespace ma = mlir::arith;
-  if (mlir::isa<mlir::IntegerType>(elem_type)) {
+  if ((elem_type.isUnsignedInteger() || elem_type.isSignlessInteger(1)) &&
+      ma::IndexCastUIOp::areCastCompatible(coord.getType(), elem_type)) {
+    return ma::IndexCastUIOp::create(b, elem_type, coord).getResult();
+  }
+  if (mlir::isa<mlir::IntegerType>(elem_type) &&
+      ma::IndexCastOp::areCastCompatible(coord.getType(), elem_type)) {
     return ma::IndexCastOp::create(b, elem_type, coord).getResult();
   }
-  if (mlir::isa<mlir::FloatType>(elem_type)) {
-    mlir::Value as_int = ma::IndexCastOp::create(b, b.getI64Type(), coord);
-    return ma::SIToFPOp::create(b, elem_type, as_int).getResult();
+  mlir::Value as_int = ma::IndexCastUIOp::create(b, b.getI64Type(), coord);
+  if (mlir::isa<mlir::FloatType>(elem_type) &&
+      ma::UIToFPOp::areCastCompatible(as_int.getType(), elem_type)) {
+    return ma::UIToFPOp::create(b, elem_type, as_int).getResult();
   }
+  std::string elem_type_string;
+  llvm::raw_string_ostream elem_type_string_stream(elem_type_string);
+  elem_type.print(elem_type_string_stream);
+  elem_type_string_stream.flush();
   return absl::UnimplementedError(
-      "Sort iota operand: unsupported element type for inline iota.");
+      absl::StrCat("Sort iota operand: unsupported element type '",
+                   elem_type_string, "' for inline iota."));
 }
 
 absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
@@ -375,16 +379,6 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
   const int64_t operand_count = desc.sort->operand_count();
   TF_RET_CHECK(!desc.xor_masks.empty())
       << "tiled stage requires at least one xor_mask";
-
-  // On the first stage, iota operands are computed from the index at load
-  // time instead of read; the unconditional tile writeback then materializes
-  // them into the output buffer for later stages.
-  llvm::SmallVector<int64_t, 4> iota_dims(operand_count, -1);
-  if (desc.emit_iota_operands) {
-    for (int64_t i = 0; i < operand_count; ++i) {
-      iota_dims[i] = SortIotaDim(desc.sort, i);
-    }
-  }
 
   mlir::Block* entry_block = entry_func.addEntryBlock();
   b.setInsertionPointToStart(entry_block);
@@ -407,6 +401,8 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
     tile_types.push_back(tile_ty);
   }
 
+  TF_RET_CHECK(desc.launch_dimensions.block_counts().y == 1);
+  TF_RET_CHECK(desc.launch_dimensions.block_counts().z == 1);
   mlir::Value tid = mlir::gpu::ThreadIdOp::create(b, mlir::gpu::Dimension::x);
   mlir::Value bid = mlir::gpu::BlockIdOp::create(b, mlir::gpu::Dimension::x);
 
@@ -466,10 +462,14 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
       llvm::SmallVector<mlir::Value, 1> tile_pos{tile_off};
       for (int64_t i = 0; i < operand_count; ++i) {
         mlir::Value v;
-        if (iota_dims[i] >= 0) {
+        // On the first stage, iota operands are computed from the index at load
+        // time instead of read; the unconditional tile writeback then
+        // materializes them into the output buffer for later stages.
+        if (auto* iota = DynCast<HloIotaInstruction>(desc.sort->operand(i))) {
+          const int64_t iota_dim = iota->iota_dimension();
           TF_ASSIGN_OR_RETURN(
               v, EmitSortIotaValue(
-                     b, global_idx[iota_dims[i]],
+                     b, global_idx[iota_dim],
                      mlir::cast<mlir::RankedTensorType>(tile_types[i])
                          .getElementType()));
         } else {
@@ -498,8 +498,7 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
       llvm::SmallVector<mlir::Value, 4> new_entries;
       llvm::SmallVector<mlir::Value, 1> tile_pos{tile_off};
       for (int64_t i = 0; i < operand_count; ++i) {
-        mlir::Value v =
-            mlir::tensor::ExtractOp::create(b, tiles[i], tile_pos);
+        mlir::Value v = mlir::tensor::ExtractOp::create(b, tiles[i], tile_pos);
         new_entries.push_back(
             mlir::tensor::InsertOp::create(b, v, entry_tensors[i], global_idx));
       }
@@ -510,8 +509,7 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
       b.setInsertionPointToStart(if_op.elseBlock());
       mlir::scf::YieldOp::create(b, entry_tensors);
     }
-    entry_tensors.assign(if_op.getResults().begin(),
-                         if_op.getResults().end());
+    entry_tensors.assign(if_op.getResults().begin(), if_op.getResults().end());
   };
 
   // Load: each thread copies its `unroll` adjacent elements from global
@@ -562,12 +560,13 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
     for (int64_t pair_i = 0; pair_i < pairs_per_thread; ++pair_i) {
       mlir::Value pair_idx;
       if (aligned_to_banks) {
-        pair_idx = ma::AddIOp::create(
-            b, epi_base, const_idx(pair_i * gpu::kNumShmemBanks));
+        pair_idx = ma::AddIOp::create(b, epi_base,
+                                      const_idx(pair_i * gpu::kNumShmemBanks));
       } else {
         pair_idx = ma::AddIOp::create(b, epi_base, const_idx(pair_i));
       }
-      mlir::Value tile_current = DeriveCurrentTileIndex(b, pair_idx, block_size);
+      mlir::Value tile_current =
+          DeriveCurrentTileIndex(b, pair_idx, block_size);
       mlir::Value tile_compare =
           ma::XOrIOp::create(b, tile_current, const_idx(xor_mask));
       mlir::Value global_current =
@@ -672,11 +671,10 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
   for (const auto& arg : args) {
     param_types.push_back(emitters::TensorShapeToMlirType(arg.shape(), b));
     llvm::SmallVector<mlir::NamedAttribute> attrs;
-    attrs.push_back(b.getNamedAttr(kXlaSliceIndexAttr,
-                                   b.getIndexAttr(arg.slice_index())));
     attrs.push_back(
-        b.getNamedAttr(mlir::LLVM::LLVMDialect::getAlignAttrName(),
-                       b.getIndexAttr(arg.alignment())));
+        b.getNamedAttr(kXlaSliceIndexAttr, b.getIndexAttr(arg.slice_index())));
+    attrs.push_back(b.getNamedAttr(mlir::LLVM::LLVMDialect::getAlignAttrName(),
+                                   b.getIndexAttr(arg.alignment())));
     attrs.push_back(
         b.getNamedAttr(mlir::LLVM::LLVMDialect::getDereferenceableAttrName(),
                        b.getIndexAttr(arg.slice().size())));
@@ -761,12 +759,14 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
   // linear = bid.x * threads_per_block + tid.x. We use only the x dim;
   // PlanBitonicSort issues a 1D launch by feeding a CeilOfRatio-shaped
   // standard iteration shape into CalculateLaunchDimensions.
+  TF_RET_CHECK(desc.launch_dimensions.block_counts().y == 1);
+  TF_RET_CHECK(desc.launch_dimensions.block_counts().z == 1);
   mlir::Value tid = mlir::gpu::ThreadIdOp::create(b, mlir::gpu::Dimension::x);
   mlir::Value bid = mlir::gpu::BlockIdOp::create(b, mlir::gpu::Dimension::x);
   mlir::Value linear = ma::AddIOp::create(
-      b, ma::MulIOp::create(b, bid,
-                            const_idx(desc.launch_dimensions
-                                          .num_threads_per_block())),
+      b,
+      ma::MulIOp::create(
+          b, bid, const_idx(desc.launch_dimensions.num_threads_per_block())),
       tid);
 
   // Decompose linear into iteration_shape (= keys_shape with sort_dim
@@ -776,8 +776,8 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
   llvm::SmallVector<mlir::Value, 4> indices(rank);
   mlir::Value remaining = linear;
   for (int64_t d : keys_shape.layout().minor_to_major()) {
-    int64_t size = (d == sort_dim) ? iteration_shape_sort_dim
-                                    : keys_shape.dimensions(d);
+    int64_t size =
+        (d == sort_dim) ? iteration_shape_sort_dim : keys_shape.dimensions(d);
     mlir::Value size_c = const_idx(size);
     indices[d] = ma::RemUIOp::create(b, remaining, size_c);
     remaining = ma::DivUIOp::create(b, remaining, size_c);
@@ -808,22 +808,30 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
     current = ma::SelectOp::create(b, is_left, iter_sort_idx, sentinel);
   }
 
-  // compare = current XOR xor_mask. Bounds check both indices against the
-  // *actual* sort dimension length (not iteration_bound) to skip phantom
-  // pairs that the bitonic algorithm would otherwise touch on the next-
-  // power-of-two padding.
-  mlir::Value compare =
-      ma::XOrIOp::create(b, current, const_idx(xor_mask));
+  // The standard launch rounds up to whole threadgroups, and the index
+  // delinearization wraps modulo total_iterations, so without this guard the
+  // slack threads would alias - and race on - real element pairs.
+  const int64_t total_iterations =
+      ShapeUtil::ElementsIn(ComputeStandardIterationShape(
+          keys_shape, sort_dim, iteration_shape_sort_dim));
+  mlir::Value within_grid = ma::CmpIOp::create(
+      b, ma::CmpIPredicate::ult, linear, const_idx(total_iterations));
+
+  // `compare` is the element's bitonic partner (current ^ xor_mask). Bound both
+  // by the actual sort-dim length, not the power-of-two iteration space, to drop
+  // the phantom pairs the schedule would otherwise touch in the padding.
+  mlir::Value compare = ma::XOrIOp::create(b, current, const_idx(xor_mask));
   mlir::Value bound = const_idx(dim_to_sort_bound);
   mlir::Value in_bounds = ma::AndIOp::create(
-      b,
-      ma::CmpIOp::create(b, ma::CmpIPredicate::ult, current, bound),
-      ma::CmpIOp::create(b, ma::CmpIPredicate::ult, compare, bound));
+      b, within_grid,
+      ma::AndIOp::create(
+          b, ma::CmpIOp::create(b, ma::CmpIPredicate::ult, current, bound),
+          ma::CmpIOp::create(b, ma::CmpIPredicate::ult, compare, bound)));
 
   llvm::SmallVector<mlir::Value, 4> current_indices(indices.begin(),
-                                                     indices.end());
+                                                    indices.end());
   llvm::SmallVector<mlir::Value, 4> compare_indices(indices.begin(),
-                                                     indices.end());
+                                                    indices.end());
   current_indices[sort_dim] = current;
   compare_indices[sort_dim] = compare;
 
