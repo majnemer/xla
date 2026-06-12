@@ -173,7 +173,11 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
   // threads_per_block).
   uint64_t tile_size = std::min({max_threads_per_block * kBitonicTileUnroll,
                                  max_tile_in_shmem, uint64_t{1} << num_stages});
-  tile_size = Pow2Floor(std::max<uint64_t>(tile_size, kBitonicTileUnroll));
+  // No lower floor, matching the CUDA emitter: a tile below kBitonicTileUnroll
+  // only arises for tiny sorts (2^num_stages < kBitonicTileUnroll), whose lone
+  // mask is emitted as a non-tiled stage anyway (flush_pending), so the tiled
+  // body never sees a sub-unroll tile.
+  tile_size = Pow2Floor(tile_size);
 
   // Standard (non-tiled) launch covers ceil(2^(num_stages-1)/unroll) element
   // pairs per thread along the sort dimension; one element pair compared per
@@ -185,9 +189,17 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
       keys_shape, dimension_to_sort, standard_num_iterations_in_sort_dim,
       kBitonicSortUnrollFactor, device);
   int64_t tiled_num_tiles_in_sort_dim = 0;
-  gpu::LaunchDimensions tiled_launch = ComputeTiledLaunchDimensions(
-      keys_shape, dimension_to_sort, dimension_to_sort_bound, tile_size,
-      kBitonicTileUnroll, &tiled_num_tiles_in_sort_dim);
+  // A tiled stage only forms from a >1 mask bundle, which needs
+  // tile_size >= kBitonicTileUnroll (two sub-tile masks bundling back to back).
+  // Below that every stage is non-tiled, so skip the tiled launch: computing it
+  // would feed a sub-unroll tile_size to ComputeTiledLaunchDimensions and trip
+  // its tile_size % unroll DCHECK.
+  gpu::LaunchDimensions tiled_launch;
+  if (tile_size >= kBitonicTileUnroll) {
+    tiled_launch = ComputeTiledLaunchDimensions(
+        keys_shape, dimension_to_sort, dimension_to_sort_bound, tile_size,
+        kBitonicTileUnroll, &tiled_num_tiles_in_sort_dim);
+  }
 
   // Sort runs in place on the output buffers; the input buffers alias the
   // outputs after the copies/fills emitted earlier, so the kernel only takes
@@ -234,7 +246,14 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
   std::vector<int64_t> pending;
   auto flush_pending = [&]() {
     if (pending.empty()) return;
-    emit_stage(std::move(pending), /*tiled=*/true);
+    // A lone bundled mask has nothing to amortise a tile load/store across, so
+    // emit it as a non-tiled global-memory stage (matching CUDA's
+    // xor_masks.size() > 1 dispatch). A >1 bundle only forms once tile_size is
+    // large enough to hold two sub-tile masks back to back, i.e.
+    // tile_size >= kBitonicTileUnroll, so tiled stages never get a sub-unroll
+    // tile even with the floor removed.
+    const bool tiled = pending.size() > 1;
+    emit_stage(std::move(pending), tiled);
     pending.clear();
   };
   for (int64_t stage_idx = 0; stage_idx < num_stages; ++stage_idx) {
@@ -516,8 +535,9 @@ absl::Status EmitTiledBitonicSortBody(mlir::ImplicitLocOpBuilder& b,
         mlir::Value v;
         // On the first stage, iota operands are computed from the index at load
         // time instead of read; the unconditional tile writeback then
-        // materializes them into the output buffer for later stages.
-        if (auto* iota = DynCast<HloIotaInstruction>(desc.sort->operand(i))) {
+        // materializes them into the output buffer.
+        if (auto* iota = DynCast<HloIotaInstruction>(desc.sort->operand(i));
+            iota != nullptr && desc.emit_iota_operands) {
           const int64_t iota_dim = iota->iota_dimension();
           TF_ASSIGN_OR_RETURN(
               v, EmitSortIotaValue(
@@ -770,13 +790,6 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
     return module;
   }
 
-  // Iota materialization only ever runs on the first stage, which is always
-  // tiled (the smallest xor_mask is below tile_size). A non-tiled stage
-  // carrying iota operands would leave them unmaterialized — assert it cannot
-  // happen rather than emit a path that silently produces garbage.
-  TF_RET_CHECK(!desc.emit_iota_operands)
-      << "non-tiled first stage cannot materialize iota operands";
-
   const Shape& keys_shape = desc.sort->operand(0)->shape();
   const int64_t sort_dim = desc.sort->sort_dimension();
   const int64_t dim_to_sort_bound = keys_shape.dimensions(sort_dim);
@@ -793,7 +806,10 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
   }
   if (block_size >= dim_to_sort_bound) {
     // No adjacent block to compare with; emit a no-op kernel body so the
-    // PSO is still installed for thunk dispatch.
+    // PSO is still installed for thunk dispatch. The iota-materialising stage
+    // is always the smallest mask (block_size 1 < bound), so it never lands
+    // here — a no-op body would otherwise leave iota operands unfilled.
+    TF_RET_CHECK(!desc.emit_iota_operands);
     mlir::Block* entry_block = entry_func.addEntryBlock();
     b.setInsertionPointToStart(entry_block);
     llvm::SmallVector<mlir::Value> returns(entry_block->getArguments());
@@ -864,6 +880,12 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
   llvm::SmallVector<mlir::Value, 4> compare_indices(indices.begin(),
                                                     indices.end());
 
+  // On the iota-materialising stage, iota operands have no input buffer; derive
+  // their value from the coordinate on read, and force_write (below) persists
+  // it to the buffer even when no swap happens. Mirrors the tiled body and the
+  // CUDA single-mask path (element_address + force_write).
+  const bool force_write = desc.emit_iota_operands;
+
   for (int64_t u = 0; u < unroll; ++u) {
     mlir::Value pair_idx = ma::AddIOp::create(b, base_pair, const_idx(u));
     mlir::Value current = DeriveCurrentIndex(b, pair_idx, block_size,
@@ -895,11 +917,26 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
       compare_vals.reserve(operand_count);
       current_vals.reserve(operand_count);
       for (int64_t i = 0; i < operand_count; ++i) {
-        mlir::Value tensor = tensors[i];
-        mlir::Value v_compare =
-            mlir::tensor::ExtractOp::create(b, tensor, compare_indices);
-        mlir::Value v_current =
-            mlir::tensor::ExtractOp::create(b, tensor, current_indices);
+        mlir::Value v_compare;
+        mlir::Value v_current;
+        if (auto* iota = DynCast<HloIotaInstruction>(desc.sort->operand(i));
+            iota != nullptr && force_write) {
+          const int64_t iota_dim = iota->iota_dimension();
+          // Iota operand: no input buffer on the first stage. Compute its value
+          // from the position along the iota dimension instead of reading.
+          mlir::Type elem =
+              mlir::cast<mlir::RankedTensorType>(tensors[i].getType())
+                  .getElementType();
+          TF_ASSIGN_OR_RETURN(
+              v_compare, EmitSortIotaValue(b, compare_indices[iota_dim], elem));
+          TF_ASSIGN_OR_RETURN(
+              v_current, EmitSortIotaValue(b, current_indices[iota_dim], elem));
+        } else {
+          v_compare =
+              mlir::tensor::ExtractOp::create(b, tensors[i], compare_indices);
+          v_current =
+              mlir::tensor::ExtractOp::create(b, tensors[i], current_indices);
+        }
         compare_vals.push_back(v_compare);
         current_vals.push_back(v_current);
         compare_args.push_back(v_compare);
@@ -936,7 +973,23 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitSortStageModule(
       {
         mlir::OpBuilder::InsertionGuard sg(b);
         b.setInsertionPointToStart(swap_if.elseBlock());
-        mlir::scf::YieldOp::create(b, tensors);
+        if (force_write) {
+          // Persist the read/computed values even without a swap, so a
+          // freshly-computed iota lands in the buffer. A no-op for non-iota
+          // operands — it writes back exactly what was just read.
+          llvm::SmallVector<mlir::Value, 4> kept;
+          kept.reserve(operand_count);
+          for (int64_t i = 0; i < operand_count; ++i) {
+            mlir::Value tensor = mlir::tensor::InsertOp::create(
+                b, current_vals[i], tensors[i], current_indices);
+            tensor = mlir::tensor::InsertOp::create(b, compare_vals[i], tensor,
+                                                    compare_indices);
+            kept.push_back(tensor);
+          }
+          mlir::scf::YieldOp::create(b, kept);
+        } else {
+          mlir::scf::YieldOp::create(b, tensors);
+        }
       }
       mlir::scf::YieldOp::create(b, swap_if.getResults());
     }
