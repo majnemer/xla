@@ -748,6 +748,7 @@ xla_test(
         "//xla:types",
         "//xla:xla_data_proto_cc",
         "//xla/backends/gpu/transforms:sort_rewriter",
+        "//xla/ffi:ffi_registry",
         "//xla/hlo/ir:hlo",
         "//xla/tests:hlo_pjrt_interpreter_reference_mixin",
         "//xla/tests:hlo_pjrt_test_base",

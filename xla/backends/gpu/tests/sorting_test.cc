@@ -29,6 +29,7 @@ limitations under the License.
 #include "Eigen/Core"
 #include "xla/backends/gpu/transforms/sort_rewriter.h"
 #include "xla/error_spec.h"
+#include "xla/ffi/ffi_registry.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
@@ -49,11 +50,21 @@ namespace xla {
 namespace gpu {
 namespace {
 
+// CUB sort custom calls execute through FFI handlers that are only linked in
+// on some platforms (CUDA, ROCm). Skip tests that depend on them elsewhere.
+bool CubSortIsRegistered(absl::string_view custom_call_target) {
+  return ffi::FindHandler(custom_call_target, "gpu").ok();
+}
+
 class TypeSupportTest
     : public HloPjRtInterpreterReferenceMixin<HloPjRtTestBase>,
       public ::testing::WithParamInterface<PrimitiveType> {};
 
 TEST_P(TypeSupportTest, SortSupportsType) {
+  if (!CubSortIsRegistered("xla.gpu.ext.cub_sort_keys")) {
+    GTEST_SKIP() << "xla.gpu.ext.cub_sort_keys is not registered for this "
+                    "platform";
+  }
   constexpr char kHloTemplate[] = R"(
 compare {
 p.0.lhs = $0[] parameter(0)
@@ -290,6 +301,10 @@ class CubSortKeysTest : public HloPjRtTestBase,
                             std::tuple<std::shared_ptr<Literal>, bool>> {};
 
 TEST_P(CubSortKeysTest, SortKeys) {
+  if (!CubSortIsRegistered("xla.gpu.ext.cub_sort_keys")) {
+    GTEST_SKIP() << "xla.gpu.ext.cub_sort_keys is not registered for this "
+                    "platform";
+  }
   constexpr char kHloTemplate[] = R"(
 HloModule TestModule
 
@@ -329,6 +344,10 @@ class CubSortPairsTest
           std::tuple<std::shared_ptr<Literal>, PrimitiveType, bool>> {};
 
 TEST_P(CubSortPairsTest, SortPairs) {
+  if (!CubSortIsRegistered("xla.gpu.ext.cub_sort_pairs")) {
+    GTEST_SKIP() << "xla.gpu.ext.cub_sort_pairs is not registered for this "
+                    "platform";
+  }
   constexpr char kHloTemplate[] = R"(
 HloModule TestModule
 
