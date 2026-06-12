@@ -137,11 +137,11 @@ MaybeOwningThreadPool CreateMaybeOwningThreadPool(
 
 // Captured by the serial HLO walk; processed in parallel after.
 struct DeferredFusion {
-  std::string fusion_name;                  // for diagnostics
+  std::string fusion_name;                   // for diagnostics
   const HloFusionInstruction* fusion_instr;  // not owned
-  std::string entry_name;                   // globally unique
+  std::string entry_name;                    // globally unique
   emitters::KernelArguments kernel_args;
-  xla::metal::MetalKernelThunk* thunk;      // owned by ThunkExecutor
+  xla::metal::MetalKernelThunk* thunk;  // owned by ThunkExecutor
 };
 
 // One bitonic-sort stage queued for Phase-2 MLIR emission. Mirrors
@@ -213,8 +213,10 @@ class MetalFloatSupport : public FloatSupport {
 // constants.
 absl::Span<const FloatSupport* const> MetalFloatSupports() {
   static const auto* supports = new std::vector<const FloatSupport*>{
-      new MetalFloatSupport(BF16),          new MetalFloatSupport(F8E5M2, F16),
-      new MetalFloatSupport(F8E4M3, F16),   new MetalFloatSupport(F8E3M4, F16),
+      new MetalFloatSupport(BF16),
+      new MetalFloatSupport(F8E5M2, F16),
+      new MetalFloatSupport(F8E4M3, F16),
+      new MetalFloatSupport(F8E3M4, F16),
       new MetalFloatSupport(F8E4M3FN, F16),
       new MetalFloatSupport(F8E4M3FNUZ, F16),
       new MetalFloatSupport(F8E5M2FNUZ, F16),
@@ -228,7 +230,8 @@ absl::Span<const FloatSupport* const> MetalFloatSupports() {
 }  // namespace
 
 void MetalCompiler::AddGraphCompilerFusionPasses(
-    HloPassPipeline& pipeline, const se::DeviceDescription& /*device_description*/,
+    HloPassPipeline& pipeline,
+    const se::DeviceDescription& /*device_description*/,
     se::StreamExecutor* stream_exec) {
   MetalGraphCapabilities caps;
   if (stream_exec != nullptr) {
@@ -245,9 +248,10 @@ void MetalCompiler::AddGraphCompilerFusionPasses(
   }
 }
 
-void MetalCompiler::AddGemmRewriteCustomCallPasses(
-    HloPassPipeline&, const DebugOptions&, se::GpuComputeCapability,
-    const se::SemanticVersion&) {
+void MetalCompiler::AddGemmRewriteCustomCallPasses(HloPassPipeline&,
+                                                   const DebugOptions&,
+                                                   se::GpuComputeCapability,
+                                                   const se::SemanticVersion&) {
   // Metal has no gpublas custom-call implementation. Keep dots in HLO so they
   // can be wrapped into MLIR elemental fusions instead.
 }
@@ -399,10 +403,9 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
         llvm_ir::SanitizeFunctionName(std::string(sort->name())));
     TF_ASSIGN_OR_RETURN(
         std::vector<xla::metal::SortStageDescription> stages,
-        xla::metal::PlanBitonicSort(sort, fusion, *buffer_assignment,
-                                    gpu_device_info,
-                                    gpu::GetDefaultBufferAlignment(),
-                                    entry_name_prefix));
+        xla::metal::PlanBitonicSort(
+            sort, fusion, *buffer_assignment, gpu_device_info,
+            gpu::GetDefaultBufferAlignment(), entry_name_prefix));
     for (auto& stage : stages) {
       auto stage_thunk = std::make_unique<xla::metal::MetalKernelThunk>(
           gpu::Thunk::ThunkInfo{}, stage.kernel_args);
@@ -469,8 +472,7 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
         // into matmul+select. Real ADJOINT reaches the thunk and is folded
         // into TRANSPOSE there (A^H == A^T for real A).
         const auto* trsm = Cast<HloTriangularSolveInstruction>(instr);
-        const TriangularSolveOptions& opts =
-            trsm->triangular_solve_options();
+        const TriangularSolveOptions& opts = trsm->triangular_solve_options();
         const HloInstruction* a = trsm->operand(0);
         const HloInstruction* b = trsm->operand(1);
         const Shape& a_shape = a->shape();
@@ -603,8 +605,8 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
               extra_allocations.emplace_back(state_idx, kStateBytes,
                                              /*color=*/0);
           state_alloc.set_constant(true);
-          rng_state_slice = BufferAllocation::Slice(&state_alloc, /*offset=*/0,
-                                                    kStateBytes);
+          rng_state_slice =
+              BufferAllocation::Slice(&state_alloc, /*offset=*/0, kStateBytes);
 
           std::array<uint64_t, 2> initial_state = {0x7012395ULL, 0};
           std::vector<uint8_t> content(sizeof(initial_state));
@@ -612,8 +614,7 @@ MetalCompiler::CompileToBackendResult(std::unique_ptr<HloModule> hlo_module,
 
           gpu::GpuExecutable::ConstantInfo info;
           info.symbol_name = llvm_ir::SanitizeFunctionName(absl::StrCat(
-              hlo_module->name(), "_", hlo_module->unique_id(),
-              "_rng_state"));
+              hlo_module->name(), "_", hlo_module->unique_id(), "_rng_state"));
           info.content = gpu::DenseDataIntermediate::Own(std::move(content));
           info.allocation_index = state_idx;
           constants.push_back(std::move(info));
@@ -643,11 +644,10 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
         if (!msl_blob.empty()) msl_blob.append("\n");
         msl_blob.append(rng_msl);
 
-        TF_ASSIGN_OR_RETURN(
-            stream_executor::metal::CompiledPipeline compiled,
-            stream_executor::metal::CompileAndProbe(
-                metal_device, rng_msl, entry_name,
-                /*descriptor_thread_hint=*/1));
+        TF_ASSIGN_OR_RETURN(stream_executor::metal::CompiledPipeline compiled,
+                            stream_executor::metal::CompileAndProbe(
+                                metal_device, rng_msl, entry_name,
+                                /*descriptor_thread_hint=*/1));
 
         const Shape kStateShape = ShapeUtil::MakeShape(U64, {2});
         std::vector<emitters::KernelArgument> kernel_arg_vec;
@@ -720,9 +720,9 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
           auto graph_thunk = std::make_unique<xla::metal::MetalGraphThunk>(
               gpu::Thunk::ThunkInfo{}, std::move(graph_feeds),
               ShapedSlice{result_slice, instr->shape()});
-          deferred_graph_fusions.push_back(DeferredGraphFusion{
-              std::string(fusion_instr->name()), fusion_instr,
-              graph_thunk.get()});
+          deferred_graph_fusions.push_back(
+              DeferredGraphFusion{std::string(fusion_instr->name()),
+                                  fusion_instr, graph_thunk.get()});
           thunks.push_back(std::move(graph_thunk));
           break;
         }
@@ -761,9 +761,8 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
       }
 
       case HloOpcode::kWhile: {
-        TF_ASSIGN_OR_RETURN(
-            gpu::ThunkSequence cond_thunks,
-            emit_computation(instr->while_condition()));
+        TF_ASSIGN_OR_RETURN(gpu::ThunkSequence cond_thunks,
+                            emit_computation(instr->while_condition()));
         TF_ASSIGN_OR_RETURN(gpu::ThunkSequence body_thunks,
                             emit_computation(instr->while_body()));
         TF_ASSIGN_OR_RETURN(
@@ -786,13 +785,12 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
         std::vector<gpu::ThunkSequence> branch_thunks;
         branch_thunks.reserve(instr->branch_count());
         for (HloComputation* branch : instr->branch_computations()) {
-          TF_ASSIGN_OR_RETURN(gpu::ThunkSequence b,
-                              emit_computation(branch));
+          TF_ASSIGN_OR_RETURN(gpu::ThunkSequence b, emit_computation(branch));
           branch_thunks.push_back(std::move(b));
         }
-        TF_ASSIGN_OR_RETURN(BufferAllocation::Slice idx_slice,
-                            buffer_assignment->GetUniqueSlice(
-                                instr->operand(0), {}));
+        TF_ASSIGN_OR_RETURN(
+            BufferAllocation::Slice idx_slice,
+            buffer_assignment->GetUniqueSlice(instr->operand(0), {}));
         thunks.push_back(std::make_unique<gpu::ConditionalThunk>(
             gpu::Thunk::ThunkInfo{},
             ShapedSlice{idx_slice, instr->operand(0)->shape()},
@@ -888,18 +886,17 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
                               context.get(), *deferred.fusion_instr,
                               deferred.entry_name, buffer_assignment.get()));
       gpu::LaunchDimensions launch_dims = mlir_fusion->launch_dimensions();
-      int unroll_factor =
-          mlir_fusion->mlir_kernel_emitter()->unroll_factor();
+      int unroll_factor = mlir_fusion->mlir_kernel_emitter()->unroll_factor();
 
       mlir::ModuleOp module = mlir_source.module();
       TF_RETURN_IF_ERROR(metal::RunMetalLoweringPipeline(
           module, dev, unroll_factor, *hlo_module, deferred.entry_name,
           /*dump_category=*/"mlir-fusion"));
       NameUniquer per_fusion_uniquer;
-      TF_ASSIGN_OR_RETURN(metal::MslKernelSource msl_source,
-                          metal::EmitMslKernel(module, &per_fusion_uniquer,
-                                               *hlo_module,
-                                               deferred.entry_name));
+      TF_ASSIGN_OR_RETURN(
+          metal::MslKernelSource msl_source,
+          metal::EmitMslKernel(module, &per_fusion_uniquer, *hlo_module,
+                               deferred.entry_name));
       last_msl = std::move(msl_source).source();
 
       TF_ASSIGN_OR_RETURN(
@@ -909,8 +906,7 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
       int64_t requested = launch_dims.num_threads_per_block();
       if (last_requested == requested && requested > compiled.pso_max_threads) {
         return absl::ResourceExhaustedError(absl::StrCat(
-            "Fusion '", deferred.fusion_name, "': emitter requires ",
-            requested,
+            "Fusion '", deferred.fusion_name, "': emitter requires ", requested,
             " threads per threadgroup, but the device's PSO grants only ",
             compiled.pso_max_threads,
             " (register pressure). The emitter for this fusion does not "
@@ -922,8 +918,7 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
         const unsigned arity =
             static_cast<unsigned>(deferred.kernel_args.args().size());
         auto artifact = std::make_unique<xla::metal::MetalKernelArtifact>(
-            deferred.entry_name, arity, launch_dims,
-            std::move(compiled.pso));
+            deferred.entry_name, arity, launch_dims, std::move(compiled.pso));
         return BuildResult{std::move(artifact), std::move(last_msl)};
       }
       int64_t next = (compiled.pso_max_threads / simd_width) * simd_width;
@@ -973,11 +968,10 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
 
   // Phase 2/3 for sort stages. Sort kernels don't go through the fusion
   // MLIR-kernel-emitter; we build their MLIR modules directly from each
-  // SortStageDescription. Retry is simpler than fusion's: tiled stages can
-  // ShrinkSortStageTile on a PSO grant below requested threads; non-tiled
-  // stages fall back to threads_per_block_limit just like fusions.
-  auto build_sort_artifact =
-      [&](xla::metal::SortStageDescription stage) -> absl::StatusOr<BuildResult> {
+  // SortStageDescription. Stages can ShrinkSortStage on a PSO grant below
+  // requested threads.
+  auto build_sort_artifact = [&](xla::metal::SortStageDescription stage)
+      -> absl::StatusOr<BuildResult> {
     const int64_t simd_width = gpu_device_info.threads_per_warp();
     for (;;) {
       auto context = std::make_unique<mlir::MLIRContext>();
@@ -994,42 +988,38 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
           module, gpu_device_info, /*max_unroll_factor=*/0, *hlo_module,
           stage.entry_name, /*dump_category=*/"mlir-sort"));
       NameUniquer per_stage_uniquer;
-      TF_ASSIGN_OR_RETURN(
-          metal::MslKernelSource msl_source,
-          metal::EmitMslKernel(module, &per_stage_uniquer, *hlo_module,
-                               stage.entry_name));
+      TF_ASSIGN_OR_RETURN(metal::MslKernelSource msl_source,
+                          metal::EmitMslKernel(module, &per_stage_uniquer,
+                                               *hlo_module, stage.entry_name));
       std::string msl_src = std::move(msl_source).source();
 
-      TF_ASSIGN_OR_RETURN(
-          stream_executor::metal::CompiledPipeline compiled,
-          stream_executor::metal::CompileAndProbe(
-              metal_device, msl_src, stage.entry_name,
-              stage.launch_dimensions.num_threads_per_block()));
+      TF_ASSIGN_OR_RETURN(stream_executor::metal::CompiledPipeline compiled,
+                          stream_executor::metal::CompileAndProbe(
+                              metal_device, msl_src, stage.entry_name,
+                              stage.launch_dimensions.num_threads_per_block()));
       int64_t requested = stage.launch_dimensions.num_threads_per_block();
       if (compiled.pso_max_threads >= requested) {
-        unsigned arity =
-            static_cast<unsigned>(stage.kernel_args.args().size());
+        unsigned arity = static_cast<unsigned>(stage.kernel_args.args().size());
         auto artifact = std::make_unique<MetalKernelArtifact>(
             stage.entry_name, arity, stage.launch_dimensions,
             std::move(compiled.pso));
         return BuildResult{std::move(artifact), std::move(msl_src)};
       }
-      // PSO ceiling is below the launch's threads-per-block. For tiled
-      // stages, the tile width sets threads_per_block — shrink and re-emit.
-      // For non-tiled stages, the launch divides the iteration shape and
-      // can't be re-tiled here, so surface a ResourceExhausted.
-      if (xla::metal::ShrinkSortStageTile(stage, gpu_device_info)) {
+      // PSO ceiling is below the launch's threads-per-block. Shrink the unroll
+      // factor and tile size.
+      if (xla::metal::ShrinkSortStage(stage, gpu_device_info)) {
         VLOG(1) << "Sort stage '" << stage.entry_name << "': requested "
                 << requested << " threads, PSO ceiling "
-                << compiled.pso_max_threads << "; shrinking tile to "
-                << stage.tile_size << " and retrying.";
+                << compiled.pso_max_threads
+                << "; shrinking (tile=" << stage.tile_size
+                << ", unroll=" << stage.unroll_factor << ") and retrying.";
         continue;
       }
       return absl::ResourceExhaustedError(absl::StrCat(
           "Sort stage '", stage.entry_name, "': requested ", requested,
           " threads per threadgroup, but the device's PSO grants only ",
           compiled.pso_max_threads, " (>= SIMD width ", simd_width,
-          " required). Tile cannot shrink further."));
+          " required). Cannot shrink further."));
     }
   };
 
@@ -1091,10 +1081,9 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
           module, gpu_device_info, /*max_unroll_factor=*/0, *hlo_module,
           entry_name, dump_category));
       NameUniquer per_kernel_uniquer;
-      TF_ASSIGN_OR_RETURN(
-          metal::MslKernelSource msl_source,
-          metal::EmitMslKernel(module, &per_kernel_uniquer, *hlo_module,
-                               entry_name));
+      TF_ASSIGN_OR_RETURN(metal::MslKernelSource msl_source,
+                          metal::EmitMslKernel(module, &per_kernel_uniquer,
+                                               *hlo_module, entry_name));
       std::string msl_src = std::move(msl_source).source();
 
       const int64_t requested = launch_dimensions.num_threads_per_block();
@@ -1103,8 +1092,7 @@ kernel void $0(device ulong* rng_state [[buffer(0)]],
           stream_executor::metal::CompileAndProbe(
               metal_device, msl_src, std::string(entry_name), requested));
       if (compiled.pso_max_threads >= requested) {
-        const unsigned arity =
-            static_cast<unsigned>(kernel_args.args().size());
+        const unsigned arity = static_cast<unsigned>(kernel_args.args().size());
         auto artifact = std::make_unique<xla::metal::MetalKernelArtifact>(
             std::string(entry_name), arity, launch_dimensions,
             std::move(compiled.pso));

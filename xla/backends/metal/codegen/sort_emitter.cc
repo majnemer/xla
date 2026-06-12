@@ -256,6 +256,17 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
 
 namespace {
 
+void RecomputeStandardLaunch(SortStageDescription& desc,
+                             const se::DeviceDescription& device) {
+  const Shape& keys_shape = desc.sort->operand(0)->shape();
+  const int64_t sort_dim = desc.sort->sort_dimension();
+  // num_iterations_in_sort_dim stays the full pair count P; the launch (and the
+  // body's ceil(P/unroll) delinearization) are what track the unroll factor.
+  desc.launch_dimensions = ComputeStandardLaunchDimensions(
+      keys_shape, sort_dim, desc.num_iterations_in_sort_dim, desc.unroll_factor,
+      device);
+}
+
 void RecomputeTiledLaunch(SortStageDescription& desc) {
   const Shape& keys_shape = desc.sort->operand(0)->shape();
   const int64_t sort_dim = desc.sort->sort_dimension();
@@ -269,14 +280,21 @@ void RecomputeTiledLaunch(SortStageDescription& desc) {
 
 }  // namespace
 
-bool ShrinkSortStageTile(SortStageDescription& desc,
-                         const se::DeviceDescription& device) {
-  // Non-tiled (global-memory) stages have no tile_size knob to shrink;
-  // their PSO-retry uses threads_per_block_limit instead, like fusion
-  // kernels.
-  if (desc.tile_size == 0) return false;
+bool ShrinkSortStage(SortStageDescription& desc,
+                     const se::DeviceDescription& device) {
+  const int64_t unroll = desc.unroll_factor;
+  if (desc.tile_size == 0) {
+    // Non-tiled (global-memory) stage. Its one knob is the per-thread pair
+    // unroll, which counts PAIRS — floor 1 (one pair/thread, the base case),
+    // unlike the tiled element unroll below whose floor is 2.
+    if (unroll <= 1) {
+      return false;
+    }
+    desc.unroll_factor /= 2;
+    RecomputeStandardLaunch(desc, device);
+    return true;
+  }
   const uint64_t warp = device.threads_per_warp();
-  const uint64_t unroll = static_cast<uint64_t>(desc.unroll_factor);
   // Rung 1: halve tile_size while threads_per_block stays >= one warp.
   // Preserves bank-aware indexing when threads_per_block was bank-aligned.
   uint64_t next = Pow2Floor(static_cast<uint64_t>(desc.tile_size) / 2);
@@ -296,18 +314,18 @@ bool ShrinkSortStageTile(SortStageDescription& desc,
       return true;
     }
   }
-  // Rung 2: tile shrink failed. Halve unroll (4 → 2) to lower per-thread
-  // register pressure; threads_per_block doubles, the next compile sees a
-  // less-loaded kernel that the PSO may grant more threads to. The bank-
-  // aware reshape naturally turns off at unroll=2 (pairs_per_thread = 1).
-  // Floor at 2: pair-compare requires >= 1 pair per thread, so unroll=1
+  // Rung 2: tile shrink failed. Halve unroll to lower per-thread register
+  // pressure; threads_per_block doubles, the next compile sees a less-loaded
+  // kernel that the PSO may grant more threads to. The bank-aware reshape
+  // naturally turns off at unroll=2 (pairs_per_thread = 1). Floor at 2:
+  // pair-compare requires >= 1 pair per thread, so unroll=1
   // (= 0.5 pairs per thread) has no in-emitter realisation.
-  if (unroll > 2) {
-    desc.unroll_factor = 2;
-    RecomputeTiledLaunch(desc);
-    return true;
+  if (unroll <= 2) {
+    return false;
   }
-  return false;
+  desc.unroll_factor /= 2;
+  RecomputeTiledLaunch(desc);
+  return true;
 }
 
 namespace {

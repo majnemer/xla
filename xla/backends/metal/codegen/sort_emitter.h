@@ -55,9 +55,7 @@ struct SortStageDescription {
   // memory; 0 means the stage runs in global memory.
   int64_t tile_size = 0;
   // Elements per thread for the tiled body's load/store; pair-compares
-  // per xor_mask = unroll_factor / 2. 0 for non-tiled stages. Halved by
-  // ShrinkSortStageTile when tile_size has bottomed out under register
-  // pressure (4 → 2 → ResourceExhausted).
+  // per xor_mask = unroll_factor / 2.
   int64_t unroll_factor = 0;
   // Non-tiled stages: number of element-pair iterations along the sort
   // dimension. Tiled stages: number of tiles in the sort dimension.
@@ -97,13 +95,9 @@ absl::StatusOr<std::vector<SortStageDescription>> PlanBitonicSort(
     const std::string& entry_name_prefix);
 
 // Re-plans `desc` after the PSO grants fewer threads than the launch
-// requested. Tries shrinking tile_size first (preserves bank-aware path);
-// on failure halves unroll_factor (4 → 2) to lower per-thread register
-// pressure. Returns false when neither knob has any room left — caller
-// should surface ResourceExhausted. Recomputes launch_dimensions and
-// num_iterations_in_sort_dim on success.
-bool ShrinkSortStageTile(SortStageDescription& desc,
-                         const se::DeviceDescription& device);
+// requested.
+bool ShrinkSortStage(SortStageDescription& desc,
+                     const se::DeviceDescription& device);
 
 // Builds an MLIR module for one sort stage. The module contains:
 //   * a `func.func` per comparator subgraph (declared and bodies emitted)
