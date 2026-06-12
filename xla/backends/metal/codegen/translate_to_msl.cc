@@ -20,6 +20,7 @@ limitations under the License.
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "absl/log/check.h"
@@ -444,8 +445,7 @@ class MslEmitter {
       // MetalStream::LaunchKernel binds positionally; mismatch would corrupt
       // the encoder when slice_index != position.
       std::string arg_name = absl::StrCat("arg", i);
-      names_[arg] = arg_name;
-      addr_spaces_[arg] = "device";
+      BindLValue(arg, arg_name, "device");
       emit_param(absl::StrCat("device ", elem_msl, "* ", arg_name, " [[buffer(",
                               i, ")]]"));
     }
@@ -484,18 +484,23 @@ class MslEmitter {
       if (i > 0) os_ << ", ";
       mlir::Value arg = func.getArgument(i);
       std::string pty;
+      bool is_buffer = false;
       if (auto t = mlir::dyn_cast<mlir::RankedTensorType>(arg.getType())) {
         TF_ASSIGN_OR_RETURN(std::string elem,
                             EmitElementType(t.getElementType()));
         pty = absl::StrCat("device ", elem, "*");
-        if (names) addr_spaces_[arg] = "device";
+        is_buffer = true;
       } else {
         TF_ASSIGN_OR_RETURN(pty, TypeToMSL(arg.getType()));
       }
       os_ << pty;
       if (names) {
         std::string nm = absl::StrCat("arg", i);
-        names_[arg] = nm;
+        if (is_buffer) {
+          BindLValue(arg, nm, "device");
+        } else {
+          values_[arg] = RValue{nm};
+        }
         os_ << " " << nm;
       }
     }
@@ -771,8 +776,8 @@ class MslEmitter {
       }
       TF_ASSIGN_OR_RETURN(std::string elem_msl,
                           EmitElementType(tensor_ty.getElementType()));
-      std::string name = BindValueName(op.getResult());
-      addr_spaces_[op.getResult()] = "thread";
+      std::string name = CreateFreshName();
+      BindLValue(op.getResult(), name, "thread");
       os_ << elem_msl << " " << name << "[" << tensor_ty.getNumElements()
           << "] = {";
       bool first = true;
@@ -1209,8 +1214,8 @@ class MslEmitter {
       auto tensor_ty = mlir::cast<mlir::RankedTensorType>(op.getType());
       TF_ASSIGN_OR_RETURN(std::string elem_msl,
                           EmitElementType(tensor_ty.getElementType()));
-      std::string name = BindValueName(op.getResult());
-      addr_spaces_[op.getResult()] = "threadgroup";
+      std::string name = CreateFreshName();
+      BindLValue(op.getResult(), name, "threadgroup");
       os_ << "threadgroup " << elem_msl << " " << name << "["
           << tensor_ty.getNumElements() << "];\n";
     }
@@ -1221,26 +1226,8 @@ class MslEmitter {
     os_ << "threadgroup_barrier(metal::mem_flags::mem_threadgroup);\n";
     for (auto [result, operand] :
          llvm::zip(op.getResults(), op.getOperands())) {
-      TF_ASSIGN_OR_RETURN(std::string opname, GetName(operand));
-      names_[result] = opname;
-      TF_RETURN_IF_ERROR(InheritAddrSpace(result, operand));
+      TF_RETURN_IF_ERROR(ForwardLValue(result, operand));
     }
-    return absl::OkStatus();
-  }
-
-  absl::Status InheritAddrSpace(mlir::Value to, mlir::Value from) {
-    // Only tensor-typed values represent buffers; scalars don't carry an
-    // address space.
-    if (!mlir::isa<mlir::RankedTensorType>(from.getType())) {
-      return absl::OkStatus();
-    }
-    auto it = addr_spaces_.find(from);
-    if (it == addr_spaces_.end()) {
-      return absl::InternalError(absl::StrCat(
-          "MSL emitter: tensor value has no recorded address space: ",
-          mlir::debugString(from.getType())));
-    }
-    addr_spaces_[to] = it->second;
     return absl::OkStatus();
   }
 
@@ -1321,13 +1308,20 @@ class MslEmitter {
   }
 
   absl::StatusOr<std::string> AddrSpaceOf(mlir::Value v) const {
-    auto it = addr_spaces_.find(v);
-    if (it == addr_spaces_.end()) {
-      return absl::InternalError(
-          "MSL emitter: no address space recorded for tensor value; cannot "
-          "emit a vector load/store without it.");
+    auto it = values_.find(v);
+    if (it == values_.end()) {
+      return absl::InternalError(absl::StrCat(
+          "MSL emitter: no value recorded for ",
+          mlir::debugString(v.getType())));
     }
-    return it->second;
+    auto* lv = std::get_if<LValue>(&it->second);
+    if (!lv) {
+      return absl::InternalError(absl::StrCat(
+          "MSL emitter: value is a computed rvalue, not a memory location, so "
+          "it has no address space: ",
+          mlir::debugString(v.getType())));
+    }
+    return lv->address_space;
   }
 
   absl::Status EmitVectorTransferRead(mlir::vector::TransferReadOp op) {
@@ -1362,8 +1356,7 @@ class MslEmitter {
     os_ << "*(" << space << " " << vec_ty << "*)(&" << buf << "[" << idx
         << "]) = " << val << ";\n";
     if (!op.getResults().empty()) {
-      names_[op.getResult()] = buf;
-      TF_RETURN_IF_ERROR(InheritAddrSpace(op.getResult(), op.getBase()));
+      TF_RETURN_IF_ERROR(ForwardLValue(op.getResult(), op.getBase()));
     }
     return absl::OkStatus();
   }
@@ -1508,8 +1501,7 @@ class MslEmitter {
          llvm::zip(op.getRegionIterArgs(), op.getInitArgs())) {
       TF_ASSIGN_OR_RETURN(std::string init_name, GetName(init));
       if (mlir::isa<mlir::TensorType, mlir::MemRefType>(iter_arg.getType())) {
-        names_[iter_arg] = init_name;
-        TF_RETURN_IF_ERROR(InheritAddrSpace(iter_arg, init));
+        TF_RETURN_IF_ERROR(ForwardLValue(iter_arg, init));
       } else {
         TF_ASSIGN_OR_RETURN(std::string ty, TypeToMSL(iter_arg.getType()));
         std::string var = BindValueName(iter_arg);
@@ -1548,9 +1540,13 @@ class MslEmitter {
     os_ << "}\n";
     for (auto [result, iter_arg] :
          llvm::zip(op.getResults(), op.getRegionIterArgs())) {
-      TF_ASSIGN_OR_RETURN(std::string name, GetName(iter_arg));
-      names_[result] = name;
-      TF_RETURN_IF_ERROR(InheritAddrSpace(result, iter_arg));
+      if (mlir::isa<mlir::TensorType, mlir::MemRefType>(iter_arg.getType())) {
+        TF_RETURN_IF_ERROR(ForwardLValue(result, iter_arg));
+      } else {
+        // Scalar result aliases the iter_arg's mutable loop variable.
+        TF_ASSIGN_OR_RETURN(std::string name, GetName(iter_arg));
+        values_[result] = RValue{name};
+      }
     }
     return absl::OkStatus();
   }
@@ -1620,8 +1616,7 @@ class MslEmitter {
             "buffers; MSL emitter only supports both branches yielding the "
             "same buffer (the in-place tensor.insert pattern).");
       }
-      names_[result] = then_name;
-      TF_RETURN_IF_ERROR(InheritAddrSpace(result, then_v));
+      TF_RETURN_IF_ERROR(ForwardLValue(result, then_v));
     }
     return absl::OkStatus();
   }
@@ -1642,8 +1637,7 @@ class MslEmitter {
     TF_ASSIGN_OR_RETURN(std::string val, GetName(op.getScalar()));
     os_ << buf << "[" << idx << "] = " << val << ";\n";
     // Result aliases dest; subsequent users access the same buffer.
-    names_[op.getResult()] = buf;
-    TF_RETURN_IF_ERROR(InheritAddrSpace(op.getResult(), op.getDest()));
+    TF_RETURN_IF_ERROR(ForwardLValue(op.getResult(), op.getDest()));
     return absl::OkStatus();
   }
 
@@ -1743,7 +1737,7 @@ class MslEmitter {
           << ">((" << expected << " >> " << shift << ") & " << element_mask
           << "u);\n";
     }
-    names_[op.getCurrentValue()] = current;
+    values_[op.getCurrentValue()] = RValue{current};
 
     for (mlir::Operation& body_op : op.getBody()->without_terminator()) {
       TF_RETURN_IF_ERROR(EmitOp(&body_op));
@@ -1776,8 +1770,7 @@ class MslEmitter {
     os_.unindent();
     os_ << "} while (!" << success << ");\n";
 
-    names_[op.getResult()] = buf;
-    TF_RETURN_IF_ERROR(InheritAddrSpace(op.getResult(), op.getInput()));
+    TF_RETURN_IF_ERROR(ForwardLValue(op.getResult(), op.getInput()));
     return absl::OkStatus();
   }
 
@@ -1844,7 +1837,7 @@ class MslEmitter {
       os_ << element_msl << " " << current << " = static_cast<" << element_msl
           << ">(" << expected << ");\n";
     }
-    names_[op.getCurrentValue()] = current;
+    values_[op.getCurrentValue()] = RValue{current};
 
     for (mlir::Operation& body_op : op.getBody()->without_terminator()) {
       TF_RETURN_IF_ERROR(EmitOp(&body_op));
@@ -1870,26 +1863,56 @@ class MslEmitter {
     os_.unindent();
     os_ << "} while (!" << success << ");\n";
 
-    names_[op.getResult()] = buf;
-    TF_RETURN_IF_ERROR(InheritAddrSpace(op.getResult(), op.getInput()));
+    TF_RETURN_IF_ERROR(ForwardLValue(op.getResult(), op.getInput()));
     return absl::OkStatus();
   }
 
   absl::StatusOr<std::string> GetName(mlir::Value v) const {
-    auto it = names_.find(v);
-    if (it == names_.end()) {
+    auto it = values_.find(v);
+    if (it == values_.end()) {
       return absl::InternalError(absl::StrCat(
           "MSL emitter: SSA value has no name (use before def or unmapped "
           "operand). Type: ",
           mlir::debugString(v.getType())));
     }
-    return it->second;
+    if (auto* lv = std::get_if<LValue>(&it->second)) return lv->name;
+    return std::get<RValue>(it->second).name;
   }
 
   std::string BindValueName(mlir::Value v) {
     std::string name = CreateFreshName();
-    names_[v] = name;
+    values_[v] = RValue{name};
     return name;
+  }
+
+  // Records `v` as an lvalue: a memory location with MSL identifier `name` in
+  // address space `address_space`.
+  void BindLValue(mlir::Value v, std::string name, std::string address_space) {
+    values_[v] = LValue{std::move(name), std::move(address_space)};
+  }
+
+  // Forwards an lvalue (name + address space, inseparably) from `from` to `to`,
+  // for ops that thread a buffer/tile through unchanged (scf.if/for,
+  // sync_threads, tensor.insert, atomic results). Errors loudly if `from` is a
+  // computed rvalue rather than a memory location.
+  absl::Status ForwardLValue(mlir::Value to, mlir::Value from) {
+    auto it = values_.find(from);
+    if (it == values_.end()) {
+      return absl::InternalError(absl::StrCat(
+          "MSL emitter: cannot forward an unrecorded value: ",
+          mlir::debugString(from.getType())));
+    }
+    if (!std::holds_alternative<LValue>(it->second)) {
+      return absl::InternalError(absl::StrCat(
+          "MSL emitter: expected a memory lvalue to forward but got a "
+          "computed rvalue: ",
+          mlir::debugString(from.getType())));
+    }
+    // Copy before assigning: inserting `to` can rehash values_ and invalidate
+    // a reference into it (a use-after-free of the source record otherwise).
+    LValue lv = std::get<LValue>(it->second);
+    values_[to] = std::move(lv);
+    return absl::OkStatus();
   }
 
   std::string CreateFreshName() { return absl::StrCat("v", next_id_++); }
@@ -1917,8 +1940,21 @@ class MslEmitter {
   }
 
   mlir::raw_indented_ostream& os_;
-  llvm::DenseMap<mlir::Value, std::string> names_;
-  llvm::DenseMap<mlir::Value, std::string> addr_spaces_;
+  // An emitted SSA value is either an lvalue — a memory location (buffer, tile,
+  // or local array) with an MSL identifier and an address space — or an rvalue:
+  // a computed scalar/vector with just an identifier. Holding the name and
+  // address space in one record means an lvalue forwarded through
+  // scf.if/sync_threads/atomic results can never lose its space (see
+  // ForwardLValue), which is the class of bug a parallel name/space map invites.
+  struct LValue {
+    std::string name;
+    std::string address_space;  // "device" | "threadgroup" | "thread"
+  };
+  struct RValue {
+    std::string name;
+  };
+  using EmittedValue = std::variant<LValue, RValue>;
+  llvm::DenseMap<mlir::Value, EmittedValue> values_;
   unsigned next_id_ = 0;
   // True while emitting the entry kernel (void; results land in buffers) and
   // false while emitting a device function (func.return yields a value).
