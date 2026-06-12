@@ -170,6 +170,13 @@ MetalExecutor::CreateDeviceDescription(int ordinal) {
         /*x=*/std::numeric_limits<int64_t>::max(),
         /*y=*/std::numeric_limits<int64_t>::max(),
         /*z=*/std::numeric_limits<int64_t>::max()));
+
+    // Threadgroup ("shared") memory budget. Metal has no opt-in tier, so the
+    // opt-in limit equals the base limit.
+    const int64_t threadgroup_memory =
+        static_cast<int64_t>([device maxThreadgroupMemoryLength]);
+    desc->set_shared_memory_per_block(threadgroup_memory);
+    desc->set_shared_memory_per_block_optin(threadgroup_memory);
   }
   return desc;
 }
