@@ -42,6 +42,7 @@ limitations under the License.
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "xla/backends/gpu/codegen/emitters/ir/xla_gpu_ops.h"
 #include "xla/backends/metal/codegen/transforms/passes.h"
 #include "xla/codegen/emitters/ir/xla_ops.h"
 
@@ -862,6 +863,50 @@ struct ConvertPoisonOp : public mlir::OpConversionPattern<mlir::ub::PoisonOp> {
   }
 };
 
+// A sub-byte threadgroup tile packs into i8 just like a buffer; the existing
+// tensor.extract/insert patterns then index it (byte + bit offset), and the
+// MSL translator emits `threadgroup char name[ceil(N/2)]`.
+struct ConvertAllocateShared
+    : public mlir::OpConversionPattern<::xla::gpu::AllocateSharedOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      ::xla::gpu::AllocateSharedOp op, OpAdaptor /*adaptor*/,
+      mlir::ConversionPatternRewriter& rewriter) const override {
+    if (!HasSubByteElementType(op.getType())) {
+      return rewriter.notifyMatchFailure(op, "tile is not sub-byte");
+    }
+    mlir::Type converted_type = getTypeConverter()->convertType(op.getType());
+    if (!converted_type) {
+      return rewriter.notifyMatchFailure(op, "failed to convert tile type");
+    }
+    rewriter.replaceOpWithNewOp<::xla::gpu::AllocateSharedOp>(op,
+                                                             converted_type);
+    return mlir::success();
+  }
+};
+
+// sync_threads threads the operand tiles through the barrier, so a sub-byte
+// tile shows up as one of its operand/result types — re-create it on the
+// packed i8 types.
+struct ConvertSyncThreads
+    : public mlir::OpConversionPattern<::xla::gpu::SyncThreadsOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      ::xla::gpu::SyncThreadsOp op, OpAdaptor adaptor,
+      mlir::ConversionPatternRewriter& rewriter) const override {
+    llvm::SmallVector<mlir::Type> result_types;
+    if (mlir::failed(getTypeConverter()->convertTypes(op.getResultTypes(),
+                                                      result_types))) {
+      return rewriter.notifyMatchFailure(op, "failed to convert result types");
+    }
+    rewriter.replaceOpWithNewOp<::xla::gpu::SyncThreadsOp>(
+        op, result_types, adaptor.getOperands());
+    return mlir::success();
+  }
+};
+
 class LowerSubByteStoragePass
     : public impl::LowerSubByteStoragePassBase<LowerSubByteStoragePass> {
  public:
@@ -873,7 +918,8 @@ class LowerSubByteStoragePass
 
     mlir::RewritePatternSet patterns(context);
     patterns.add<
-        ConvertBitcastOp, ConvertCmpIOp, ConvertConstantOp, ConvertExtSIOp,
+        ConvertAllocateShared, ConvertSyncThreads, ConvertBitcastOp,
+        ConvertCmpIOp, ConvertConstantOp, ConvertExtSIOp,
         ConvertExtUIOp, ConvertPoisonOp, ConvertSelectOp,
         ConvertSubByteCtlzOp, ConvertSubByteShRSIOp, ConvertSubByteSIToFPOp,
         ConvertSubByteUIToFPOp, ConvertTensorExtract, ConvertTensorInsert,
