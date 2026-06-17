@@ -618,7 +618,9 @@ absl::StatusOr<MemorySpace> MetalExecutor::GetPointerMemorySpace(
   if (auto resolved = allocator_->Resolve(ptr); resolved.has_value()) {
     return resolved->memory_space;
   }
-  return MemorySpace::kHost;
+  return absl::NotFoundError(
+      "MetalExecutor::GetPointerMemorySpace: pointer is not owned by the "
+      "Metal allocator.");
 }
 
 bool MetalExecutor::SynchronizeAllActivity() {
