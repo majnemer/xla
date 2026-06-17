@@ -16,6 +16,8 @@ limitations under the License.
 #ifndef XLA_SERVICE_GPU_FUSION_PIPELINE_H_
 #define XLA_SERVICE_GPU_FUSION_PIPELINE_H_
 
+#include <cstdint>
+
 #include "mlir/IR/MLIRContext.h"
 #include "xla/hlo/pass/hlo_pass_pipeline.h"
 #include "xla/service/gpu/alias_info.h"
@@ -34,7 +36,8 @@ HloPassPipeline FusionPipeline(
     HloCostAnalysis::ShapeSizeFunction shape_size_bytes_function,
     const GpuAliasInfo* alias_info, tsl::thread::ThreadPool* thread_pool,
     const se::DeviceDescription& gpu_device_info,
-    mlir::MLIRContext* mlir_context);
+    mlir::MLIRContext* mlir_context,
+    int64_t max_operands_and_outputs_per_fusion);
 
 }  // namespace gpu
 }  // namespace xla

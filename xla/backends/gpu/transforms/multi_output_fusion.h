@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef XLA_BACKENDS_GPU_TRANSFORMS_MULTI_OUTPUT_FUSION_H_
 #define XLA_BACKENDS_GPU_TRANSFORMS_MULTI_OUTPUT_FUSION_H_
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 
@@ -100,11 +101,14 @@ class MultiOutputFusion : public HloModulePass {
   explicit MultiOutputFusion(
       const se::DeviceDescription& device_info, const GpuAliasInfo* alias_info,
       HloCostAnalysis::ShapeSizeFunction shape_size_function,
-      mlir::MLIRContext* mlir_context)
+      mlir::MLIRContext* mlir_context,
+      int64_t max_operands_and_outputs_per_fusion)
       : device_info_(device_info),
         alias_info_(alias_info),
         shape_size_function_(shape_size_function),
-        mlir_context_(mlir_context) {}
+        mlir_context_(mlir_context),
+        max_operands_and_outputs_per_fusion_(
+            max_operands_and_outputs_per_fusion) {}
 
   absl::string_view name() const override { return "multi_output_fusion"; }
 
@@ -138,6 +142,7 @@ class MultiOutputFusion : public HloModulePass {
   const GpuAliasInfo* alias_info_;
   HloCostAnalysis::ShapeSizeFunction shape_size_function_;
   mlir::MLIRContext* mlir_context_;
+  const int64_t max_operands_and_outputs_per_fusion_;
 };
 
 }  // namespace gpu

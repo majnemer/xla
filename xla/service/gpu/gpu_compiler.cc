@@ -260,6 +260,7 @@ limitations under the License.
 #include "xla/service/gpu/gpu_executable.h"
 #include "xla/service/gpu/gpu_executable.pb.h"
 #include "xla/service/gpu/gpu_float_support.h"
+#include "xla/service/gpu/gpu_fusible.h"
 #include "xla/service/gpu/gpu_hlo_schedule.h"
 #include "xla/service/gpu/gpu_latency_hiding_scheduler.h"
 #include "xla/service/gpu/gpu_memory_space_assignment.h"
@@ -527,6 +528,10 @@ void MergeModuleStatsInPlace(const ModuleStats& from, ModuleStats& to) {
 
 GpuCompiler::GpuCompiler(se::Platform::Id platform_id, int64_t pointer_size)
     : platform_id_(platform_id), pointer_size_(pointer_size) {}
+
+int64_t GpuCompiler::MaxOperandsAndOutputsPerFusion() const {
+  return kDefaultMaxOperandsAndOutputsPerFusion;
+}
 
 namespace {
 // Adds the HloVerifier for GPU to the given pipeline.
@@ -1229,6 +1234,7 @@ absl::Status RunFusionPasses(HloModule* hlo_module,
                              HloCostAnalysis::ShapeSizeFunction shape_size_fn,
                              const GpuAliasInfo* alias_info,
                              mlir::MLIRContext* mlir_context,
+                             int64_t max_operands_and_outputs_per_fusion,
                              CompilationStats* compilation_stats) {
   const se::DeviceDescription& gpu_device_info =
       gpu_target_config.device_description;
@@ -1239,7 +1245,8 @@ absl::Status RunFusionPasses(HloModule* hlo_module,
 
   RETURN_IF_ERROR(FusionPipeline(hlo_module->config().debug_options(),
                                  shape_size_fn, alias_info, thread_pool,
-                                 gpu_device_info, mlir_context)
+                                 gpu_device_info, mlir_context,
+                                 max_operands_and_outputs_per_fusion)
                       .Run(hlo_module, {HloInstruction::kMainExecutionThread})
                       .status());
 
@@ -1737,7 +1744,8 @@ absl::Status GpuCompiler::OptimizeHloModule(
 
   RETURN_IF_ERROR(RunFusionPasses(
       hlo_module, gpu_topology.gpu_target_config(), thread_pool.get_mutable(),
-      ShapeSizeBytesFunction(), alias_info, mlir_context, compilation_stats));
+      ShapeSizeBytesFunction(), alias_info, mlir_context,
+      MaxOperandsAndOutputsPerFusion(), compilation_stats));
   RETURN_IF_ERROR(RunPostFusionPasses(
       hlo_module, device_description, alias_info, pointer_size_, options,
       gpu_topology.number_of_devices(), mlir_context, compilation_stats));
@@ -1808,7 +1816,8 @@ absl::Status GpuCompiler::RunPreSchedulingCopyInsertion(
     HloModule& hlo_module, const se::DeviceDescription& device_description,
     const GpuAliasInfo* alias_info) {
   return PreSchedulingCopyInsertionPipeline(hlo_module.config(), alias_info,
-                                            device_description)
+                                            device_description,
+                                            MaxOperandsAndOutputsPerFusion())
       .Run(&hlo_module, {HloInstruction::kMainExecutionThread})
       .status();
 }
@@ -2547,9 +2556,8 @@ absl::StatusOr<std::vector<std::unique_ptr<Executable>>> GpuCompiler::Compile(
     return absl::StrFormat("XlaCompile:#module=%s,program_id=%d#",
                            hlo_module->name(), hlo_module->unique_id());
   }};
-  TF_ASSIGN_OR_RETURN(
-      hlo_module,
-      RunHloPasses(std::move(hlo_module), stream_execs[0], options));
+  TF_ASSIGN_OR_RETURN(hlo_module, RunHloPasses(std::move(hlo_module),
+                                               stream_execs[0], options));
   TF_ASSIGN_OR_RETURN(
       std::unique_ptr<Executable> executable,
       RunBackend(std::move(hlo_module), stream_execs[0], options));
@@ -2571,9 +2579,9 @@ absl::StatusOr<ScheduleMetadata> GpuCompiler::ScheduleAndVerify(
   HloPassPipeline pipeline("scheduled-gpu-module");
   AddHloVerifier(&pipeline);
   RETURN_IF_ERROR(pipeline.Run(module).status());
-  RETURN_IF_ERROR(RunPostSchedulingPipelines(
-      module, schedule_metadata.scheduler_mem_limit, gpu_topology, alias_info,
-      mlir_context));
+  RETURN_IF_ERROR(
+      RunPostSchedulingPipelines(module, schedule_metadata.scheduler_mem_limit,
+                                 gpu_topology, alias_info, mlir_context));
   return schedule_metadata;
 }
 
@@ -2620,10 +2628,9 @@ absl::StatusOr<std::unique_ptr<Executable>> GpuCompiler::RunBackend(
         tsl::strings::HumanReadableNumBytes(cost_analysis.bytes_accessed()));
   }
 
-  ASSIGN_OR_RETURN(
-      std::unique_ptr<GpuExecutable> gpu_executable,
-      CompileToBackendResult(std::move(module), gpu_topology, options,
-                             stream_exec));
+  ASSIGN_OR_RETURN(std::unique_ptr<GpuExecutable> gpu_executable,
+                   CompileToBackendResult(std::move(module), gpu_topology,
+                                          options, stream_exec));
 
   return static_cast<std::unique_ptr<Executable>>(std::move(gpu_executable));
 }
@@ -2698,12 +2705,10 @@ GpuCompiler::NewCompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,
   return results;
 }
 
-
 HloCostAnalysis::ShapeSizeFunction GpuCompiler::ShapeSizeBytesFunction() const {
   // Capture just the pointer size, not the entire GpuCompiler object.
   return gpu::ShapeSizeBytesFunction(pointer_size_);
 }
-
 
 absl::Status GpuCompiler::RunPreSchedulingPasses(
     HloModule* module, const se::DeviceDescription& gpu_device_info,

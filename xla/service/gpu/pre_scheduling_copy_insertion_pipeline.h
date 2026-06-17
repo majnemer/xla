@@ -16,6 +16,8 @@ limitations under the License.
 #ifndef XLA_SERVICE_GPU_PRE_SCHEDULING_COPY_INSERTION_PIPELINE_H_
 #define XLA_SERVICE_GPU_PRE_SCHEDULING_COPY_INSERTION_PIPELINE_H_
 
+#include <cstdint>
+
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/pass/hlo_pass_pipeline.h"
 #include "xla/service/gpu/alias_info.h"
@@ -28,7 +30,8 @@ namespace gpu {
 // This pipeline must run before scheduling to ensure correctness.
 HloPassPipeline PreSchedulingCopyInsertionPipeline(
     const HloModuleConfig& config, const GpuAliasInfo* alias_info,
-    const se::DeviceDescription& device_description);
+    const se::DeviceDescription& device_description,
+    int64_t max_operands_and_outputs_per_fusion);
 
 }  // namespace gpu
 }  // namespace xla

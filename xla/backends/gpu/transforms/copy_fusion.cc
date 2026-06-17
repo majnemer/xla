@@ -110,7 +110,10 @@ absl::StatusOr<bool> CopyFusion::DoCopyFusion(
           copy_user->shape() == copy_user->operand(0)->shape() &&
           !copy_user->shape().IsTuple() &&
           !copy_user->HasControlDependencies() &&
-          FusionFitsInBudget(*hlo, *copy_user, device_description_)) {
+          FusionFitsInBudget(*hlo, *copy_user, device_description_,
+                             /*is_consumer_producer_fusion=*/false,
+                             /*cache=*/nullptr,
+                             max_operands_and_outputs_per_fusion_)) {
         copies.push_back(copy_user);
       } else {
         other_users.push_back(user);
@@ -133,10 +136,10 @@ absl::StatusOr<bool> CopyFusion::DoCopyFusion(
         hlo->IsMultiOutputFusion() ? root->operand_count() : int64_t{1};
     int64_t total_outputs = num_outputs + copies.size();
 
-    if (total_outputs > MaxOperandsAndOutputsPerFusion()) {
+    if (total_outputs > max_operands_and_outputs_per_fusion_) {
       VLOG(1) << "Skipping fusion as it would exceed "
                  "MaxOperandsAndOutputsPerFusion(): "
-              << total_outputs << " > " << MaxOperandsAndOutputsPerFusion();
+              << total_outputs << " > " << max_operands_and_outputs_per_fusion_;
       continue;
     }
 

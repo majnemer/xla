@@ -165,7 +165,8 @@ class PriorityFusionQueue {
       tsl::thread::ThreadPool* thread_pool, mlir::MLIRContext* mlir_context,
       HloFusionAnalysisCache& fusion_analysis_cache,
       FusionDeduplicationCache& fusion_deduplication_cache,
-      bool triton_heroless_fusion_enabled, const AliasInfo* alias_info) {
+      bool triton_heroless_fusion_enabled, const AliasInfo* alias_info,
+      int64_t max_operands_and_outputs_per_fusion) {
     auto cost_analysis = std::make_unique<GpuHloCostAnalysis>(
         cost_analysis_options, *device_info);
     VLOG(2) << "Running full HLO cost analysis for " << computation->name();
@@ -175,7 +176,8 @@ class PriorityFusionQueue {
         computation, std::move(cost_analysis), cost_analysis_options,
         device_info, fusion_process_dump, thread_pool, mlir_context,
         fusion_analysis_cache, fusion_deduplication_cache,
-        triton_heroless_fusion_enabled, alias_info);
+        triton_heroless_fusion_enabled, alias_info,
+        max_operands_and_outputs_per_fusion);
 
     std::vector<HloInstruction*> instructions;
     for (auto* instruction : computation->MakeInstructionPostOrder()) {
@@ -204,7 +206,8 @@ class PriorityFusionQueue {
                       HloFusionAnalysisCache& fusion_analysis_cache,
                       FusionDeduplicationCache& fusion_deduplication_cache,
                       bool triton_heroless_fusion_enabled,
-                      const AliasInfo* alias_info)
+                      const AliasInfo* alias_info,
+                      int64_t max_operands_and_outputs_per_fusion)
       : computation_(computation),
         device_info_(device_info),
         cost_analysis_(std::move(cost_analysis)),
@@ -218,7 +221,9 @@ class PriorityFusionQueue {
         fusion_info_cache_(*device_info_),
         reachability_(HloDfsReachability::Build(computation)),
         triton_heroless_fusion_enabled_(triton_heroless_fusion_enabled),
-        alias_info_(alias_info) {
+        alias_info_(alias_info),
+        max_operands_and_outputs_per_fusion_(
+            max_operands_and_outputs_per_fusion) {
     dump_fusion_visualization_ = computation->parent()
                                      ->config()
                                      .debug_options()
@@ -759,7 +764,8 @@ class PriorityFusionQueue {
     // regarding the maximum number of parameters that can be passed to a
     // kernel.
     if (auto fits_budget = FusionFitsInParameterLimit(
-            *consumer, *producer, /*is_consumer_producer_fusion=*/true);
+            *consumer, *producer, /*is_consumer_producer_fusion=*/true,
+            max_operands_and_outputs_per_fusion_);
         !fits_budget) {
       return fits_budget;
     }
@@ -876,7 +882,8 @@ class PriorityFusionQueue {
     // Would be nice to model this with cost instead.
     if (auto fits_budget = FusionFitsInBudget(
             *consumer, *producer, *device_info_,
-            /*is_consumer_producer_fusion=*/true, &fusion_info_cache_);
+            /*is_consumer_producer_fusion=*/true, &fusion_info_cache_,
+            max_operands_and_outputs_per_fusion_);
         !fits_budget) {
       return fits_budget;
     }
@@ -1091,6 +1098,8 @@ class PriorityFusionQueue {
 
   const AliasInfo* alias_info_;
 
+  const int64_t max_operands_and_outputs_per_fusion_;
+
   bool dump_fusion_visualization_;
 };
 
@@ -1184,7 +1193,8 @@ absl::StatusOr<bool> PriorityFusion::RunImpl(
             computation, cost_analysis_options_, &device_info_,
             fusion_process_dump_.get(), thread_pool_, mlir_context_,
             fusion_analysis_cache_, fusion_deduplication_cache,
-            triton_heroless_fusion_enabled, alias_info_));
+            triton_heroless_fusion_enabled, alias_info_,
+            max_operands_and_outputs_per_fusion_));
 
     while (fusion_queue->DequeueNextProducer()) {
       auto producer = fusion_queue->current_producer();

@@ -51,14 +51,16 @@ class MultiOutputFusionTest : public HloHardwareIndependentTestBase {
   se::DeviceDescription device_info_{TestGpuDeviceInfo::RTXA6000DeviceInfo()};
   GpuAliasInfo alias_info_{device_info_};
   MultiOutputFusion mof_{device_info_, &alias_info_,
-                         HloCostAnalysis::DefaultShapeSize, &mlir_context_};
+                         HloCostAnalysis::DefaultShapeSize, &mlir_context_,
+                         kDefaultMaxOperandsAndOutputsPerFusion};
 
   void CheckMultiOutputFusion(absl::string_view hlo,
                               std::optional<absl::string_view> expected) {
     RunAndFilecheckHloRewrite(
         hlo,
         MultiOutputFusion{device_info_, &alias_info_,
-                          HloCostAnalysis::DefaultShapeSize, &mlir_context_},
+                          HloCostAnalysis::DefaultShapeSize, &mlir_context_,
+                          kDefaultMaxOperandsAndOutputsPerFusion},
         expected);
   }
 
@@ -1013,7 +1015,7 @@ TEST_F(MultiOutputFusionTest, PreferFuseProducerIntoFusionConsumer) {
 // Check that we limit the number of operands to fusions we create.
 TEST_F(MultiOutputFusionTest, AvoidsLargeFusion) {
   constexpr int64_t kNumParams = 200;
-  ASSERT_GT(kNumParams, MaxOperandsAndOutputsPerFusion());
+  ASSERT_GT(kNumParams, kDefaultMaxOperandsAndOutputsPerFusion);
 
   // Compute
   //   p0 * p1,
@@ -1058,7 +1060,7 @@ TEST_F(MultiOutputFusionTest, AvoidsLargeFusion) {
   SCOPED_TRACE(module->ToString());
   for (const HloInstruction* instr : computation->instructions()) {
     EXPECT_LE(instr->operand_count() + ShapeUtil::SubshapeCount(instr->shape()),
-              MaxOperandsAndOutputsPerFusion())
+              kDefaultMaxOperandsAndOutputsPerFusion)
         << instr->ToString();
   }
 }

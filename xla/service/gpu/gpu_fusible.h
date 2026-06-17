@@ -79,7 +79,7 @@ std::vector<HloComputation*> GetFusibleComputations(
     const HloModule& module,
     const absl::flat_hash_set<absl::string_view>& execution_threads);
 
-inline constexpr int64_t MaxOperandsAndOutputsPerFusion() { return 96; }
+inline constexpr int64_t kDefaultMaxOperandsAndOutputsPerFusion = 96;
 
 // Whether the op transposes the physical data layout. Fusing such ops may lead
 // to uncoalesced data access and may thus not be beneficial.
@@ -133,9 +133,10 @@ bool IsInputFusibleScatter(const HloInstruction& instr);
 // passed to a kernel. If the fusion is a producer/consumer fusion and `instr1`
 // is the consumer and `instr2` is the producer, set consumer_producer_fusion to
 // true to enable more fusion.
-FusionDecision FusionFitsInParameterLimit(
-    const HloInstruction& instr1, const HloInstruction& instr2,
-    bool is_consumer_producer_fusion = false);
+FusionDecision FusionFitsInParameterLimit(const HloInstruction& instr1,
+                                          const HloInstruction& instr2,
+                                          bool is_consumer_producer_fusion,
+                                          int64_t max_operands_and_outputs);
 
 // Determines whether the combination of `instr1` and `instr2` into a (possibly
 // multi-output) fusion fits within a "budget" -- i.e., does have more operands
@@ -145,8 +146,9 @@ FusionDecision FusionFitsInParameterLimit(
 FusionDecision FusionFitsInBudget(const HloInstruction& instr1,
                                   const HloInstruction& instr2,
                                   const se::DeviceDescription& device_info,
-                                  bool is_consumer_producer_fusion = false,
-                                  FusionInfoCache* cache = nullptr);
+                                  bool is_consumer_producer_fusion,
+                                  FusionInfoCache* cache,
+                                  int64_t max_operands_and_outputs);
 
 // Returns the instruction that determines the emitter used for lowering,
 // sometimes referred to as "the real hero".

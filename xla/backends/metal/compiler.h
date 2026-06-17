@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef XLA_BACKENDS_METAL_COMPILER_H_
 #define XLA_BACKENDS_METAL_COMPILER_H_
 
+#include <cstdint>
 #include <memory>
 
 #include "absl/base/nullability.h"
@@ -42,6 +43,8 @@ class MetalCompiler : public xla::gpu::GpuCompiler {
   ~MetalCompiler() override = default;
 
  protected:
+  int64_t MaxOperandsAndOutputsPerFusion() const override { return 31; }
+
   // Slot for Metal-specific HLO passes that must run after expanders
   // (CholeskyExpander, etc.) but before LayoutAssignment. The base hook is
   // named for its primary use case on LLVM-flavored GPU backends; we use it
@@ -80,9 +83,8 @@ class MetalCompiler : public xla::gpu::GpuCompiler {
       se::StreamExecutor* stream_exec,
       const xla::gpu::GpuTargetConfig* target_config,
       const MultiProcessKeyValueStore& key_value_store,
-      const se::SemanticVersion& toolkit_version,
-      const AliasInfo* alias_info, const DebugOptions& debug_options,
-      mlir::MLIRContext* mlir_context,
+      const se::SemanticVersion& toolkit_version, const AliasInfo* alias_info,
+      const DebugOptions& debug_options, mlir::MLIRContext* mlir_context,
       HloCostAnalysis::ShapeSizeFunction shape_size_fn) override {
     return absl::OkStatus();
   }
@@ -91,11 +93,10 @@ class MetalCompiler : public xla::gpu::GpuCompiler {
   // only HLO modules whose entry computation is parameter-only are
   // supported; compute opcodes are rejected with Unimplemented up front.
   absl::StatusOr<std::unique_ptr<xla::gpu::GpuExecutable>>
-  CompileToBackendResult(std::unique_ptr<HloModule> module,
-                         const GpuTopology& gpu_topology,
-                         const CompileOptions& options,
-                         se::StreamExecutor* absl_nullable stream_exec)
-      override;
+  CompileToBackendResult(
+      std::unique_ptr<HloModule> module, const GpuTopology& gpu_topology,
+      const CompileOptions& options,
+      se::StreamExecutor* absl_nullable stream_exec) override;
 
  private:
   MetalCompiler(const MetalCompiler&) = delete;

@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef XLA_BACKENDS_GPU_TRANSFORMS_PRIORITY_FUSION_H_
 #define XLA_BACKENDS_GPU_TRANSFORMS_PRIORITY_FUSION_H_
 
+#include <cstdint>
 #include <memory>
 #include <utility>
 
@@ -85,13 +86,16 @@ class PriorityFusion : public HloModulePass {
                  const se::DeviceDescription& device,
                  const AliasInfo* alias_info,
                  GpuHloCostAnalysis::Options cost_analysis_options,
-                 mlir::MLIRContext* mlir_context)
+                 mlir::MLIRContext* mlir_context,
+                 int64_t max_operands_and_outputs_per_fusion)
       : thread_pool_(thread_pool),
         device_info_(device),
         alias_info_(alias_info),
         cost_analysis_options_(std::move(cost_analysis_options)),
         fusion_analysis_cache_(device_info_),
-        mlir_context_(mlir_context) {}
+        mlir_context_(mlir_context),
+        max_operands_and_outputs_per_fusion_(
+            max_operands_and_outputs_per_fusion) {}
 
   absl::string_view name() const override { return "priority-fusion"; }
 
@@ -129,6 +133,7 @@ class PriorityFusion : public HloModulePass {
   HloFusionAnalysisCache fusion_analysis_cache_;
 
   mlir::MLIRContext* mlir_context_;
+  const int64_t max_operands_and_outputs_per_fusion_;
 };
 
 }  // namespace gpu

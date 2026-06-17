@@ -84,7 +84,8 @@ class PriorityFusionTest : public HloHardwareIndependentTestBase {
     GpuHloCostAnalysis::Options options;
     options.count_multiple_input_accesses = true;
     return PriorityFusion(/*thread_pool=*/nullptr, device_info_, &alias_info_,
-                          options, &mlir_context_);
+                          options, &mlir_context_,
+                          kDefaultMaxOperandsAndOutputsPerFusion);
   }();
 };
 
@@ -1466,7 +1467,7 @@ TEST_F(PriorityFusionWithTritonEnabledTest, DoNotFuseIntoRoot) {
 TEST_F(PriorityFusionWithTritonEnabledTest, LimitNumberOfParameters) {
   std::string module_text =
       "HloModule m\n\nENTRY main {\nadd0 = f32[] parameter(0)\n";
-  for (int64_t i = 1; i <= MaxOperandsAndOutputsPerFusion(); ++i) {
+  for (int64_t i = 1; i <= kDefaultMaxOperandsAndOutputsPerFusion; ++i) {
     module_text += absl::StrFormat("p%d = f32[] parameter(%d)\n", i, i);
     module_text +=
         absl::StrFormat("add%d = f32[] add(add%d, p%d)\n", i, i - 1, i);
@@ -1479,7 +1480,7 @@ TEST_F(PriorityFusionWithTritonEnabledTest, LimitNumberOfParameters) {
   // Assert that there is not just a single fusion with all parameters as
   // operands.
   HloInstruction* root = module->entry_computation()->root_instruction();
-  EXPECT_LE(root->operand_count(), MaxOperandsAndOutputsPerFusion());
+  EXPECT_LE(root->operand_count(), kDefaultMaxOperandsAndOutputsPerFusion);
 }
 
 TEST_F(PriorityFusionWithTritonEnabledTest,
@@ -1500,9 +1501,13 @@ TEST_F(PriorityFusionWithTritonEnabledTest,
   tsl::thread::ThreadPool pool(tsl::Env::Default(), "priority-fusion-test", 8);
   GpuHloCostAnalysis::Options options;
   options.count_multiple_input_accesses = true;
-  PriorityFusion priority_fusion_with_thread_pool{/*thread_pool=*/&pool,
-                                                  device_info_, &alias_info_,
-                                                  options, &mlir_context_};
+  PriorityFusion priority_fusion_with_thread_pool{
+      /*thread_pool=*/&pool,
+      device_info_,
+      &alias_info_,
+      options,
+      &mlir_context_,
+      kDefaultMaxOperandsAndOutputsPerFusion};
   module->mutable_config()
       .mutable_debug_options()
       .set_xla_gpu_unsupported_enable_triton_multi_output_fusion(true);
@@ -1560,7 +1565,8 @@ ENTRY main.4 {
   GpuHloCostAnalysis::Options options;
   options.count_multiple_input_accesses = true;
   PriorityFusion priority_fusion(nullptr, device_info_, &alias_info_, options,
-                                 &mlir_context_);
+                                 &mlir_context_,
+                                 kDefaultMaxOperandsAndOutputsPerFusion);
   HloModuleConfig config;
   config.mutable_debug_options()
       .set_xla_gpu_experimental_enable_triton_heroless_priority_fusion(true);

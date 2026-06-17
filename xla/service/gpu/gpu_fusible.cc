@@ -762,8 +762,8 @@ static int64_t NumUnnestedReductions(const HloInstruction& instr,
 // big temp buffer versus in other allocations.
 //
 // As a heuristic, we simply cap the number of fusion operands plus outputs at
-// MaxOperandsAndOutputsPerFusion().  This puts an upper bound on the number of
-// parameters to the kernel, working around the correctness problem.
+// a configured operands-plus-outputs limit. This puts an upper bound on the
+// number of parameters to the kernel, working around the correctness problem.
 //
 // This limit is also often good for performance.  In a fusion with many
 // operands, each GPU thread likely has to do a lot of work, and so possibly
@@ -774,7 +774,8 @@ static int64_t NumUnnestedReductions(const HloInstruction& instr,
 // to true to enable more fusion.
 FusionDecision FusionFitsInParameterLimit(const HloInstruction& instr1,
                                           const HloInstruction& instr2,
-                                          bool is_consumer_producer_fusion) {
+                                          bool is_consumer_producer_fusion,
+                                          int64_t max_operands_and_outputs) {
   // Compute the number of outputs of the (possibly multi-output) fusion node
   // we're considering creating.
   //
@@ -788,7 +789,7 @@ FusionDecision FusionFitsInParameterLimit(const HloInstruction& instr1,
   //    fusion.
   //
   // But because this is a heuristic and our limit
-  // MaxOperandsAndOutputsPerFusion() is a large value (so +/- 1 doesn't make a
+  // max_operands_and_outputs is a large value (so +/- 1 doesn't make a
   // big difference), we ignore this small inaccuracy in favor of simplicity.
   int64_t num_output_buffers = ShapeUtil::SubshapeCount(instr1.shape()) +
                                ShapeUtil::SubshapeCount(instr2.shape());
@@ -802,7 +803,7 @@ FusionDecision FusionFitsInParameterLimit(const HloInstruction& instr1,
   // number of operands, which can be expensive.
   if (instr1.operand_count() + instr2.operand_count() - 1 +
           num_output_buffers <=
-      MaxOperandsAndOutputsPerFusion()) {
+      max_operands_and_outputs) {
     return FusionDecision::Allow();
   } else {
     VLOG(5) << "Operand count of "
@@ -810,8 +811,7 @@ FusionDecision FusionFitsInParameterLimit(const HloInstruction& instr1,
             << " and ( " << instr2.ToString()
             << " ) = " << instr2.operand_count()
             << " and num_output_buffers = " << num_output_buffers
-            << " is bigger than the bound of "
-            << MaxOperandsAndOutputsPerFusion();
+            << " is bigger than the bound of " << max_operands_and_outputs;
   }
 
   // Compute the precise number of operands to the new fusion.
@@ -833,7 +833,7 @@ FusionDecision FusionFitsInParameterLimit(const HloInstruction& instr1,
   }
 
   // Does the new fusion have more operands and outputs than the max?
-  if (operands.size() + num_output_buffers > MaxOperandsAndOutputsPerFusion()) {
+  if (operands.size() + num_output_buffers > max_operands_and_outputs) {
     return FusionDecision::Forbid(
         "Number of operands and output buffers is larger than allowed budget "
         "per fusion");
@@ -852,7 +852,8 @@ FusionDecision FusionFitsInBudget(const HloInstruction& instr1,
                                   const HloInstruction& instr2,
                                   const se::DeviceDescription& device_info,
                                   bool is_consumer_producer_fusion,
-                                  FusionInfoCache* cache /*=nullptr*/) {
+                                  FusionInfoCache* cache /*=nullptr*/,
+                                  int64_t max_operands_and_outputs) {
   if (SharedMemoryUsage(instr1, cache, device_info) +
           SharedMemoryUsage(instr2, cache, device_info) >
       device_info.shared_memory_per_block()) {
@@ -868,8 +869,8 @@ FusionDecision FusionFitsInBudget(const HloInstruction& instr1,
            << kMaxUnnestedReductionOutputsPerFusion
            << " unnested reductions in fusion";
   }
-  return FusionFitsInParameterLimit(instr1, instr2,
-                                    is_consumer_producer_fusion);
+  return FusionFitsInParameterLimit(instr1, instr2, is_consumer_producer_fusion,
+                                    max_operands_and_outputs);
 }
 
 bool IsFusibleAsMultiOutputFusionRoot(

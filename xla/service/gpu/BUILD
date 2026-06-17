@@ -1705,6 +1705,7 @@ cc_library(
         ":gpu_executable",
         ":gpu_executable_proto_cc",
         ":gpu_float_support",
+        ":gpu_fusible",
         ":gpu_hlo_schedule",
         ":gpu_latency_hiding_scheduler",
         ":gpu_memory_space_assignment",

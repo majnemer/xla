@@ -36,6 +36,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/pass/hlo_pass_pipeline.h"
 #include "xla/service/compiler.h"
+#include "xla/service/gpu/gpu_fusible.h"
 #include "xla/service/hlo_cost_analysis.h"
 #include "xla/shape_util.h"
 #include "xla/tools/hlo_decomposer.h"
@@ -122,7 +123,8 @@ absl::Status FissionBackend::RunPriorityFusion(HloModule* module) {
   priority_fusion_options.count_multiple_input_accesses = true;
   PriorityFusion priority_fusion(
       /*thread_pool=*/nullptr, target_config().device_description, alias_info_,
-      priority_fusion_options, mlir_context_);
+      priority_fusion_options, mlir_context_,
+      kDefaultMaxOperandsAndOutputsPerFusion);
   return priority_fusion.Run(module).status();
 }
 

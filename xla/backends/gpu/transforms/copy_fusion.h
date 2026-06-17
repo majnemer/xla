@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef XLA_BACKENDS_GPU_TRANSFORMS_COPY_FUSION_H_
 #define XLA_BACKENDS_GPU_TRANSFORMS_COPY_FUSION_H_
 
+#include <cstdint>
 #include <memory>
 
 #include "absl/container/flat_hash_set.h"
@@ -34,8 +35,11 @@ namespace gpu {
 // those copies to the fusion, replacing the copies with get_tuple_elements.
 class CopyFusion : public HloModulePass {
  public:
-  explicit CopyFusion(const se::DeviceDescription& device_description)
-      : device_description_(device_description) {}
+  explicit CopyFusion(const se::DeviceDescription& device_description,
+                      int64_t max_operands_and_outputs_per_fusion)
+      : device_description_(device_description),
+        max_operands_and_outputs_per_fusion_(
+            max_operands_and_outputs_per_fusion) {}
 
   absl::string_view name() const override { return "copy_fusion"; }
 
@@ -49,6 +53,7 @@ class CopyFusion : public HloModulePass {
                                     std::unique_ptr<CallGraph> call_graph);
 
   const se::DeviceDescription& device_description_;
+  const int64_t max_operands_and_outputs_per_fusion_;
 };
 
 }  // namespace gpu

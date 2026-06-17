@@ -55,6 +55,7 @@ limitations under the License.
 #include "xla/service/gpu/alias_info.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/fusion_pipeline.h"
+#include "xla/service/gpu/gpu_fusible.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/gpu/model/fusion_analysis_cache.h"
 #include "xla/service/gpu/model/gpu_hlo_cost_analysis.h"
@@ -287,7 +288,7 @@ absl::Status RunFusionPipeline(
 
   return FusionPipeline(module->config().debug_options(), shape_size,
                         alias_info, /*thread_pool=*/nullptr, device_info,
-                        mlir_context)
+                        mlir_context, kDefaultMaxOperandsAndOutputsPerFusion)
       .Run(module)
       .status();
 }

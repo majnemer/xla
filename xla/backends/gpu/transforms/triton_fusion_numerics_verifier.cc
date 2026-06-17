@@ -49,6 +49,7 @@ limitations under the License.
 #include "xla/service/dump.h"
 #include "xla/service/executable.h"
 #include "xla/service/gpu/backend_configs.pb.h"
+#include "xla/service/gpu/gpu_fusible.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/hlo_cost_analysis.h"
 #include "xla/service/hlo_cse.h"
@@ -135,7 +136,8 @@ absl::StatusOr<std::unique_ptr<HloModule>> NewHloModuleFromFusionComputation(
   RETURN_IF_ERROR(tree_reduction_rewriter.Run(new_module.get()).status());
   PriorityFusion fusion_pass(
       /*thread_pool=*/nullptr, gpu_device_info, alias_info,
-      HloCostAnalysis::Options{}, mlir_context);
+      HloCostAnalysis::Options{}, mlir_context,
+      kDefaultMaxOperandsAndOutputsPerFusion);
   RETURN_IF_ERROR(fusion_pass.Run(new_module.get()).status());
 
   // If the priority fusion pass above skipped some instructions, turn them

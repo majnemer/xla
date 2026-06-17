@@ -40,7 +40,8 @@ namespace gpu {
 
 HloPassPipeline PreSchedulingCopyInsertionPipeline(
     const HloModuleConfig& config, const GpuAliasInfo* alias_info,
-    const se::DeviceDescription& device_description) {
+    const se::DeviceDescription& device_description,
+    int64_t max_operands_and_outputs_per_fusion) {
   const DebugOptions& debug_options = config.debug_options();
 
   // In some cases, we have to place the result of an instruction in a temporary
@@ -77,7 +78,8 @@ HloPassPipeline PreSchedulingCopyInsertionPipeline(
     pipeline.AddPass<CopyInsertion>(alias_info);
   }
 
-  pipeline.AddPass<CopyFusion>(device_description);
+  pipeline.AddPass<CopyFusion>(device_description,
+                               max_operands_and_outputs_per_fusion);
   pipeline.AddPass<SanitizeConstantNames>();
   return pipeline;
 }

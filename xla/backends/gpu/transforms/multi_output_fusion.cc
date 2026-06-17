@@ -127,7 +127,8 @@ FusionDecision ParameterSlicesAreNonOverlapping(const HloInstruction& instr1,
 FusionDecision LegalToFuse(const HloInstruction& instr1,
                            const HloInstruction& instr2,
                            const se::DeviceDescription& device_info,
-                           FusionInfoCache* fusion_info_cache) {
+                           FusionInfoCache* fusion_info_cache,
+                           int64_t max_operands_and_outputs_per_fusion) {
   CHECK(instr1.opcode() == HloOpcode::kFusion);
 
   // The emitter only supports in-place DUS for fusions with a single DUS at the
@@ -145,7 +146,8 @@ FusionDecision LegalToFuse(const HloInstruction& instr1,
   // Do this check last, as it may be expensive.
   return FusionFitsInBudget(instr1, instr2, device_info,
                             /*is_consumer_producer_fusion=*/false,
-                            fusion_info_cache);
+                            fusion_info_cache,
+                            max_operands_and_outputs_per_fusion);
 }
 
 // We prefer multi-output fusions over other fusions over unfused ops, because
@@ -201,7 +203,8 @@ FusionDecision ProducerCandidateIsFusible(
     const HloDfsReachability& reachability, FusionInfoCache* fusion_info_cache,
     const se::DeviceDescription& device_info,
     GpuPerformanceModel& gpu_performance_model,
-    GpuHloCostAnalysis* cost_analysis) {
+    GpuHloCostAnalysis* cost_analysis,
+    int64_t max_operands_and_outputs_per_fusion) {
   if (!IsFusibleAsMultiOutputFusionRoot(consumer, device_info)) {
     return FusionDecision::Forbid(
         "consumer not eligible as multi-output fusion root.");
@@ -215,7 +218,8 @@ FusionDecision ProducerCandidateIsFusible(
 
   RETURN_IF_NOT_FUSIBLE(FusionFitsInBudget(
       producer, consumer, device_info,
-      /*is_consumer_producer_fusion=*/false, fusion_info_cache));
+      /*is_consumer_producer_fusion=*/false, fusion_info_cache,
+      max_operands_and_outputs_per_fusion));
 
   if (cost_analysis->ProducerConsumerMergedTooLarge(producer, consumer)) {
     return FusionDecision::Forbid("will generate too large IR");
@@ -236,7 +240,8 @@ std::vector<HloInstruction*> GetProducerConsumerMultiOutputFusionCandidates(
     FusionInfoCache* fusion_info_cache,
     const se::DeviceDescription& device_info, const GpuAliasInfo* alias_info,
     GpuPerformanceModel& gpu_performance_model,
-    GpuHloCostAnalysis* cost_analysis) {
+    GpuHloCostAnalysis* cost_analysis,
+    int64_t max_operands_and_outputs_per_fusion) {
   std::vector<HloInstruction*> fusion_candidates;
   const HloComputation* computation = producer->parent();
   const HloModule* module = computation->parent();
@@ -263,7 +268,8 @@ std::vector<HloInstruction*> GetProducerConsumerMultiOutputFusionCandidates(
 
     if (auto decision = ProducerCandidateIsFusible(
             *producer, *consumer, reachability, fusion_info_cache, device_info,
-            gpu_performance_model, cost_analysis)) {
+            gpu_performance_model, cost_analysis,
+            max_operands_and_outputs_per_fusion)) {
       fusion_candidates.push_back(consumer);
     } else if (dump_fusion) {
       RegisterFusionState(
@@ -297,7 +303,8 @@ FusionDecision CanFuseSiblings(const HloInstruction& sibling_consumer_1,
                                const HloInstruction& common_producer,
                                const HloDfsReachability& reachability,
                                FusionInfoCache* fusion_info_cache,
-                               const se::DeviceDescription& device_info) {
+                               const se::DeviceDescription& device_info,
+                               int64_t max_operands_and_outputs_per_fusion) {
   if (reachability.IsConnected(&sibling_consumer_1, &sibling_consumer_2)) {
     return FusionDecision::Forbid(
         absl::StrCat(sibling_consumer_1.name(), " and ",
@@ -318,7 +325,8 @@ FusionDecision CanFuseSiblings(const HloInstruction& sibling_consumer_1,
 
   // This check should be last, as it may be expensive.
   RETURN_IF_NOT_FUSIBLE(LegalToFuse(sibling_consumer_1, sibling_consumer_2,
-                                    device_info, fusion_info_cache));
+                                    device_info, fusion_info_cache,
+                                    max_operands_and_outputs_per_fusion));
   return FusionDecision::Allow();
 }
 
@@ -365,7 +373,8 @@ bool MultiOutputFusion::FuseSiblings(
       VLOG(3) << "Considering " << (*i)->name() << " and " << (*j)->name();
 
       if (auto fusible = CanFuseSiblings(**i, **j, *parent, *reachability_,
-                                         fusion_info_cache, device_info_);
+                                         fusion_info_cache, device_info_,
+                                         max_operands_and_outputs_per_fusion_);
           !fusible) {
         // We pick `j` arbitrarily as a consumer.
         if (dump_fusion) {
@@ -471,7 +480,8 @@ absl::StatusOr<bool> MultiOutputFusion::DoMultiOutputFusion() {
     // traversal, and hence, not get into the way of subsequent fusion attempts.
     const auto candidates = GetProducerConsumerMultiOutputFusionCandidates(
         producer, *reachability_, &fusion_info_cache, device_info_, alias_info_,
-        gpu_performance_model, &cost_analysis);
+        gpu_performance_model, &cost_analysis,
+        max_operands_and_outputs_per_fusion_);
     auto* consumer_for_fusion = SelectPreferredFusionCandidate(candidates);
     if (consumer_for_fusion == nullptr) {
       continue;

@@ -46,7 +46,7 @@ class CopyFusionTest : public HloHardwareIndependentTestBase {
  public:
   CopyFusionTest()
       : device_description_(TestGpuDeviceInfo::RTXA6000DeviceInfo()),
-        cf_(device_description_) {}
+        cf_(device_description_, kDefaultMaxOperandsAndOutputsPerFusion) {}
   const stream_executor::DeviceDescription device_description_;
   CopyFusion cf_;
 
@@ -90,6 +90,10 @@ class CopyFusionTest : public HloHardwareIndependentTestBase {
 
   // Helper function to create a fusion with a specified number of copies.
   bool CreateFusionWithNumCopies(int64_t num_copies) {
+    return CreateFusionWithNumCopies(num_copies, cf_);
+  }
+
+  bool CreateFusionWithNumCopies(int64_t num_copies, CopyFusion& copy_fusion) {
     auto module = CreateNewVerifiedModule();
     Shape shape = ShapeUtil::MakeShape(F32, {16, 32});
 
@@ -118,7 +122,7 @@ class CopyFusionTest : public HloHardwareIndependentTestBase {
     entry_builder.AddInstruction(HloInstruction::CreateTuple(copies));
     module->AddEntryComputation(entry_builder.Build());
 
-    return cf_.Run(module.get()).value();
+    return copy_fusion.Run(module.get()).value();
   }
 };
 
@@ -631,23 +635,33 @@ TEST_F(CopyFusionTest, CopyFusionWithFusionReturningTupleAndOtherUser) {
 }
 
 TEST_F(CopyFusionTest, FusionFitsInBudget) {
-  const int64_t max_operands = MaxOperandsAndOutputsPerFusion();
+  const int64_t max_operands = kDefaultMaxOperandsAndOutputsPerFusion;
   EXPECT_TRUE(CreateFusionAndRunCopyFusion(max_operands - 2));
 }
 
 TEST_F(CopyFusionTest, FusionExceedsBudget) {
-  const int64_t max_operands = MaxOperandsAndOutputsPerFusion();
+  const int64_t max_operands = kDefaultMaxOperandsAndOutputsPerFusion;
   EXPECT_FALSE(CreateFusionAndRunCopyFusion(max_operands - 1));
 }
 
 TEST_F(CopyFusionTest, CopyFusionWithFewerThanMaxCopies) {
-  const int64_t max_copies = MaxOperandsAndOutputsPerFusion() - 1;
+  const int64_t max_copies = kDefaultMaxOperandsAndOutputsPerFusion - 1;
   EXPECT_TRUE(CreateFusionWithNumCopies(max_copies));
 }
 
 TEST_F(CopyFusionTest, CopyFusionWithMoreThanMaxCopies) {
-  const int64_t max_copies = MaxOperandsAndOutputsPerFusion();
+  const int64_t max_copies = kDefaultMaxOperandsAndOutputsPerFusion;
   EXPECT_FALSE(CreateFusionWithNumCopies(max_copies));
+}
+
+TEST_F(CopyFusionTest, CopyFusionUsesConfiguredOutputBudget) {
+  CopyFusion copy_fusion(device_description_,
+                         /*max_operands_and_outputs_per_fusion=*/31);
+
+  const int64_t max_copies = 31 - 1;
+  EXPECT_EQ(max_copies, 30);
+  EXPECT_TRUE(CreateFusionWithNumCopies(max_copies, copy_fusion));
+  EXPECT_FALSE(CreateFusionWithNumCopies(max_copies + 1, copy_fusion));
 }
 
 TEST_F(CopyFusionTest, PropagateOriginalValue) {

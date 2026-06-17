@@ -143,6 +143,8 @@ class GpuCompiler : public virtual Compiler {
   }
 
  protected:
+  virtual int64_t MaxOperandsAndOutputsPerFusion() const;
+
   // Virtual seam: produce a fully-built GpuExecutable for a scheduled module.
   // The shared RunBackend handles topology inference, annotations, and post-
   // build dumping; this hook owns codegen and executable construction.
