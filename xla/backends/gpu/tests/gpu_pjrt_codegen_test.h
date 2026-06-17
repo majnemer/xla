@@ -35,8 +35,11 @@ namespace xla::gpu {
 class GpuPjRtCodegenTest : public HloPjRtGpuTestBase {
  public:
   GpuPjRtCodegenTest() {
-    is_built_with_rocm_ =
-        device_description().gpu_compute_capability().IsRocm();
+    const auto& compute_capability =
+        device_description().gpu_compute_capability();
+    is_built_with_cuda_ = compute_capability.IsCuda();
+    is_built_with_rocm_ = compute_capability.IsRocm();
+    is_built_with_metal_ = compute_capability.IsMetal();
     compile_options_.gpu_topology = GetSingleDeviceGpuTopology(
         /*platform_version=*/"", gpu_target_config());
     compile_options_.early_exit_with_layouts = false;
@@ -77,7 +80,9 @@ class GpuPjRtCodegenTest : public HloPjRtGpuTestBase {
                                   bool match_optimized_ir = false,
                                   bool run_optimization_passes = true);
 
+  bool is_built_with_cuda_{false};
   bool is_built_with_rocm_{false};
+  bool is_built_with_metal_{false};
 
  private:
   Compiler::CompileOptions compile_options_;

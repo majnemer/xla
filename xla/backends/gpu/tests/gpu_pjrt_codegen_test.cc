@@ -35,6 +35,7 @@ limitations under the License.
 #include "xla/service/hlo_module_config.h"
 #include "xla/service/llvm_compiler.h"
 #include "xla/shape_util.h"
+#include "xla/stream_executor/platform_manager.h"
 #include "xla/tests/codegen_utils.h"
 #include "xla/xla.pb.h"
 
@@ -72,10 +73,9 @@ void GpuPjRtCodegenTest::CompileAndOptionallyVerifyPtx(
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<Executable> executable,
                        std::move(status_or_executable));
 
-  // On the ROCM platform the "ptx" string is not populated for the compiled
-  // executable, and hence the "ptx_str" will be empty. So disabling the
-  // pattern check on the ROCm platform
-  if (!is_built_with_rocm_) {
+  // PTX is only populated by CUDA. ROCm and Metal still compile the executable,
+  // but do not run CUDA PTX FileCheck patterns.
+  if (is_built_with_cuda_) {
     absl::StatusOr<bool> filecheck_result = RunFileCheck(ptx_str, pattern);
     ASSERT_TRUE(filecheck_result.ok());
     EXPECT_TRUE(filecheck_result.value());
@@ -109,9 +109,21 @@ std::string GpuPjRtCodegenTest::MakePlatformSpecificLlvm(
 absl::StatusOr<std::unique_ptr<Executable>>
 GpuPjRtCodegenTest::CompileToExecutable(std::unique_ptr<HloModule> hlo_module,
                                         bool run_optimization_passes) {
-  return xla::CompileToExecutable(compiler(), compile_options_,
-                                  std::move(hlo_module),
-                                  run_optimization_passes);
+  se::StreamExecutor* executor = nullptr;
+  if (is_built_with_metal_) {
+    ASSIGN_OR_RETURN(se::Platform * platform,
+                     se::PlatformManager::PlatformWithId(
+                         stream_executor_platform_id()));
+    ASSIGN_OR_RETURN(executor, platform->ExecutorForDevice(0));
+  }
+
+  if (run_optimization_passes) {
+    ASSIGN_OR_RETURN(hlo_module, compiler()->RunHloPasses(
+                                     std::move(hlo_module), executor,
+                                     compile_options_));
+  }
+  return compiler()->RunBackend(std::move(hlo_module), executor,
+                                compile_options_);
 }
 
 absl::Status GpuPjRtCodegenTest::CompileAndVerifyIr(

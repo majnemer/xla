@@ -78,6 +78,7 @@ cc_library(
         "//xla/service:hlo_module_config",
         "//xla/service:llvm_compiler",
         "//xla/service/gpu:gpu_compiler",
+        "//xla/stream_executor:platform_manager",
         "//xla/tests:codegen_utils",
         "//xla/tsl/platform:status_macros",
         "@com_google_absl//absl/base",

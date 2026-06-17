@@ -29,11 +29,13 @@ limitations under the License.
 #include "absl/strings/substitute.h"
 #include "xla/service/platform_util.h"
 #include "xla/stream_executor/device_address.h"
+#include "xla/stream_executor/cuda/cuda_platform_id.h"
 #include "xla/stream_executor/gpu/kernel_serialization_check.h"
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/kernel_args.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_manager.h"
+#include "xla/stream_executor/rocm/rocm_platform_id.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/lib/core/status_test_util.h"
@@ -74,6 +76,11 @@ PrimitiveType Get(float) { return PrimitiveType::F32; }
 
 PrimitiveType Get(bfloat16) { return PrimitiveType::BF16; }
 
+bool TopKRuntimeKernelSupported(se::Platform* platform) {
+  return platform->id() == se::cuda::kCudaPlatformId ||
+         platform->id() == se::rocm::kROCmPlatformId;
+}
+
 // Params:
 //  - n_kb: number of elements in kilobytes.
 //  - k: number of elements to return.
@@ -90,6 +97,9 @@ TEST_P(TopKKernelTest, TopKFloat) {
   auto name =
       absl::AsciiStrToUpper(PlatformUtil::CanonicalPlatformName("gpu").value());
   se::Platform* platform = se::PlatformManager::PlatformWithName(name).value();
+  if (!TopKRuntimeKernelSupported(platform)) {
+    GTEST_SKIP() << "TopK runtime kernel is only registered for CUDA and ROCm.";
+  }
   se::StreamExecutor* executor = platform->ExecutorForDevice(0).value();
 
   auto stream = executor->CreateStream().value();
@@ -112,20 +122,21 @@ TEST_P(TopKKernelTest, TopKFloat) {
       stream->MemZero(&output_indices, k * batch_size * sizeof(uint32_t)));
 
   TF_ASSERT_OK_AND_ASSIGN(auto desc, platform->DescriptionForDevice(0));
-  auto custom_kernel =
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto custom_kernel,
       GetTopKKernel("topk", PrimitiveType::F32, n, k, batch_size,
-                    platform->Name(), desc->threads_per_warp());
+                    platform->Name(), desc->threads_per_warp()));
 
   TF_ASSERT_OK_AND_ASSIGN(auto kernel,
-                          executor->LoadKernel(custom_kernel->kernel_spec()));
+                          executor->LoadKernel(custom_kernel.kernel_spec()));
 
   // Launch topk kernel with device memory arguments.
   stream_executor::KernelArgsDeviceAddressArray arr(
       std::vector<se::DeviceAddressBase>(
           {input_buffer, output_values, output_indices}),
-      custom_kernel->shared_memory_bytes());
-  TF_ASSERT_OK(kernel->Launch(custom_kernel->thread_dims(),
-                              custom_kernel->block_dims(), stream.get(), arr));
+      custom_kernel.shared_memory_bytes());
+  TF_ASSERT_OK(kernel->Launch(custom_kernel.thread_dims(),
+                              custom_kernel.block_dims(), stream.get(), arr));
 
   std::vector<T> got(k);
   ASSERT_TRUE(stream->BlockHostUntilDone().ok());
@@ -146,6 +157,9 @@ TEST_P(TopKKernelTest, TopKPackedNegative) {
   auto name =
       absl::AsciiStrToUpper(PlatformUtil::CanonicalPlatformName("gpu").value());
   se::Platform* platform = se::PlatformManager::PlatformWithName(name).value();
+  if (!TopKRuntimeKernelSupported(platform)) {
+    GTEST_SKIP() << "TopK runtime kernel is only registered for CUDA and ROCm.";
+  }
   se::StreamExecutor* executor = platform->ExecutorForDevice(0).value();
 
   auto stream = executor->CreateStream().value();
@@ -168,20 +182,21 @@ TEST_P(TopKKernelTest, TopKPackedNegative) {
       stream->MemZero(&output_indices, k * batch_size * sizeof(uint32_t)));
 
   TF_ASSERT_OK_AND_ASSIGN(auto desc, platform->DescriptionForDevice(0));
-  auto custom_kernel =
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto custom_kernel,
       GetTopKKernel("topk", PrimitiveType::F32, n, k, batch_size,
-                    platform->Name(), desc->threads_per_warp());
+                    platform->Name(), desc->threads_per_warp()));
 
   TF_ASSERT_OK_AND_ASSIGN(auto kernel,
-                          executor->LoadKernel(custom_kernel->kernel_spec()));
+                          executor->LoadKernel(custom_kernel.kernel_spec()));
 
   // Launch topk kernel with device memory arguments.
   stream_executor::KernelArgsDeviceAddressArray arr(
       std::vector<se::DeviceAddressBase>(
           {input_buffer, output_values, output_indices}),
-      custom_kernel->shared_memory_bytes());
-  TF_ASSERT_OK(kernel->Launch(custom_kernel->thread_dims(),
-                              custom_kernel->block_dims(), stream.get(), arr));
+      custom_kernel.shared_memory_bytes());
+  TF_ASSERT_OK(kernel->Launch(custom_kernel.thread_dims(),
+                              custom_kernel.block_dims(), stream.get(), arr));
 
   std::vector<T> got(k);
   ASSERT_TRUE(stream->BlockHostUntilDone().ok());
@@ -200,16 +215,20 @@ TEST_P(TopKKernelTest, EnsureSerializable) {
   auto name =
       absl::AsciiStrToUpper(PlatformUtil::CanonicalPlatformName("gpu").value());
   se::Platform* platform = se::PlatformManager::PlatformWithName(name).value();
+  if (!TopKRuntimeKernelSupported(platform)) {
+    GTEST_SKIP() << "TopK runtime kernel is only registered for CUDA and ROCm.";
+  }
 
   const auto [n_kb, k, batch_size, offset] = GetParam();
   const size_t n = n_kb * 1024 + offset;
 
   TF_ASSERT_OK_AND_ASSIGN(auto desc, platform->DescriptionForDevice(0));
-  auto custom_kernel =
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto custom_kernel,
       GetTopKKernel("topk", PrimitiveType::F32, n, k, batch_size,
-                    platform->Name(), desc->threads_per_warp());
+                    platform->Name(), desc->threads_per_warp()));
 
-  stream_executor::gpu::VerifyKernelIsSerializable(custom_kernel->kernel_spec(),
+  stream_executor::gpu::VerifyKernelIsSerializable(custom_kernel.kernel_spec(),
                                                    platform->id());
 }
 
