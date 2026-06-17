@@ -76,6 +76,7 @@ TEST(RngSeedThunkTest, ExecuteExplicitSeed) {
 
   uint64_t result = 0;
   ASSERT_OK(stream->Memcpy(&result, dest, sizeof(uint64_t)));
+  ASSERT_OK(stream->BlockHostUntilDone());
   EXPECT_EQ(result, kExplicitSeed);
 }
 
@@ -109,6 +110,7 @@ TEST(RngSeedThunkTest, ExecuteRandomSeed) {
 
   uint64_t result = 0;
   ASSERT_OK(stream->Memcpy(&result, dest, sizeof(uint64_t)));
+  ASSERT_OK(stream->BlockHostUntilDone());
   EXPECT_NE(result, 0);
 }
 
