@@ -32,6 +32,7 @@ limitations under the License.
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/PatternMatch.h"
@@ -99,8 +100,8 @@ mlir::Attribute IntegerValueAttr(mlir::OpBuilder& builder, mlir::Type type,
 mlir::Value ConstantIntLike(mlir::ImplicitLocOpBuilder& builder,
                             mlir::Type type, uint64_t value) {
   return ma::ConstantOp::create(
-      builder, type, mlir::cast<mlir::TypedAttr>(
-                         IntegerValueAttr(builder, type, value)));
+      builder, type,
+      mlir::cast<mlir::TypedAttr>(IntegerValueAttr(builder, type, value)));
 }
 
 mlir::Value MaskLowBits(mlir::Value value, int bit_width,
@@ -133,8 +134,7 @@ mlir::Value SignExtendLowBitsToI8(mlir::Value value, int bit_width,
                             sign);
 }
 
-std::optional<uint64_t> GetRawSubByteBits(mlir::Attribute attr,
-                                          int bit_width) {
+std::optional<uint64_t> GetRawSubByteBits(mlir::Attribute attr, int bit_width) {
   uint64_t mask = (uint64_t{1} << bit_width) - 1;
   if (auto int_attr = mlir::dyn_cast<mlir::IntegerAttr>(attr)) {
     return int_attr.getValue().getZExtValue() & mask;
@@ -167,8 +167,7 @@ mlir::TypedAttr ConvertSubByteAttrToStorage(mlir::TypedAttr attr,
   }
 
   auto elements = mlir::dyn_cast<mlir::DenseElementsAttr>(attr);
-  auto converted_shaped_type =
-      mlir::dyn_cast<mlir::ShapedType>(converted_type);
+  auto converted_shaped_type = mlir::dyn_cast<mlir::ShapedType>(converted_type);
   if (!elements || !converted_shaped_type) return {};
 
   llvm::SmallVector<mlir::Attribute> converted_values;
@@ -186,8 +185,8 @@ mlir::TypedAttr ConvertSubByteAttrToStorage(mlir::TypedAttr attr,
       if (!bits) return {};
       int64_t byte_index = index / elements_per_byte;
       int shift = (index % elements_per_byte) * *bit_width;
-      auto old_value = mlir::cast<mlir::IntegerAttr>(
-          converted_values[byte_index]);
+      auto old_value =
+          mlir::cast<mlir::IntegerAttr>(converted_values[byte_index]);
       uint64_t packed =
           old_value.getValue().getZExtValue() | ((*bits & mask) << shift);
       converted_values[byte_index] = mlir::IntegerAttr::get(i8_type, packed);
@@ -228,8 +227,7 @@ class SubByteStorageTypeConverter : public mlir::TypeConverter {
     });
 
     addConversion([context](mlir::RankedTensorType type) -> mlir::Type {
-      std::optional<int> bit_width =
-          GetSubByteBitWidth(type.getElementType());
+      std::optional<int> bit_width = GetSubByteBitWidth(type.getElementType());
       if (!bit_width) return type;
       if (!type.hasStaticShape()) return mlir::Type{};
       return mlir::RankedTensorType::get(
@@ -252,8 +250,8 @@ class SubByteStorageTypeConverter : public mlir::TypeConverter {
 std::pair<mlir::Value, mlir::Value> GetPackedByteIndexAndShift(
     mlir::Value logical_index, int bit_width,
     mlir::ImplicitLocOpBuilder& builder) {
-  mlir::Value linear = ma::IndexCastUIOp::create(builder, builder.getI64Type(),
-                                                 logical_index);
+  mlir::Value linear =
+      ma::IndexCastUIOp::create(builder, builder.getI64Type(), logical_index);
   mlir::Value byte_index_i64 = ma::ShRUIOp::create(
       builder, linear,
       ma::ConstantIntOp::create(builder, builder.getI64Type(),
@@ -267,9 +265,8 @@ std::pair<mlir::Value, mlir::Value> GetPackedByteIndexAndShift(
       ma::ConstantIntOp::create(builder, builder.getI64Type(), bit_width));
   mlir::Value shift =
       ma::TruncIOp::create(builder, builder.getI8Type(), shift_i64);
-  mlir::Value byte_index =
-      ma::IndexCastUIOp::create(builder, builder.getIndexType(),
-                                byte_index_i64);
+  mlir::Value byte_index = ma::IndexCastUIOp::create(
+      builder, builder.getIndexType(), byte_index_i64);
   return {byte_index, shift};
 }
 
@@ -297,27 +294,82 @@ mlir::Value InsertSubByteElement(mlir::Value value, mlir::Value packed_tensor,
       GetPackedByteIndexAndShift(logical_index, bit_width, builder);
   mlir::Value low_bits = MaskLowBits(value, bit_width, builder);
   mlir::Value shifted_value = ma::ShLIOp::create(builder, low_bits, shift);
-  mlir::Value mask = ma::ShLIOp::create(
-      builder,
-      ConstantIntLike(builder, builder.getI8Type(),
-                      (uint64_t{1} << bit_width) - 1),
-      shift);
-  mlir::Value inverse_mask =
-      ma::XOrIOp::create(builder, ConstantIntLike(builder, builder.getI8Type(),
-                                                 0xff),
-                         mask);
+  mlir::Value mask =
+      ma::ShLIOp::create(builder,
+                         ConstantIntLike(builder, builder.getI8Type(),
+                                         (uint64_t{1} << bit_width) - 1),
+                         shift);
+  mlir::Value inverse_mask = ma::XOrIOp::create(
+      builder, ConstantIntLike(builder, builder.getI8Type(), 0xff), mask);
 
-  auto atomic_rmw = ::xla::AtomicRMWOp::create(builder, packed_tensor,
-                                              byte_index);
+  auto atomic_rmw =
+      ::xla::AtomicRMWOp::create(builder, packed_tensor, byte_index);
   mlir::ImplicitLocOpBuilder body_builder(atomic_rmw.getLoc(),
                                           atomic_rmw.getBodyBuilder());
-  mlir::Value preserved =
-      ma::AndIOp::create(body_builder, atomic_rmw.getCurrentValue(),
-                         inverse_mask);
+  mlir::Value preserved = ma::AndIOp::create(
+      body_builder, atomic_rmw.getCurrentValue(), inverse_mask);
   mlir::Value merged =
       ma::OrIOp::create(body_builder, preserved, shifted_value);
   ::xla::YieldOp::create(body_builder, merged.getLoc(), merged);
   return atomic_rmw.getResult();
+}
+
+bool IsDefinedInRegion(mlir::Value value, mlir::Region& region) {
+  mlir::Region* parent_region = value.getParentRegion();
+  return parent_region != nullptr && region.isAncestor(parent_region);
+}
+
+bool IsIntegerCast(mlir::Type src_type, mlir::Type dst_type) {
+  return mlir::isa<mlir::IntegerType>(mlir::getElementTypeOrSelf(src_type)) &&
+         mlir::isa<mlir::IntegerType>(mlir::getElementTypeOrSelf(dst_type));
+}
+
+mlir::LogicalResult MapCaptureForSourceTypedClone(
+    mlir::Value operand, mlir::Region& source_region,
+    const mlir::TypeConverter& type_converter, mlir::IRMapping& mapper,
+    mlir::ConversionPatternRewriter& rewriter,
+    mlir::ImplicitLocOpBuilder& builder) {
+  if (mapper.contains(operand) || IsDefinedInRegion(operand, source_region)) {
+    return mlir::success();
+  }
+
+  mlir::Value remapped = rewriter.getRemappedValue(operand);
+  if (!remapped) {
+    if (!type_converter.isLegal(operand.getType())) return mlir::failure();
+    remapped = operand;
+  }
+
+  mlir::Type converted_type = type_converter.convertType(operand.getType());
+  if (!converted_type || remapped.getType() != converted_type) {
+    return mlir::failure();
+  }
+
+  if (remapped.getType() != operand.getType()) {
+    if (!IsIntegerCast(remapped.getType(), operand.getType())) {
+      return mlir::failure();
+    }
+    remapped = CastIntegerLike(remapped, operand.getType(), /*is_signed=*/false,
+                               builder);
+  }
+  mapper.map(operand, remapped);
+  return mlir::success();
+}
+
+mlir::LogicalResult MapAtomicBodyCapturesForSourceTypedClone(
+    mlir::Region& source_region, const mlir::TypeConverter& type_converter,
+    mlir::IRMapping& mapper, mlir::ConversionPatternRewriter& rewriter,
+    mlir::ImplicitLocOpBuilder& builder) {
+  mlir::WalkResult result = source_region.walk([&](mlir::Operation* op) {
+    for (mlir::Value operand : op->getOperands()) {
+      if (mlir::failed(MapCaptureForSourceTypedClone(operand, source_region,
+                                                     type_converter, mapper,
+                                                     rewriter, builder))) {
+        return mlir::WalkResult::interrupt();
+      }
+    }
+    return mlir::WalkResult::advance();
+  });
+  return mlir::failure(result.wasInterrupted());
 }
 
 template <typename Op>
@@ -417,8 +469,8 @@ struct ConvertExtUIOp : public mlir::OpConversionPattern<ma::ExtUIOp> {
 
     mlir::ImplicitLocOpBuilder builder(op.getLoc(), rewriter);
     mlir::Value value = MaskLowBits(adaptor.getIn(), *bit_width, builder);
-    value = CastIntegerLike(value, converted_type, /*is_signed=*/false,
-                            builder);
+    value =
+        CastIntegerLike(value, converted_type, /*is_signed=*/false, builder);
     rewriter.replaceOp(op, value);
     return mlir::success();
   }
@@ -443,8 +495,7 @@ struct ConvertExtSIOp : public mlir::OpConversionPattern<ma::ExtSIOp> {
     mlir::ImplicitLocOpBuilder builder(op.getLoc(), rewriter);
     mlir::Value value =
         SignExtendLowBitsToI8(adaptor.getIn(), *bit_width, builder);
-    value =
-        CastIntegerLike(value, converted_type, /*is_signed=*/true, builder);
+    value = CastIntegerLike(value, converted_type, /*is_signed=*/true, builder);
     rewriter.replaceOp(op, value);
     return mlir::success();
   }
@@ -540,10 +591,8 @@ struct ConvertSubByteCtlzOp
     }
     mlir::ImplicitLocOpBuilder builder(op.getLoc(), rewriter);
     // Mask high bits so the i8 widening doesn't pollute the count.
-    mlir::Value value =
-        MaskLowBits(adaptor.getOperand(), *bit_width, builder);
-    mlir::Value clz =
-        mlir::math::CountLeadingZerosOp::create(builder, value);
+    mlir::Value value = MaskLowBits(adaptor.getOperand(), *bit_width, builder);
+    mlir::Value clz = mlir::math::CountLeadingZerosOp::create(builder, value);
     mlir::Value padding =
         ConstantIntLike(builder, clz.getType(), 8 - *bit_width);
     rewriter.replaceOp(op, ma::SubIOp::create(builder, clz, padding));
@@ -658,6 +707,119 @@ struct ConvertTensorInsert
   }
 };
 
+struct ConvertAtomicRMW : public mlir::OpConversionPattern<::xla::AtomicRMWOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      ::xla::AtomicRMWOp op, OpAdaptor adaptor,
+      mlir::ConversionPatternRewriter& rewriter) const override {
+    auto input_type =
+        mlir::cast<mlir::RankedTensorType>(op.getInput().getType());
+    std::optional<int> bit_width =
+        GetSubByteBitWidth(input_type.getElementType());
+    if (!bit_width) {
+      return rewriter.notifyMatchFailure(op, "input tensor is not sub-byte");
+    }
+    if (op.getIndices().size() > 1) {
+      return rewriter.notifyMatchFailure(
+          op, "only rank-0 and rank-1 tensors are supported");
+    }
+    if (mlir::isa<mlir::VectorType>(op.getCurrentValue().getType())) {
+      return rewriter.notifyMatchFailure(
+          op, "vector sub-byte atomics are not supported");
+    }
+
+    mlir::Type converted_type = getTypeConverter()->convertType(op.getType());
+    if (!converted_type || converted_type != adaptor.getInput().getType()) {
+      return rewriter.notifyMatchFailure(op, "failed to convert result type");
+    }
+    mlir::Type converted_element_type =
+        getTypeConverter()->convertType(op.getCurrentValue().getType());
+    if (!converted_element_type) {
+      return rewriter.notifyMatchFailure(op, "failed to convert body arg type");
+    }
+
+    mlir::ImplicitLocOpBuilder builder(op.getLoc(), rewriter);
+    mlir::Value linear_index = GetLinearIndex(adaptor.getIndices(), builder);
+    auto [byte_index, shift] =
+        GetPackedByteIndexAndShift(linear_index, *bit_width, builder);
+
+    auto new_atomic = ::xla::AtomicRMWOp::create(
+        builder, adaptor.getInput(), byte_index, converted_element_type);
+    mlir::ImplicitLocOpBuilder body_builder(new_atomic.getLoc(), rewriter);
+    body_builder.setInsertionPointToEnd(new_atomic.getBody());
+
+    mlir::Value shifted_current =
+        ma::ShRUIOp::create(body_builder, new_atomic.getCurrentValue(), shift);
+    mlir::Value current =
+        MaskLowBits(shifted_current, *bit_width, body_builder);
+
+    mlir::IRMapping mapper;
+    mlir::Value source_current = current;
+    if (source_current.getType() != op.getCurrentValue().getType()) {
+      if (!IsIntegerCast(source_current.getType(),
+                         op.getCurrentValue().getType())) {
+        return rewriter.notifyMatchFailure(
+            op, "failed to materialize source-typed current value");
+      }
+      source_current =
+          CastIntegerLike(source_current, op.getCurrentValue().getType(),
+                          /*is_signed=*/false, body_builder);
+    }
+    mapper.map(op.getCurrentValue(), source_current);
+
+    if (mlir::failed(MapAtomicBodyCapturesForSourceTypedClone(
+            op.getRegion(), *getTypeConverter(), mapper, rewriter,
+            body_builder))) {
+      return rewriter.notifyMatchFailure(
+          op, "failed to remap atomic body captures");
+    }
+
+    auto source_yield =
+        mlir::dyn_cast<::xla::YieldOp>(op.getBody()->getTerminator());
+    if (!source_yield || source_yield.getNumOperands() != 1) {
+      return rewriter.notifyMatchFailure(op, "expected single-value yield");
+    }
+
+    for (mlir::Operation& body_op : op.getBody()->without_terminator()) {
+      body_builder.clone(body_op, mapper);
+    }
+    mlir::Value yielded = mapper.lookupOrNull(source_yield.getOperand(0));
+    if (!yielded) {
+      return rewriter.notifyMatchFailure(op, "failed to remap yielded value");
+    }
+
+    if (mlir::failed(rewriter.legalize(&new_atomic.getRegion()))) {
+      return rewriter.notifyMatchFailure(op, "failed to legalize atomic body");
+    }
+    if (mlir::Value converted_yielded = rewriter.getRemappedValue(yielded)) {
+      yielded = converted_yielded;
+    }
+    body_builder.setInsertionPointToEnd(new_atomic.getBody());
+    mlir::Value yielded_wide = CastIntegerLike(
+        yielded, converted_element_type, /*is_signed=*/false, body_builder);
+    mlir::Value low_bits = MaskLowBits(yielded_wide, *bit_width, body_builder);
+    mlir::Value shifted_value =
+        ma::ShLIOp::create(body_builder, low_bits, shift);
+    mlir::Value mask =
+        ma::ShLIOp::create(body_builder,
+                           ConstantIntLike(body_builder, converted_element_type,
+                                           (uint64_t{1} << *bit_width) - 1),
+                           shift);
+    mlir::Value inverse_mask = ma::XOrIOp::create(
+        body_builder,
+        ConstantIntLike(body_builder, converted_element_type, 0xff), mask);
+    mlir::Value preserved = ma::AndIOp::create(
+        body_builder, new_atomic.getCurrentValue(), inverse_mask);
+    mlir::Value merged =
+        ma::OrIOp::create(body_builder, preserved, shifted_value);
+    ::xla::YieldOp::create(body_builder, merged.getLoc(), merged);
+
+    rewriter.replaceOp(op, new_atomic.getResult());
+    return mlir::success();
+  }
+};
+
 template <typename Op>
 bool IsSupportedTransfer(Op op) {
   for (bool in_bounds : op.getInBoundsValues()) {
@@ -708,8 +870,8 @@ struct ConvertVectorTransferRead
         index = ma::AddIOp::create(builder, base_index,
                                    ma::ConstantIndexOp::create(builder, i));
       }
-      elements.push_back(UnpackSubByteElement(adaptor.getBase(), index,
-                                              *bit_width, builder));
+      elements.push_back(
+          UnpackSubByteElement(adaptor.getBase(), index, *bit_width, builder));
     }
 
     rewriter.replaceOpWithNewOp<mlir::vector::FromElementsOp>(
@@ -738,8 +900,8 @@ struct ConvertVectorTransferWrite
     mlir::ImplicitLocOpBuilder builder(op.getLoc(), rewriter);
     mlir::Value base_index = GetLinearIndex(adaptor.getIndices(), builder);
     mlir::Value tensor = adaptor.getBase();
-    auto vector_type = mlir::cast<mlir::VectorType>(
-        adaptor.getValueToStore().getType());
+    auto vector_type =
+        mlir::cast<mlir::VectorType>(adaptor.getValueToStore().getType());
     for (int64_t i = 0; i < vector_type.getNumElements(); ++i) {
       mlir::Value index = base_index;
       if (i != 0) {
@@ -748,8 +910,8 @@ struct ConvertVectorTransferWrite
       }
       mlir::Value element = mlir::vector::ExtractOp::create(
           builder, adaptor.getValueToStore(), i);
-      tensor = InsertSubByteElement(element, tensor, index, *bit_width,
-                                    builder);
+      tensor =
+          InsertSubByteElement(element, tensor, index, *bit_width, builder);
     }
     rewriter.replaceOp(op, tensor);
     return mlir::success();
@@ -839,8 +1001,8 @@ struct ConvertVectorBroadcast
     if (!converted_type) {
       return rewriter.notifyMatchFailure(op, "failed to convert result type");
     }
-    rewriter.replaceOpWithNewOp<mlir::vector::BroadcastOp>(
-        op, converted_type, adaptor.getSource());
+    rewriter.replaceOpWithNewOp<mlir::vector::BroadcastOp>(op, converted_type,
+                                                           adaptor.getSource());
     return mlir::success();
   }
 };
@@ -881,7 +1043,7 @@ struct ConvertAllocateShared
       return rewriter.notifyMatchFailure(op, "failed to convert tile type");
     }
     rewriter.replaceOpWithNewOp<::xla::gpu::AllocateSharedOp>(op,
-                                                             converted_type);
+                                                              converted_type);
     return mlir::success();
   }
 };
@@ -918,20 +1080,17 @@ class LowerSubByteStoragePass
 
     mlir::RewritePatternSet patterns(context);
     patterns.add<
-        ConvertAllocateShared, ConvertSyncThreads, ConvertBitcastOp,
-        ConvertCmpIOp, ConvertConstantOp, ConvertExtSIOp,
-        ConvertExtUIOp, ConvertPoisonOp, ConvertSelectOp,
-        ConvertSubByteCtlzOp, ConvertSubByteShRSIOp, ConvertSubByteSIToFPOp,
-        ConvertSubByteUIToFPOp, ConvertTensorExtract, ConvertTensorInsert,
-        ConvertTruncIOp, ConvertVectorBroadcast, ConvertVectorExtract,
-        ConvertVectorFromElements, ConvertVectorInsert,
-        ConvertVectorTransferRead, ConvertVectorTransferWrite,
-        ConvertSubByteBinaryOp<ma::AddIOp>,
-        ConvertSubByteBinaryOp<ma::AndIOp>,
-        ConvertSubByteBinaryOp<ma::MulIOp>, ConvertSubByteBinaryOp<ma::OrIOp>,
-        ConvertSubByteBinaryOp<ma::ShLIOp>,
-        ConvertSubByteBinaryOp<ma::ShRUIOp>,
-        ConvertSubByteBinaryOp<ma::SubIOp>,
+        ConvertAllocateShared, ConvertAtomicRMW, ConvertSyncThreads,
+        ConvertBitcastOp, ConvertCmpIOp, ConvertConstantOp, ConvertExtSIOp,
+        ConvertExtUIOp, ConvertPoisonOp, ConvertSelectOp, ConvertSubByteCtlzOp,
+        ConvertSubByteShRSIOp, ConvertSubByteSIToFPOp, ConvertSubByteUIToFPOp,
+        ConvertTensorExtract, ConvertTensorInsert, ConvertTruncIOp,
+        ConvertVectorBroadcast, ConvertVectorExtract, ConvertVectorFromElements,
+        ConvertVectorInsert, ConvertVectorTransferRead,
+        ConvertVectorTransferWrite, ConvertSubByteBinaryOp<ma::AddIOp>,
+        ConvertSubByteBinaryOp<ma::AndIOp>, ConvertSubByteBinaryOp<ma::MulIOp>,
+        ConvertSubByteBinaryOp<ma::OrIOp>, ConvertSubByteBinaryOp<ma::ShLIOp>,
+        ConvertSubByteBinaryOp<ma::ShRUIOp>, ConvertSubByteBinaryOp<ma::SubIOp>,
         ConvertSubByteBinaryOp<ma::XOrIOp>>(converter, context);
     mlir::populateFunctionOpInterfaceTypeConversionPattern<mlir::func::FuncOp>(
         patterns, converter);

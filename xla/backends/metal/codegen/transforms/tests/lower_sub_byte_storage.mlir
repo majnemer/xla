@@ -62,6 +62,105 @@ func.func @store_i4(%dst: tensor<4xi4>, %value: i8) -> tensor<4xi4> {
 
 // -----
 
+// CHECK-LABEL: func.func @atomic_rmw_i4(
+// CHECK-SAME:    %[[DST:.*]]: tensor<2xi8>
+// CHECK-SAME:    %[[I:.*]]: index
+// CHECK-SAME:    %[[VALUE:.*]]: i8
+// CHECK-SAME:  ) -> tensor<2xi8>
+func.func @atomic_rmw_i4(%dst: tensor<4xi4>, %i: index, %value: i4) -> tensor<4xi4> {
+  %out = xla.atomic_rmw %dst[%i] : tensor<4xi4> {
+    ^bb0(%current: i4):
+      %sum = arith.addi %current, %value : i4
+      xla.yield %sum : i4
+  }
+  return %out : tensor<4xi4>
+}
+// CHECK:      %[[OUT:.*]] = xla.atomic_rmw %[[DST]]
+// CHECK-SAME:   : tensor<2xi8>
+// CHECK:      ^bb0(%[[CURRENT:.*]]: i8):
+// CHECK-NOT:    i4
+// CHECK:        %[[SHIFTED:.*]] = arith.shrui %[[CURRENT]]
+// CHECK:        %[[LOW_BITS:.*]] = arith.andi %[[SHIFTED]]
+// CHECK:        %[[VALUE_LOW:.*]] = arith.andi %[[VALUE]]
+// CHECK:        %[[SUM:.*]] = arith.addi %[[LOW_BITS]], %[[VALUE_LOW]] : i8
+// CHECK:        %[[SUM_LOW_BITS:.*]] = arith.andi %[[SUM]]
+// CHECK:        arith.shli %[[SUM_LOW_BITS]]
+// CHECK-NOT:    i4
+// CHECK:        xla.yield {{.*}} : i8
+// CHECK:      return %[[OUT]] : tensor<2xi8>
+
+// -----
+
+// CHECK-LABEL: func.func @atomic_rmw_i4_nested_capture(
+// CHECK-SAME:    %[[DST:.*]]: tensor<2xi8>
+// CHECK-SAME:    %[[I:.*]]: index
+// CHECK-SAME:    %[[VALUE:.*]]: i8
+// CHECK-SAME:    %[[PRED:.*]]: i1
+// CHECK-SAME:  ) -> tensor<2xi8>
+func.func @atomic_rmw_i4_nested_capture(%dst: tensor<4xi4>, %i: index, %value: i4, %pred: i1) -> tensor<4xi4> {
+  %out = xla.atomic_rmw %dst[%i] : tensor<4xi4> {
+    ^bb0(%current: i4):
+      %selected = scf.if %pred -> (i4) {
+        %sum = arith.addi %current, %value : i4
+        scf.yield %sum : i4
+      } else {
+        scf.yield %value : i4
+      }
+      xla.yield %selected : i4
+  }
+  return %out : tensor<4xi4>
+}
+// CHECK:      %[[OUT:.*]] = xla.atomic_rmw %[[DST]]
+// CHECK-SAME:   : tensor<2xi8>
+// CHECK:      ^bb0(%[[CURRENT:.*]]: i8):
+// CHECK-NOT:    i4
+// CHECK:        %[[SHIFTED:.*]] = arith.shrui %[[CURRENT]]
+// CHECK:        %[[LOW_BITS:.*]] = arith.andi %[[SHIFTED]]
+// CHECK:        %[[VALUE_LOW:.*]] = arith.andi %[[VALUE]]
+// CHECK:        %[[SELECTED:.*]] = scf.if %[[PRED]] -> (i8) {
+// CHECK:          %[[SUM:.*]] = arith.addi %[[LOW_BITS]], %[[VALUE_LOW]] : i8
+// CHECK:          %[[SUM_LOW:.*]] = arith.andi %[[SUM]]
+// CHECK:          scf.yield %[[SUM_LOW]] : i8
+// CHECK:        } else {
+// CHECK:          scf.yield %[[VALUE_LOW]] : i8
+// CHECK:        }
+// CHECK-NOT:    i4
+// CHECK:        xla.yield {{.*}} : i8
+// CHECK:      return %[[OUT]] : tensor<2xi8>
+
+// -----
+
+// CHECK-LABEL: func.func @atomic_rmw_i4_signed_cmp(
+// CHECK-SAME:    %[[DST:.*]]: tensor<2xi8>
+// CHECK-SAME:    %[[I:.*]]: index
+// CHECK-SAME:    %[[VALUE:.*]]: i8
+// CHECK-SAME:  ) -> tensor<2xi8>
+func.func @atomic_rmw_i4_signed_cmp(%dst: tensor<4xi4>, %i: index, %value: i4) -> tensor<4xi4> {
+  %out = xla.atomic_rmw %dst[%i] : tensor<4xi4> {
+    ^bb0(%current: i4):
+      %zero = arith.constant 0 : i4
+      %negative = arith.cmpi slt, %current, %zero : i4
+      %selected = arith.select %negative, %value, %current : i4
+      xla.yield %selected : i4
+  }
+  return %out : tensor<4xi4>
+}
+// CHECK:      %[[OUT:.*]] = xla.atomic_rmw %[[DST]]
+// CHECK-SAME:   : tensor<2xi8>
+// CHECK:      ^bb0(%[[CURRENT:.*]]: i8):
+// CHECK-NOT:    i4
+// CHECK:        %[[SHIFTED:.*]] = arith.shrui %[[CURRENT]]
+// CHECK:        %[[LOW_BITS:.*]] = arith.andi %[[SHIFTED]]
+// CHECK:        %[[SIGN_FLIPPED:.*]] = arith.xori %[[LOW_BITS]]
+// CHECK:        %[[SIGNED_CURRENT:.*]] = arith.subi %[[SIGN_FLIPPED]]
+// CHECK:        %[[NEGATIVE:.*]] = arith.cmpi slt, %[[SIGNED_CURRENT]]
+// CHECK:        arith.select %[[NEGATIVE]]
+// CHECK-NOT:    i4
+// CHECK:        xla.yield {{.*}} : i8
+// CHECK:      return %[[OUT]] : tensor<2xi8>
+
+// -----
+
 // CHECK-LABEL: func.func @store_vector_i4(
 // CHECK-SAME:    %[[DST:.*]]: tensor<2xi8>
 // CHECK-SAME:    %[[VALUE:.*]]: vector<2xi8>
