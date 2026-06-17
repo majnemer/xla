@@ -35,6 +35,7 @@ limitations under the License.
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/stream.h"
+#include "xla/tests/xla_test_backend_predicates.h"
 #include "xla/types.h"
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/ml_dtypes.h"
@@ -130,6 +131,14 @@ class BufferComparatorTest : public testing::Test {
   se::StreamExecutor* stream_exec_;
 };
 
+bool BackendSupportsBFloat16BufferComparator() {
+  return !test::DeviceIs(test::kMetal);
+}
+
+bool BackendSupportsFloat8BufferComparator() {
+  return !test::DeviceIs(test::kMetal);
+}
+
 TEST_F(BufferComparatorTest, TestComplex) {
   EXPECT_FALSE(
       CompareEqualComplex<float>({{0.1, 0.2}, {2, 3}}, {{0.1, 0.2}, {6, 7}}));
@@ -146,23 +155,29 @@ TEST_F(BufferComparatorTest, TestComplex) {
 
   EXPECT_FALSE(
       CompareEqualComplex<float>({{0.1, 0.2}, {2, 3}}, {{0.1, 6}, {2, 3}}));
-  EXPECT_TRUE(CompareEqualComplex<double>({{0.1, 0.2}, {2, 3}},
-                                          {{0.1, 0.2}, {2.2, 3.3}}));
-  EXPECT_FALSE(
-      CompareEqualComplex<double>({{0.1, 0.2}, {2, 3}}, {{0.1, 0.2}, {2, 7}}));
+  if (test::BackendSupportsFloat64()) {
+    EXPECT_TRUE(CompareEqualComplex<double>({{0.1, 0.2}, {2, 3}},
+                                            {{0.1, 0.2}, {2.2, 3.3}}));
+    EXPECT_FALSE(CompareEqualComplex<double>({{0.1, 0.2}, {2, 3}},
+                                             {{0.1, 0.2}, {2, 7}}));
+  }
 }
 
 TEST_F(BufferComparatorTest, TestScalar) {
-  EXPECT_TRUE(CompareEqualScalar<std::complex<double>>({1, 1}, {1, 1}));
-  EXPECT_FALSE(CompareEqualScalar<std::complex<double>>({1, 1}, {1, 2}));
-  EXPECT_FALSE(CompareEqualScalar<std::complex<double>>({1, 1}, {2, 1}));
+  if (test::BackendSupportsFloat64()) {
+    EXPECT_TRUE(CompareEqualScalar<std::complex<double>>({1, 1}, {1, 1}));
+    EXPECT_FALSE(CompareEqualScalar<std::complex<double>>({1, 1}, {1, 2}));
+    EXPECT_FALSE(CompareEqualScalar<std::complex<double>>({1, 1}, {2, 1}));
+  }
   EXPECT_TRUE(CompareEqualScalar<std::complex<float>>({1, 1}, {1, 1}));
   EXPECT_FALSE(CompareEqualScalar<std::complex<float>>({1, 1}, {1, 2}));
   EXPECT_FALSE(CompareEqualScalar<std::complex<float>>({1, 1}, {2, 1}));
   EXPECT_TRUE(CompareEqualScalar<float>(1, 1));
   EXPECT_FALSE(CompareEqualScalar<float>(1, 2));
-  EXPECT_TRUE(CompareEqualScalar<double>(1, 1));
-  EXPECT_FALSE(CompareEqualScalar<double>(1, 2));
+  if (test::BackendSupportsFloat64()) {
+    EXPECT_TRUE(CompareEqualScalar<double>(1, 1));
+    EXPECT_FALSE(CompareEqualScalar<double>(1, 2));
+  }
   EXPECT_TRUE(CompareEqualScalar<bool>(true, true));
   EXPECT_TRUE(CompareEqualScalar<bool>(false, false));
   EXPECT_FALSE(CompareEqualScalar<bool>(true, false));
@@ -194,12 +209,14 @@ TEST_F(BufferComparatorTest, TestNaNs) {
       CompareEqualFloatBuffers<float>({std::nanf("")}, {std::nanf("1234")}));
   EXPECT_FALSE(CompareEqualFloatBuffers<float>({std::nanf("")}, {1.}));
 
-  EXPECT_TRUE(
-      CompareEqualFloatBuffers<double>({std::nanf("")}, {std::nanf("")}));
-  // NaN values with different bit patterns should compare equal.
-  EXPECT_TRUE(
-      CompareEqualFloatBuffers<double>({std::nanf("")}, {std::nanf("1234")}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<double>({std::nanf("")}, {1.}));
+  if (test::BackendSupportsFloat64()) {
+    EXPECT_TRUE(
+        CompareEqualFloatBuffers<double>({std::nanf("")}, {std::nanf("")}));
+    // NaN values with different bit patterns should compare equal.
+    EXPECT_TRUE(
+        CompareEqualFloatBuffers<double>({std::nanf("")}, {std::nanf("1234")}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<double>({std::nanf("")}, {1.}));
+  }
 }
 
 TEST_F(BufferComparatorTest, TestInfs) {
@@ -226,36 +243,40 @@ TEST_F(BufferComparatorTest, TestInfs) {
   EXPECT_FALSE(CompareEqualFloatBuffers<float>({-inf}, {20}));
   EXPECT_FALSE(CompareEqualFloatBuffers<float>({-inf}, {-20}));
 
-  EXPECT_FALSE(CompareEqualFloatBuffers<double>({inf}, {std::nanf("")}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<double>({inf}, {inf}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<double>({inf}, {65504}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<double>({-inf}, {-65504}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<double>({inf}, {-65504}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<double>({-inf}, {65504}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<double>({inf}, {20}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<double>({inf}, {-20}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<double>({-inf}, {20}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<double>({-inf}, {-20}));
+  if (test::BackendSupportsFloat64()) {
+    EXPECT_FALSE(CompareEqualFloatBuffers<double>({inf}, {std::nanf("")}));
+    EXPECT_TRUE(CompareEqualFloatBuffers<double>({inf}, {inf}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<double>({inf}, {65504}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<double>({-inf}, {-65504}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<double>({inf}, {-65504}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<double>({-inf}, {65504}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<double>({inf}, {20}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<double>({inf}, {-20}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<double>({-inf}, {20}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<double>({-inf}, {-20}));
+  }
 
-  EXPECT_TRUE(
-      CompareEqualFloatBuffers<tsl::float8_e4m3fn>({inf}, {std::nanf("")}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({inf}, {inf}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({inf}, {-inf}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({inf}, {448}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({inf}, {-448}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({inf}, {20}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({inf}, {-20}));
+  if (BackendSupportsFloat8BufferComparator()) {
+    EXPECT_TRUE(
+        CompareEqualFloatBuffers<tsl::float8_e4m3fn>({inf}, {std::nanf("")}));
+    EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({inf}, {inf}));
+    EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({inf}, {-inf}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({inf}, {448}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({inf}, {-448}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({inf}, {20}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({inf}, {-20}));
 
-  EXPECT_FALSE(
-      CompareEqualFloatBuffers<tsl::float8_e5m2>({inf}, {std::nanf("")}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e5m2>({inf}, {inf}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({inf}, {-inf}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({inf}, {57344}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({-inf}, {-57344}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({inf}, {20}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({inf}, {-20}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({-inf}, {20}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({-inf}, {-20}));
+    EXPECT_FALSE(
+        CompareEqualFloatBuffers<tsl::float8_e5m2>({inf}, {std::nanf("")}));
+    EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e5m2>({inf}, {inf}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({inf}, {-inf}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({inf}, {57344}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({-inf}, {-57344}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({inf}, {20}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({inf}, {-20}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({-inf}, {20}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({-inf}, {-20}));
+  }
 }
 
 TEST_F(BufferComparatorTest, TestNumbers) {
@@ -277,14 +298,16 @@ TEST_F(BufferComparatorTest, TestNumbers) {
   EXPECT_TRUE(CompareEqualFloatBuffers<float>({9}, {10}));
   EXPECT_TRUE(CompareEqualFloatBuffers<float>({10}, {9}));
 
-  EXPECT_TRUE(CompareEqualFloatBuffers<double>({20}, {20.1}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<double>({20}, {23.0}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<double>({20}, {23.0}, 0.2));
-  EXPECT_FALSE(CompareEqualFloatBuffers<double>({20}, {26.0}, 0.2));
-  EXPECT_FALSE(CompareEqualFloatBuffers<double>({0}, {1}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<double>({0.9}, {1}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<double>({9}, {10}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<double>({10}, {9}));
+  if (test::BackendSupportsFloat64()) {
+    EXPECT_TRUE(CompareEqualFloatBuffers<double>({20}, {20.1}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<double>({20}, {23.0}));
+    EXPECT_TRUE(CompareEqualFloatBuffers<double>({20}, {23.0}, 0.2));
+    EXPECT_FALSE(CompareEqualFloatBuffers<double>({20}, {26.0}, 0.2));
+    EXPECT_FALSE(CompareEqualFloatBuffers<double>({0}, {1}));
+    EXPECT_TRUE(CompareEqualFloatBuffers<double>({0.9}, {1}));
+    EXPECT_TRUE(CompareEqualFloatBuffers<double>({9}, {10}));
+    EXPECT_TRUE(CompareEqualFloatBuffers<double>({10}, {9}));
+  }
 
   EXPECT_TRUE(CompareEqualFloatBuffers<int8_t>({100}, {101}));
   EXPECT_FALSE(CompareEqualFloatBuffers<int8_t>({100}, {120}));
@@ -296,23 +319,27 @@ TEST_F(BufferComparatorTest, TestNumbers) {
   EXPECT_TRUE(CompareEqualFloatBuffers<int8_t>({100}, {90}));
   EXPECT_FALSE(CompareEqualFloatBuffers<int8_t>({-128}, {127}));
 
-  EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({20}, {20.1}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({20}, {23.0}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({20}, {23.0}, 0.2));
-  EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({20}, {26.0}, 0.2));
-  EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({0}, {1}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({0.9}, {1}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({9}, {10}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({9}, {10}));
+  if (BackendSupportsFloat8BufferComparator()) {
+    EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({20}, {20.1}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({20}, {23.0}));
+    EXPECT_TRUE(
+        CompareEqualFloatBuffers<tsl::float8_e4m3fn>({20}, {23.0}, 0.2));
+    EXPECT_FALSE(
+        CompareEqualFloatBuffers<tsl::float8_e4m3fn>({20}, {26.0}, 0.2));
+    EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({0}, {1}));
+    EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({0.9}, {1}));
+    EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({9}, {10}));
+    EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({9}, {10}));
 
-  EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e5m2>({20}, {20.1}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({20}, {23.0}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e5m2>({20}, {23.0}, 0.2));
-  EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({20}, {30.0}, 0.2));
-  EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({0}, {1}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e5m2>({0.9}, {1}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e5m2>({11}, {12}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e5m2>({12}, {11}));
+    EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e5m2>({20}, {20.1}));
+    EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({20}, {23.0}));
+    EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e5m2>({20}, {23.0}, 0.2));
+    EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({20}, {30.0}, 0.2));
+    EXPECT_FALSE(CompareEqualFloatBuffers<tsl::float8_e5m2>({0}, {1}));
+    EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e5m2>({0.9}, {1}));
+    EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e5m2>({11}, {12}));
+    EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e5m2>({12}, {11}));
+  }
 
   // Rerunning tests with increased relative tolerance
   const double tol = 0.001;
@@ -321,8 +348,10 @@ TEST_F(BufferComparatorTest, TestNumbers) {
   EXPECT_FALSE(CompareEqualFloatBuffers<float>({10}, {10.1}, tol));
   EXPECT_TRUE(CompareEqualFloatBuffers<float>({10}, {10.01}, tol));
   EXPECT_FALSE(CompareEqualFloatBuffers<int8_t>({100}, {101}, tol));
-  EXPECT_FALSE(CompareEqualFloatBuffers<double>({20}, {20.1}, tol));
-  EXPECT_TRUE(CompareEqualFloatBuffers<double>({20}, {20.01}, tol));
+  if (test::BackendSupportsFloat64()) {
+    EXPECT_FALSE(CompareEqualFloatBuffers<double>({20}, {20.1}, tol));
+    EXPECT_TRUE(CompareEqualFloatBuffers<double>({20}, {20.01}, tol));
+  }
 }
 
 TEST_F(BufferComparatorTest, TestMultiple) {
@@ -360,7 +389,7 @@ TEST_F(BufferComparatorTest, TestMultiple) {
     }
   }
 
-  {
+  if (test::BackendSupportsFloat64()) {
     EXPECT_TRUE(CompareEqualFloatBuffers<double>(
         {20, 30, 40, 50, 60}, {20.1, 30.1, 40.1, 50.1, 60.1}));
     std::vector<float> lhs(200);
@@ -393,7 +422,7 @@ TEST_F(BufferComparatorTest, TestMultiple) {
       rhs[i] = 0;
     }
   }
-  {
+  if (BackendSupportsFloat8BufferComparator()) {
     EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>(
         {20, 30, 40, 50, 60}, {20.1, 30.1, 40.1, 50.1, 60.1}));
     std::vector<float> lhs(200);
@@ -410,7 +439,7 @@ TEST_F(BufferComparatorTest, TestMultiple) {
     }
   }
 
-  {
+  if (BackendSupportsFloat8BufferComparator()) {
     EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e5m2>(
         {20, 30, 40, 50, 60}, {20.1, 30.1, 40.1, 50.1, 60.1}));
     std::vector<float> lhs(200);
@@ -429,6 +458,11 @@ TEST_F(BufferComparatorTest, TestMultiple) {
 }
 
 TEST_F(BufferComparatorTest, BF16) {
+  if (!BackendSupportsBFloat16BufferComparator()) {
+    GTEST_SKIP()
+        << "Metal does not register bfloat16 buffer comparator kernels.";
+  }
+
   const int element_count = 3123;
   int64_t rng_state = 0;
 
