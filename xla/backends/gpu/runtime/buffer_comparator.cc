@@ -26,8 +26,8 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
-#include "Eigen/Core"
 #include "xla/tsl/platform/status_macros.h"
+#include "Eigen/Core"
 #include "xla/primitive_util.h"
 #include "xla/service/gpu/launch_dimensions.h"
 #include "xla/shape.h"
@@ -55,6 +55,29 @@ struct ComparisonParams {
   se::DeviceAddressBase current{};
   se::DeviceAddressBase expected{};
 };
+
+template <typename T>
+bool IntegersCompareEqual(T lhs, T rhs, double relative_tol) {
+  T max_elem = lhs < rhs ? rhs : lhs;
+  T min_elem = lhs < rhs ? lhs : rhs;
+  uint64_t abs_diff = static_cast<uint64_t>(max_elem - min_elem);
+  uint64_t max_abs;
+  if constexpr (std::is_signed_v<T>) {
+    if ((lhs < 0) != (rhs < 0)) {
+      return false;
+    }
+    if (max_elem < 0) {
+      max_abs = uint64_t{0} - static_cast<uint64_t>(min_elem);
+    } else {
+      max_abs = static_cast<uint64_t>(max_elem);
+    }
+  } else {
+    max_abs = static_cast<uint64_t>(max_elem);
+  }
+  long double rel_error = static_cast<long double>(abs_diff) /
+                          (static_cast<long double>(max_abs) + 1.0L);
+  return rel_error <= relative_tol;
+}
 
 // Compares two buffers on the GPU.
 //
@@ -122,6 +145,26 @@ static absl::StatusOr<bool> HostCompare(const ComparisonParams& params) {
   RETURN_IF_ERROR(params.stream->Memcpy(host_expected.data(), params.expected,
                                         params.expected.size()));
   RETURN_IF_ERROR(params.stream->BlockHostUntilDone());
+
+  if constexpr (std::is_integral_v<ElementType>) {
+    int differences_seen = 0;
+    for (int64_t i = 0; i < n && differences_seen < 10; ++i) {
+      ElementType current_value = host_current[i];
+      ElementType expected_value = host_expected[i];
+      if (IntegersCompareEqual(current_value, expected_value,
+                               params.relative_tol)) {
+        continue;
+      }
+      if (!params.verbose) {
+        return false;  // Return immediately if not verbose.
+      }
+      ++differences_seen;
+      LOG(ERROR) << "Difference at " << i << ": "
+                 << static_cast<long double>(current_value) << ", expected "
+                 << static_cast<long double>(expected_value);
+    }
+    return differences_seen == 0;
+  }
 
   const auto canonicalize = [](ComparisonType a) -> ComparisonType {
     if (std::is_same<ElementType, Eigen::half>::value && a) {

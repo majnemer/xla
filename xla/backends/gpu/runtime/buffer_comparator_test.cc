@@ -318,6 +318,13 @@ TEST_F(BufferComparatorTest, TestNumbers) {
   EXPECT_TRUE(CompareEqualFloatBuffers<int8_t>({90}, {100}));
   EXPECT_TRUE(CompareEqualFloatBuffers<int8_t>({100}, {90}));
   EXPECT_FALSE(CompareEqualFloatBuffers<int8_t>({-128}, {127}));
+  EXPECT_FALSE(
+      CompareEqualBuffers<int32_t>({16777216}, {16777217}, /*tolerance=*/0.0));
+  EXPECT_FALSE(CompareEqualBuffers<uint32_t>({16777216}, {16777217},
+                                             /*tolerance=*/0.0));
+  EXPECT_FALSE(CompareEqualBuffers<uint64_t>({uint64_t{1} << 53},
+                                             {(uint64_t{1} << 53) + 1},
+                                             /*tolerance=*/0.0));
 
   if (BackendSupportsFloat8BufferComparator()) {
     EXPECT_TRUE(CompareEqualFloatBuffers<tsl::float8_e4m3fn>({20}, {20.1}));

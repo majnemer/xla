@@ -16,8 +16,6 @@ limitations under the License.
 #ifndef XLA_STREAM_EXECUTOR_GPU_BUFFER_COMPARATOR_KERNEL_LIB_CU_H_
 #define XLA_STREAM_EXECUTOR_GPU_BUFFER_COMPARATOR_KERNEL_LIB_CU_H_
 
-#include <sys/types.h>
-
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -26,6 +24,7 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include <sys/types.h>
 #include "xla/primitive_util.h"
 #include "xla/stream_executor/gpu/buffer_comparator_kernel.h"
 #include "xla/stream_executor/gpu/gpu_kernel_registry.h"
@@ -55,6 +54,30 @@ __device__ __inline__ auto Canonicalize(float elem) {
 template <>
 __device__ __inline__ auto Canonicalize(double elem) {
   return elem;
+}
+
+template <typename T>
+__device__ __inline__ bool IntCompareEqual(T lhs, T rhs,
+                                           float rel_error_threshold) {
+  T max_elem = lhs < rhs ? rhs : lhs;
+  T min_elem = lhs < rhs ? lhs : rhs;
+  uint64_t abs_diff = static_cast<uint64_t>(max_elem - min_elem);
+  uint64_t max_abs;
+  if constexpr (std::numeric_limits<T>::is_signed) {
+    if ((lhs < 0) != (rhs < 0)) {
+      return false;
+    }
+    if (max_elem < 0) {
+      max_abs = uint64_t{0} - static_cast<uint64_t>(min_elem);
+    } else {
+      max_abs = static_cast<uint64_t>(max_elem);
+    }
+  } else {
+    max_abs = static_cast<uint64_t>(max_elem);
+  }
+  float rel_error =
+      static_cast<float>(abs_diff) / (static_cast<float>(max_abs) + 1);
+  return rel_error <= rel_error_threshold;
 }
 
 template <typename T>
@@ -99,18 +122,7 @@ __global__ void xla_int_comparison(T* buffer_a, T* buffer_b,
                  stride = block_dim_x * gridDim.x;
   for (uint64_t idx = threadIdx.x + blockIdx.x * block_dim_x;
        idx < buffer_length; idx += stride) {
-    float elem_a;
-    float elem_b;
-    if constexpr (std::numeric_limits<T>::is_signed) {
-      elem_a = static_cast<int64_t>(buffer_a[idx]);
-      elem_b = static_cast<int64_t>(buffer_b[idx]);
-    } else {
-      elem_a = static_cast<uint64_t>(buffer_a[idx]);
-      elem_b = static_cast<uint64_t>(buffer_b[idx]);
-    }
-    float rel_error =
-        fabs(elem_a - elem_b) / (fmax(fabs(elem_a), fabs(elem_b)) + 1);
-    if (rel_error > rel_error_threshold || isnan(rel_error)) {
+    if (!IntCompareEqual(buffer_a[idx], buffer_b[idx], rel_error_threshold)) {
       atomicAdd(mismatch_count, 1);
     }
   }  // for
