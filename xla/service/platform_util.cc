@@ -38,6 +38,7 @@ limitations under the License.
 #include "xla/stream_executor/cuda/cuda_platform_id.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/host/host_platform_id.h"
+#include "xla/stream_executor/metal/metal_platform_id.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
@@ -174,6 +175,7 @@ absl::StatusOr<se::Platform::Id> PlatformUtil::GetPlatformIdFromCanonicalName(
       se::cuda::kCudaPlatformId,
       se::rocm::kROCmPlatformId,
       se::sycl::kSyclPlatformId,
+      se::metal::kMetalPlatformId,
   };
 
   for (se::Platform::Id id : kKnownPlatforms) {

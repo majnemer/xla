@@ -21,6 +21,7 @@ limitations under the License.
 #include "absl/status/status_matchers.h"
 #include "xla/stream_executor/cuda/cuda_platform_id.h"
 #include "xla/stream_executor/host/host_platform_id.h"
+#include "xla/stream_executor/metal/metal_platform_id.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
 #include "xla/stream_executor/sycl/sycl_platform_id.h"
 
@@ -50,6 +51,11 @@ TEST(PlatformUtilTest, GetPlatformIdFromCanonicalName) {
               IsOkAndHolds(stream_executor::sycl::kSyclPlatformId));
   EXPECT_THAT(PlatformUtil::GetPlatformIdFromCanonicalName("SYCL"),
               IsOkAndHolds(stream_executor::sycl::kSyclPlatformId));
+
+  EXPECT_THAT(PlatformUtil::GetPlatformIdFromCanonicalName("metal"),
+              IsOkAndHolds(stream_executor::metal::kMetalPlatformId));
+  EXPECT_THAT(PlatformUtil::GetPlatformIdFromCanonicalName("METAL"),
+              IsOkAndHolds(stream_executor::metal::kMetalPlatformId));
 
   EXPECT_THAT(PlatformUtil::GetPlatformIdFromCanonicalName("unknown"),
               StatusIs(absl::StatusCode::kInvalidArgument));
