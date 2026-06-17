@@ -918,6 +918,45 @@ TEST(TranslateToMSL, EmitsScfIfWithoutResults) {
       << result.source();
 }
 
+TEST(TranslateToMSL, EmitsScfIndexSwitchWithScalarAndTensorResults) {
+  auto ctx = MakeMlirContext();
+  constexpr absl::string_view kInput = R"mlir(
+    module {
+      func.func @switch_result(%out: tensor<2xf32> {xla.slice_index = 0 : i64})
+          -> tensor<2xf32> attributes {xla.entry} {
+        %i = arith.constant 0 : index
+        %selector = gpu.block_id z
+        %value, %buf = scf.index_switch %selector -> f32, tensor<2xf32>
+        case 1 {
+          %case_value = arith.constant 3.0 : f32
+          %case_buf = tensor.insert %case_value into %out[%i] : tensor<2xf32>
+          scf.yield %case_value, %case_buf : f32, tensor<2xf32>
+        }
+        default {
+          %default_value = arith.constant 5.0 : f32
+          scf.yield %default_value, %out : f32, tensor<2xf32>
+        }
+        %r = tensor.insert %value into %buf[%i] : tensor<2xf32>
+        return %r : tensor<2xf32>
+      }
+    }
+  )mlir";
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(kInput, ctx.get());
+  ASSERT_TRUE(module);
+
+  TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
+  EXPECT_NE(result.source().find("switch (v1) {"), std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find("case 1: {\n"), std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find("default: {\n"), std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find("arg0[v0] = v3;"), std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find("arg0[v0] = v2;"), std::string::npos)
+      << result.source();
+}
+
 TEST(TranslateToMSL, RejectsScfForWithReassignedIterArg) {
   auto ctx = MakeMlirContext();
   // The iter_arg %acc is reassigned to a fresh scalar (%next) before

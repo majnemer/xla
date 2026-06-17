@@ -696,6 +696,9 @@ class MslEmitter {
     if (auto ifo = mlir::dyn_cast<mlir::scf::IfOp>(op)) {
       return EmitScfIf(ifo);
     }
+    if (auto iso = mlir::dyn_cast<mlir::scf::IndexSwitchOp>(op)) {
+      return EmitScfIndexSwitch(iso);
+    }
     if (auto t = mlir::dyn_cast<mlir::gpu::ThreadIdOp>(op)) {
       return EmitDimComponent(t.getResult(), "tid", t.getDimension());
     }
@@ -1623,6 +1626,86 @@ class MslEmitter {
             "same buffer (the in-place tensor.insert pattern).");
       }
       TF_RETURN_IF_ERROR(ForwardLValue(result, then_v));
+    }
+    return absl::OkStatus();
+  }
+
+  absl::Status EmitScfIndexSwitch(mlir::scf::IndexSwitchOp op) {
+    const unsigned num_results = op->getNumResults();
+    std::vector<std::string> scalar_names(num_results);
+    for (unsigned i = 0; i < num_results; ++i) {
+      mlir::Value result = op->getResult(i);
+      if (mlir::isa<mlir::TensorType, mlir::MemRefType>(result.getType())) {
+        continue;  // Resolved as an alias after every arm emits.
+      }
+      TF_ASSIGN_OR_RETURN(std::string ty_msl, TypeToMSL(result.getType()));
+      std::string name = BindValueName(result);
+      os_ << ty_msl << " " << name << ";\n";
+      scalar_names[i] = std::move(name);
+    }
+
+    auto emit_region = [&](mlir::Region& region) -> absl::Status {
+      for (mlir::Operation& body_op : region.front().without_terminator()) {
+        TF_RETURN_IF_ERROR(EmitOp(&body_op));
+      }
+      if (num_results == 0) return absl::OkStatus();
+      auto yield =
+          mlir::cast<mlir::scf::YieldOp>(region.front().getTerminator());
+      for (unsigned i = 0; i < num_results; ++i) {
+        if (scalar_names[i].empty()) continue;  // tensor/memref result.
+        TF_ASSIGN_OR_RETURN(std::string y_name, GetName(yield.getOperand(i)));
+        os_ << scalar_names[i] << " = " << y_name << ";\n";
+      }
+      return absl::OkStatus();
+    };
+
+    TF_ASSIGN_OR_RETURN(std::string arg, GetName(op.getArg()));
+    os_ << "switch (" << arg << ") {\n";
+    os_.indent();
+    for (auto [case_value, case_region] :
+         llvm::zip(op.getCases(), op.getCaseRegions())) {
+      os_ << "case " << case_value << ": {\n";
+      os_.indent();
+      TF_RETURN_IF_ERROR(emit_region(case_region));
+      os_ << "break;\n";
+      os_.unindent();
+      os_ << "}\n";
+    }
+    os_ << "default: {\n";
+    os_.indent();
+    TF_RETURN_IF_ERROR(emit_region(op.getDefaultRegion()));
+    os_ << "break;\n";
+    os_.unindent();
+    os_ << "}\n";
+    os_.unindent();
+    os_ << "}\n";
+
+    for (unsigned i = 0; i < num_results; ++i) {
+      mlir::Value result = op->getResult(i);
+      if (!mlir::isa<mlir::TensorType, mlir::MemRefType>(result.getType())) {
+        continue;
+      }
+
+      mlir::Value common_value;
+      std::string common_name;
+      for (mlir::Region& region : op->getRegions()) {
+        auto yield =
+            mlir::cast<mlir::scf::YieldOp>(region.front().getTerminator());
+        mlir::Value yielded = yield.getOperand(i);
+        TF_ASSIGN_OR_RETURN(std::string name, GetName(yielded));
+        if (!common_value) {
+          common_value = yielded;
+          common_name = std::move(name);
+          continue;
+        }
+        if (name != common_name) {
+          return absl::UnimplementedError(
+              "scf.index_switch with tensor/memref results: arms yield "
+              "different buffers; MSL emitter only supports every arm "
+              "yielding the same buffer for each result.");
+        }
+      }
+      TF_RETURN_IF_ERROR(ForwardLValue(result, common_value));
     }
     return absl::OkStatus();
   }
