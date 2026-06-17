@@ -341,6 +341,38 @@ TEST(TranslateToMSL, EmitsSingleElementVectorBitcastAsScalar) {
       << result.source();
 }
 
+TEST(TranslateToMSL, EmitsSingleElementVectorScfResultsAsScalars) {
+  auto ctx = MakeMlirContext();
+  constexpr absl::string_view kInput = R"mlir(
+    module {
+      func.func @v1_if(%dst: tensor<1xf32> {xla.slice_index = 0 : i64})
+          -> tensor<1xf32> attributes {xla.entry} {
+        %i = arith.constant 0 : index
+        %cond = arith.constant true
+        %a = arith.constant dense<1.000000e+00> : vector<1xf32>
+        %b_scalar = arith.constant 2.000000e+00 : f32
+        %b = vector.broadcast %b_scalar : f32 to vector<1xf32>
+        %v = scf.if %cond -> (vector<1xf32>) {
+          scf.yield %a : vector<1xf32>
+        } else {
+          scf.yield %b : vector<1xf32>
+        }
+        %x = vector.extract %v[0] : f32 from vector<1xf32>
+        %out = tensor.insert %x into %dst[%i] : tensor<1xf32>
+        return %out : tensor<1xf32>
+      }
+    }
+  )mlir";
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(kInput, ctx.get());
+  ASSERT_TRUE(module);
+
+  TF_ASSERT_OK_AND_ASSIGN(MslKernelSource result, TranslateToMSL(*module));
+  EXPECT_EQ(result.source().find("float1"), std::string::npos)
+      << result.source();
+  EXPECT_NE(result.source().find("float v"), std::string::npos)
+      << result.source();
+}
+
 TEST(TranslateToMSL, RejectsMissingEntryAttribute) {
   auto ctx = MakeMlirContext();
   constexpr absl::string_view kInput = R"mlir(

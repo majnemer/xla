@@ -143,6 +143,12 @@ absl::StatusOr<std::string> TypeToMSL(mlir::Type type) {
           "Multi-rank vector types are not yet supported by the MSL emitter.");
     }
     const int64_t n = vec.getDimSize(0);
+    if (n == 1) {
+      // Metal has no float1/int1 vector spelling. Treat MLIR's single-lane
+      // vectors as scalars; vector ops that need lane semantics special-case
+      // vector<1xT> in their emitters.
+      return EmitElementType(vec.getElementType());
+    }
     if (n != 2 && n != 3 && n != 4) {
       return absl::UnimplementedError(
           absl::StrCat("MSL vector width must be 2, 3, or 4; got ", n));
