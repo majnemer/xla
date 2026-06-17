@@ -42,6 +42,7 @@ limitations under the License.
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "xla/backends/gpu/codegen/emitters/ir/xla_gpu_ops.h"
 #include "xla/backends/metal/codegen/transforms/passes.h"
 
 namespace xla {
@@ -448,8 +449,8 @@ struct ConvertVectorBroadcast
       return rewriter.notifyMatchFailure(op, "failed to convert result type");
     }
 
-    rewriter.replaceOpWithNewOp<mlir::vector::BroadcastOp>(
-        op, converted_type, adaptor.getSource());
+    rewriter.replaceOpWithNewOp<mlir::vector::BroadcastOp>(op, converted_type,
+                                                           adaptor.getSource());
     return mlir::success();
   }
 };
@@ -522,6 +523,44 @@ struct ConvertPoisonOp : public mlir::OpConversionPattern<mlir::ub::PoisonOp> {
   }
 };
 
+struct ConvertAllocateShared
+    : public mlir::OpConversionPattern<::xla::gpu::AllocateSharedOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      ::xla::gpu::AllocateSharedOp op, OpAdaptor /*adaptor*/,
+      mlir::ConversionPatternRewriter& rewriter) const override {
+    if (!HasLoweredFloatElementType(op.getType())) {
+      return rewriter.notifyMatchFailure(op, "tile is not a lowered float");
+    }
+    mlir::Type converted_type = getTypeConverter()->convertType(op.getType());
+    if (!converted_type) {
+      return rewriter.notifyMatchFailure(op, "failed to convert tile type");
+    }
+    rewriter.replaceOpWithNewOp<::xla::gpu::AllocateSharedOp>(op,
+                                                              converted_type);
+    return mlir::success();
+  }
+};
+
+struct ConvertSyncThreads
+    : public mlir::OpConversionPattern<::xla::gpu::SyncThreadsOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      ::xla::gpu::SyncThreadsOp op, OpAdaptor adaptor,
+      mlir::ConversionPatternRewriter& rewriter) const override {
+    llvm::SmallVector<mlir::Type> result_types;
+    if (mlir::failed(getTypeConverter()->convertTypes(op.getResultTypes(),
+                                                      result_types))) {
+      return rewriter.notifyMatchFailure(op, "failed to convert result types");
+    }
+    rewriter.replaceOpWithNewOp<::xla::gpu::SyncThreadsOp>(
+        op, result_types, adaptor.getOperands());
+    return mlir::success();
+  }
+};
+
 class LowerFloatStoragePass
     : public impl::LowerFloatStoragePassBase<LowerFloatStoragePass> {
  public:
@@ -532,13 +571,14 @@ class LowerFloatStoragePass
     FloatStorageTypeConverter converter(context);
 
     mlir::RewritePatternSet patterns(context);
-    patterns.add<ConvertBitcastOp, ConvertConstantOp, ConvertExtFOp,
-                 ConvertPoisonOp, ConvertSelectOp, ConvertTruncFOp,
-                 ConvertTensorExtract, ConvertTensorInsert,
-                 ConvertVectorBroadcast, ConvertVectorExtract,
-                 ConvertVectorFromElements, ConvertVectorInsert,
-                 ConvertVectorTransferRead, ConvertVectorTransferWrite>(
-        converter, context);
+    patterns
+        .add<ConvertAllocateShared, ConvertBitcastOp, ConvertConstantOp,
+             ConvertExtFOp, ConvertPoisonOp, ConvertSelectOp,
+             ConvertSyncThreads, ConvertTruncFOp, ConvertTensorExtract,
+             ConvertTensorInsert, ConvertVectorBroadcast, ConvertVectorExtract,
+             ConvertVectorFromElements, ConvertVectorInsert,
+             ConvertVectorTransferRead, ConvertVectorTransferWrite>(converter,
+                                                                    context);
     mlir::populateFunctionOpInterfaceTypeConversionPattern<mlir::func::FuncOp>(
         patterns, converter);
     mlir::populateCallOpTypeConversionPattern(patterns, converter);

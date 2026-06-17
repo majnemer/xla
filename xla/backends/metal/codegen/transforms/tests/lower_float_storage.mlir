@@ -207,3 +207,21 @@ func.func @caller_bf16(%arg0: tensor<4xbf16>, %value: bf16) -> bf16 {
 }
 // CHECK:      %[[OUT:.*]] = call @callee_bf16(%[[ARG]], %[[VALUE]]) : (tensor<4xi16>, i16) -> i16
 // CHECK:      return %[[OUT]] : i16
+
+// CHECK-LABEL: func.func @allocate_shared_bf16() -> tensor<4xi16>
+func.func @allocate_shared_bf16() -> tensor<4xbf16> {
+  %shared = xla_gpu.allocate_shared : tensor<4xbf16>
+  return %shared : tensor<4xbf16>
+}
+// CHECK:      %[[SHARED:.*]] = xla_gpu.allocate_shared : tensor<4xi16>
+// CHECK:      return %[[SHARED]] : tensor<4xi16>
+
+// CHECK-LABEL: func.func @sync_threads_bf16(
+// CHECK-SAME:    %[[ARG:.*]]: tensor<4xi16>
+// CHECK-SAME:  ) -> tensor<4xi16>
+func.func @sync_threads_bf16(%arg0: tensor<4xbf16>) -> tensor<4xbf16> {
+  %synced = xla_gpu.sync_threads %arg0 : tensor<4xbf16>
+  return %synced : tensor<4xbf16>
+}
+// CHECK:      %[[SYNCED:.*]] = xla_gpu.sync_threads %[[ARG]] : tensor<4xi16>
+// CHECK:      return %[[SYNCED]] : tensor<4xi16>
