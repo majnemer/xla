@@ -24,13 +24,15 @@ limitations under the License.
 
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
+#include "xla/stream_executor/memory_space.h"
 
 namespace stream_executor {
 namespace metal {
 
 MetalAllocator::MetalAllocator(id<MTLDevice> device) : device_(device) {}
 
-absl::StatusOr<void*> MetalAllocator::Allocate(uint64_t size) {
+absl::StatusOr<void*> MetalAllocator::Allocate(uint64_t size,
+                                               MemorySpace memory_space) {
   if (size == 0) {
     return nullptr;
   }
@@ -49,7 +51,7 @@ absl::StatusOr<void*> MetalAllocator::Allocate(uint64_t size) {
         "Shared-mode buffer should always expose a CPU pointer.");
   }
   absl::MutexLock lock(&mu_);
-  buffers_.emplace(base, buffer);
+  buffers_.emplace(base, Allocation{buffer, memory_space});
   return base;
 }
 
@@ -77,14 +79,14 @@ std::optional<MetalAllocator::Resolved> MetalAllocator::Resolve(
   }
   --it;
   void* base = it->first;
-  id<MTLBuffer> buffer = it->second;
+  id<MTLBuffer> buffer = it->second.buffer;
   uint64_t length = static_cast<uint64_t>([buffer length]);
   auto offset = static_cast<uint64_t>(
       reinterpret_cast<const char*>(ptr) - reinterpret_cast<char*>(base));
   if (offset >= length) {
     return std::nullopt;
   }
-  return Resolved{buffer, offset};
+  return Resolved{buffer, offset, it->second.memory_space};
 }
 
 }  // namespace metal

@@ -208,6 +208,12 @@ int64_t FallbackBandwidth(int generation) {
   return GBs(50);
 }
 
+MemorySpace NormalizeMetalAllocationMemorySpace(MemorySpace type) {
+  // Metal has no distinct collective memory implementation; collective
+  // allocations use ordinary device-backed MTLBuffers.
+  return type == MemorySpace::kCollective ? MemorySpace::kDevice : type;
+}
+
 }  // namespace
 
 MetalExecutor::MetalExecutor(Platform* platform, int ordinal)
@@ -479,11 +485,13 @@ absl::StatusOr<std::unique_ptr<Kernel>> MetalExecutor::LoadKernel(
 }
 
 DeviceAddressBase MetalExecutor::Allocate(uint64_t size,
-                                          int64_t /*memory_space*/) {
+                                          int64_t memory_space) {
   if (allocator_ == nullptr) {
     return DeviceAddressBase();
   }
-  auto base = allocator_->Allocate(size);
+  MemorySpace type = NormalizeMetalAllocationMemorySpace(
+      static_cast<MemorySpace>(memory_space));
+  auto base = allocator_->Allocate(size, type);
   if (!base.ok()) {
     return DeviceAddressBase();
   }
@@ -589,12 +597,28 @@ MetalExecutor::HostMemoryAllocate(uint64_t size) {
     return absl::FailedPreconditionError(
         "MetalExecutor::HostMemoryAllocate: executor not initialized.");
   }
-  auto base = allocator_->Allocate(size);
+  auto base = allocator_->Allocate(size, MemorySpace::kHost);
   if (!base.ok()) {
     return base.status();
   }
   return std::make_unique<MetalHostMemoryAllocation>(allocator_.get(), *base,
                                                     size);
+}
+
+absl::StatusOr<MemorySpace> MetalExecutor::GetPointerMemorySpace(
+    const void* ptr) {
+  if (ptr == nullptr) {
+    return absl::InvalidArgumentError(
+        "MetalExecutor::GetPointerMemorySpace: null pointer.");
+  }
+  if (allocator_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "MetalExecutor::GetPointerMemorySpace: executor not initialized.");
+  }
+  if (auto resolved = allocator_->Resolve(ptr); resolved.has_value()) {
+    return resolved->memory_space;
+  }
+  return MemorySpace::kHost;
 }
 
 bool MetalExecutor::SynchronizeAllActivity() {
@@ -715,9 +739,12 @@ MetalExecutor::CreateMemoryAllocator(MemorySpace type) {
   if (type == MemorySpace::kDevice || type == MemorySpace::kUnified ||
       type == MemorySpace::kCollective || type == MemorySpace::kHost) {
     return std::make_unique<GenericMemoryAllocator>(
-        [this](uint64_t size)
+        [this, type](uint64_t size)
             -> absl::StatusOr<std::unique_ptr<MemoryAllocation>> {
-          TF_ASSIGN_OR_RETURN(void* base, allocator_->Allocate(size));
+          MemorySpace allocation_type =
+              NormalizeMetalAllocationMemorySpace(type);
+          TF_ASSIGN_OR_RETURN(void* base,
+                              allocator_->Allocate(size, allocation_type));
           return std::make_unique<GenericMemoryAllocation>(
               base, size, [this](void* ptr, uint64_t /*size*/) {
                 allocator_->Deallocate(ptr);

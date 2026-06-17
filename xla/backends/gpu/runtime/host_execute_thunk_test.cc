@@ -162,6 +162,7 @@ TEST(HostExecuteStartThunkTest, SingleArgSingleResult) {
   xla::Literal result_literal(ShapeUtil::MakeShape(S32, {}));
   TF_ASSERT_OK(stream->Memcpy(result_literal.untyped_data(), result,
                               ShapeUtil::ByteSizeOf(result_literal.shape())));
+  TF_ASSERT_OK(stream->BlockHostUntilDone());
   EXPECT_TRUE(LiteralTestUtil::Equal(LiteralUtil::CreateR0<int32_t>(10),
                                      result_literal));
 }
@@ -243,12 +244,13 @@ TEST(HostExecuteStartThunkTest, MultiArgMultipleResult) {
   xla::Literal result_literal0(ShapeUtil::MakeShape(S32, {}));
   TF_ASSERT_OK(stream->Memcpy(result_literal0.untyped_data(), result0,
                               ShapeUtil::ByteSizeOf(result_literal0.shape())));
-  EXPECT_TRUE(LiteralTestUtil::Equal(LiteralUtil::CreateR0<int32_t>(8),
-                                     result_literal0));
 
   xla::Literal result_literal1(ShapeUtil::MakeShape(S32, {}));
   TF_ASSERT_OK(stream->Memcpy(result_literal1.untyped_data(), result1,
                               ShapeUtil::ByteSizeOf(result_literal1.shape())));
+  TF_ASSERT_OK(stream->BlockHostUntilDone());
+  EXPECT_TRUE(LiteralTestUtil::Equal(LiteralUtil::CreateR0<int32_t>(8),
+                                     result_literal0));
   EXPECT_TRUE(LiteralTestUtil::Equal(LiteralUtil::CreateR0<int32_t>(15),
                                      result_literal1));
 }

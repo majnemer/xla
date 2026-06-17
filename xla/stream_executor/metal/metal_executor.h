@@ -101,6 +101,7 @@ class MetalExecutor : public gpu::GpuExecutor {
   void Deallocate(DeviceAddressBase* mem) override;
   absl::StatusOr<std::unique_ptr<MemoryAllocation>> HostMemoryAllocate(
       uint64_t size) override;
+  absl::StatusOr<MemorySpace> GetPointerMemorySpace(const void* ptr) override;
   absl::StatusOr<std::unique_ptr<MemoryAllocator>> CreateMemoryAllocator(
       MemorySpace memory_space) override;
 

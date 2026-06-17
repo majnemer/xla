@@ -25,6 +25,7 @@ limitations under the License.
 #include "absl/base/thread_annotations.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "xla/stream_executor/memory_space.h"
 
 namespace stream_executor {
 namespace metal {
@@ -50,7 +51,7 @@ class MetalAllocator {
   // Allocates `size` bytes and returns the base contents pointer of the
   // backing MTLBuffer. Returns ResourceExhausted on Metal allocation
   // failure. Size 0 returns nullptr (no allocation).
-  absl::StatusOr<void*> Allocate(uint64_t size);
+  absl::StatusOr<void*> Allocate(uint64_t size, MemorySpace memory_space);
 
   // Releases the MTLBuffer whose base contents pointer is `base`. If `base`
   // is nullptr or not owned by this allocator, this is a no-op (matches the
@@ -60,6 +61,7 @@ class MetalAllocator {
   struct Resolved {
     id<MTLBuffer> buffer;
     uint64_t offset;
+    MemorySpace memory_space;
   };
 
   // Given any byte pointer `ptr` that lies within one of our allocations,
@@ -71,9 +73,14 @@ class MetalAllocator {
   id<MTLDevice> device_;
 
   mutable absl::Mutex mu_;
-  // base contents pointer -> MTLBuffer. Sorted by key so Resolve can use
-  // upper_bound to find the buffer whose range contains a probe pointer.
-  std::map<void*, id<MTLBuffer>> buffers_ ABSL_GUARDED_BY(mu_);
+  struct Allocation {
+    id<MTLBuffer> buffer;
+    MemorySpace memory_space;
+  };
+
+  // base contents pointer -> allocation metadata. Sorted by key so Resolve can
+  // use upper_bound to find the buffer whose range contains a probe pointer.
+  std::map<void*, Allocation> buffers_ ABSL_GUARDED_BY(mu_);
 
   MetalAllocator(const MetalAllocator&) = delete;
   MetalAllocator& operator=(const MetalAllocator&) = delete;
