@@ -18,6 +18,7 @@ limitations under the License.
 #include "xla/stream_executor/metal/metal_device_handle.h"
 
 #import <Foundation/Foundation.h>
+#import <IOKit/IOKitLib.h>
 #import <Metal/Metal.h>
 
 #include <algorithm>
@@ -25,6 +26,7 @@ limitations under the License.
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "absl/log/check.h"
@@ -80,6 +82,130 @@ int GetAppleFamilyGeneration(id<MTLDevice> device) {
     }
   }
   return 0;
+}
+
+// Compatibility shim: kIOMainPortDefault was introduced in macOS 12 as the
+// rename of the now-deprecated kIOMasterPortDefault. Both resolve to the
+// default (NULL) mach port. Define it for SDKs that predate the rename.
+#ifndef kIOMainPortDefault
+#define kIOMainPortDefault kIOMasterPortDefault
+#endif
+
+// Apple GPU cores are 128-wide (128 FP32 ALUs per core) on every Apple Silicon
+// family from Apple7 (M1 / A14) onward.
+constexpr int kAppleAlusPerCore = 128;
+
+// Queries the exact GPU core count from the IORegistry for `device`, returning
+// 0 if it cannot be determined. Apple Silicon publishes an integer
+// "gpu-core-count" property on the GPU's IOService entry; we locate that entry
+// via the Metal device's registryID. This is the only reliable way to read the
+// real core count, since Metal itself does not expose it. Requires linking the
+// IOKit framework.
+int QueryGpuCoreCountFromIOKit(id<MTLDevice> device) {
+  const uint64_t registry_id = [device registryID];
+  if (registry_id == 0) {
+    return 0;
+  }
+  // IORegistryEntryIDMatching returns a dictionary with a +1 reference that is
+  // consumed by IOServiceGetMatchingService, so we must not release it here.
+  CFMutableDictionaryRef matching = IORegistryEntryIDMatching(registry_id);
+  if (matching == nullptr) {
+    return 0;
+  }
+  io_service_t service =
+      IOServiceGetMatchingService(kIOMainPortDefault, matching);
+  if (service == IO_OBJECT_NULL) {
+    return 0;
+  }
+  int core_count = 0;
+  // Search both directions: the property may sit on the matched entry, a
+  // parent, or a child depending on the OS version's IOGPU topology.
+  CFTypeRef value = IORegistryEntrySearchCFProperty(
+      service, kIOServicePlane, CFSTR("gpu-core-count"), kCFAllocatorDefault,
+      kIORegistryIterateRecursively | kIORegistryIterateParents);
+  if (value != nullptr) {
+    if (CFGetTypeID(value) == CFNumberGetTypeID()) {
+      CFNumberGetValue(static_cast<CFNumberRef>(value), kCFNumberIntType,
+                       &core_count);
+    }
+    CFRelease(value);
+  }
+  IOObjectRelease(service);
+  return core_count > 0 ? core_count : 0;
+}
+
+constexpr int64_t GBs(double gb_per_s) {
+  return static_cast<int64_t>(gb_per_s * 1e9);
+}
+constexpr int64_t MiB(int64_t mib) { return mib * 1024 * 1024; }
+
+// Approximate, *non-authoritative* per-SKU GPU characteristics for Apple
+// Silicon. Apple does not expose memory bandwidth, GPU clock, or cache sizes
+// through any public API, so these are representative published figures used
+// only as estimates:
+//   * memory_bandwidth is in bytes/s using decimal GB (how the figures are
+//     normally quoted).
+//   * clock_ghz is a nominal boost frequency (Apple publishes none).
+//   * l2_cache_size is a coarse last-level / system-cache proxy.
+// Values differ between binned and full-die variants of the same marketing
+// name -- most notably the *_Max parts (e.g. M3 Max ships as 300 or 400 GB/s)
+// -- so treat these as order-of-magnitude hints, not ground truth. core_count
+// here is the full-die value and a fallback only; QueryGpuCoreCountFromIOKit is
+// preferred whenever it succeeds.
+struct AppleGpuSpec {
+  const char* name_substr;
+  int core_count;
+  double clock_ghz;
+  int64_t memory_bandwidth;
+  int64_t l2_cache_size;
+};
+
+// Ordered most-specific first within each generation so substring matching
+// resolves "M3 Max" before the bare "M3", etc.
+const AppleGpuSpec kAppleGpuSpecs[] = {
+    // M4 family (figures provisional).
+    {"M4 Max", 40, 1.40, GBs(546), MiB(32)},
+    {"M4 Pro", 20, 1.40, GBs(273), MiB(24)},
+    {"M4", 10, 1.40, GBs(120), MiB(8)},
+    // M3 family.
+    {"M3 Ultra", 80, 1.40, GBs(819), MiB(48)},
+    {"M3 Max", 40, 1.40, GBs(400), MiB(32)},
+    {"M3 Pro", 18, 1.40, GBs(150), MiB(12)},
+    {"M3", 10, 1.40, GBs(100), MiB(8)},
+    // M2 family.
+    {"M2 Ultra", 76, 1.40, GBs(800), MiB(48)},
+    {"M2 Max", 38, 1.40, GBs(400), MiB(32)},
+    {"M2 Pro", 19, 1.40, GBs(200), MiB(24)},
+    {"M2", 10, 1.40, GBs(100), MiB(8)},
+    // M1 family.
+    {"M1 Ultra", 64, 1.296, GBs(800), MiB(48)},
+    {"M1 Max", 32, 1.296, GBs(400), MiB(32)},
+    {"M1 Pro", 16, 1.296, GBs(200), MiB(24)},
+    {"M1", 8, 1.278, GBs(68.25), MiB(8)},
+};
+
+const AppleGpuSpec* FindAppleGpuSpec(const std::string& device_name) {
+  for (const AppleGpuSpec& spec : kAppleGpuSpecs) {
+    if (device_name.find(spec.name_substr) != std::string::npos) {
+      return &spec;
+    }
+  }
+  return nullptr;
+}
+
+// Conservative per-generation fallbacks used when the device name is not in the
+// table above (e.g. an A-series GPU, or a future part).
+double FallbackClockGhz(int generation) {
+  if (generation >= 9) return 1.40;
+  if (generation == 8) return 1.398;
+  if (generation == 7) return 1.278;
+  return 1.0;
+}
+
+int64_t FallbackBandwidth(int generation) {
+  if (generation >= 8) return GBs(100);
+  if (generation == 7) return GBs(68.25);
+  return GBs(50);
 }
 
 }  // namespace
@@ -140,7 +266,9 @@ MetalExecutor::CreateDeviceDescription(int ordinal) {
     id<MTLDevice> device = devices[ordinal];
 
     desc = std::make_unique<DeviceDescription>();
-    desc->set_name([[device name] UTF8String]);
+    const char* raw_name = [[device name] UTF8String];
+    const std::string device_name = raw_name != nullptr ? raw_name : "";
+    desc->set_name(device_name);
     desc->set_device_vendor("Apple");
 
     // Apple Silicon shares system memory; recommendedMaxWorkingSetSize is
@@ -148,6 +276,10 @@ MetalExecutor::CreateDeviceDescription(int ordinal) {
     // rejects the default -1.
     desc->set_device_memory_size(
         static_cast<int64_t>([device recommendedMaxWorkingSetSize]));
+
+    // Apple Silicon is a 64-bit architecture with a unified host/device address
+    // space. Not exposed by Metal, but invariant for every supported part.
+    desc->set_device_address_bits(64);
 
     const int generation = GetAppleFamilyGeneration(device);
     const bool metal3 = [device supportsFamily:MTLGPUFamilyMetal3];
@@ -171,12 +303,50 @@ MetalExecutor::CreateDeviceDescription(int ordinal) {
         /*y=*/std::numeric_limits<int64_t>::max(),
         /*z=*/std::numeric_limits<int64_t>::max()));
 
-    // Threadgroup ("shared") memory budget. Metal has no opt-in tier, so the
-    // opt-in limit equals the base limit.
-    const int64_t threadgroup_memory =
+    // --- Shared (threadgroup) memory -------------------------------------
+    // Metal exposes the per-threadgroup limit directly via
+    // maxThreadgroupMemoryLength. Apple GPUs do not distinguish a separate
+    // higher "opt-in" tier the way CUDA does, and the physical per-core
+    // threadgroup memory equals this per-block maximum, so all three
+    // shared-memory scalars take the same queried value. (Smaller blocks can
+    // still co-reside on a core, since occupancy modeling divides
+    // shared_memory_per_core by the per-block usage.)
+    int64_t shared_memory_per_block =
         static_cast<int64_t>([device maxThreadgroupMemoryLength]);
-    desc->set_shared_memory_per_block(threadgroup_memory);
-    desc->set_shared_memory_per_block_optin(threadgroup_memory);
+    if (shared_memory_per_block <= 0) {
+      shared_memory_per_block = 32 * 1024;  // 32 KiB: the Apple Silicon norm.
+    }
+    desc->set_shared_memory_per_block(shared_memory_per_block);
+    desc->set_shared_memory_per_block_optin(shared_memory_per_block);
+    desc->set_shared_memory_per_core(shared_memory_per_block);
+
+    // --- Execution units per core ----------------------------------------
+    // 128 FP32 ALUs per GPU core across all Apple Silicon families.
+    desc->set_fpus_per_core(kAppleAlusPerCore);
+
+    // --- Core count (query first, then estimate) -------------------------
+    const AppleGpuSpec* spec = FindAppleGpuSpec(device_name);
+    int core_count = QueryGpuCoreCountFromIOKit(device);
+    if (core_count <= 0) {
+      // IOKit lookup failed: fall back to the per-SKU table.
+      core_count = spec != nullptr ? spec->core_count : 0;
+    }
+    if (core_count <= 0) {
+      // Last resort so topology inference never divides by zero. 8 is the
+      // smallest shipping Apple Silicon GPU configuration.
+      core_count = 8;
+    }
+    desc->set_core_count(core_count);
+
+    // --- Clock, bandwidth, cache (estimated; not exposed by Metal) -------
+    // None of these are available through any public Metal API, so they are
+    // estimated from the device name where known and from the GPU family
+    // generation otherwise. See AppleGpuSpec for the caveats.
+    desc->set_clock_rate_ghz(static_cast<float>(
+        spec != nullptr ? spec->clock_ghz : FallbackClockGhz(generation)));
+    desc->set_memory_bandwidth(spec != nullptr ? spec->memory_bandwidth
+                                               : FallbackBandwidth(generation));
+    desc->set_l2_cache_size(spec != nullptr ? spec->l2_cache_size : MiB(8));
   }
   return desc;
 }

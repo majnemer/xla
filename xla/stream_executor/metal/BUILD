@@ -113,6 +113,7 @@ objc_library(
     srcs = ["metal_executor.mm"],
     sdk_frameworks = [
         "Foundation",
+        "IOKit",
         "Metal",
     ],
     target_compatible_with = ["@platforms//os:macos"],
