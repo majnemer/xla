@@ -60,10 +60,13 @@ void MetalAllocator::Deallocate(void *base) {
   if (base == nullptr) {
     return;
   }
-  absl::MutexLock lock(&mu_);
-  buffers_.erase(base);
-  // ARC releases the MTLBuffer when its last reference (the map entry) is
-  // dropped.
+  // Erasing the map entry drops the last reference to the MTLBuffer and runs
+  // its dealloc, which autoreleases the buffer's device reference. Bound that
+  // here so it does not leak when Deallocate runs on a thread with no pool.
+  @autoreleasepool {
+    absl::MutexLock lock(&mu_);
+    buffers_.erase(base);
+  }
 }
 
 std::optional<MetalAllocator::Resolved>
