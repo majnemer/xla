@@ -24,6 +24,7 @@ limitations under the License.
 #include <memory>
 #include <vector>
 
+#include "absl/base/call_once.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -39,6 +40,25 @@ limitations under the License.
 
 namespace stream_executor::metal {
 namespace {
+
+// MPSGraph runs its (asynchronous) compilation on the dispatch queue set on the
+// compilation descriptor. The queue MPSGraph uses by default does not wrap its
+// work items in an autorelease pool, so the bundle / shader library / Swift
+// temporaries MPSGraph creates while loading its libraries autorelease with no
+// pool in place. Route compilation onto a process-wide serial queue created
+// with a per-work-item autorelease frequency, so each compilation work item
+// drains its own temporaries.
+dispatch_queue_t MpsCompilationQueue() {
+  static absl::once_flag once;
+  static dispatch_queue_t queue;
+  absl::call_once(once, [] {
+    dispatch_queue_attr_t attr =
+        dispatch_queue_attr_make_with_autorelease_frequency(
+            DISPATCH_QUEUE_SERIAL, DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM);
+    queue = dispatch_queue_create("xla.metal.mps_fft_compile", attr);
+  });
+  return queue;
+}
 
 // Maps an XLA fft::Type onto MPSGraph descriptor settings + tensor dtypes.
 // Returns false if the type is unsupported (F64 variants on Apple silicon).
@@ -286,6 +306,7 @@ std::unique_ptr<fft::Plan> MetalFft::CreateBatchedPlanWithScratchAllocator(
     NSError* err = nil;
     MPSGraphCompilationDescriptor* compile_desc =
         [[MPSGraphCompilationDescriptor alloc] init];
+    compile_desc.dispatchQueue = MpsCompilationQueue();
     MPSGraphExecutable* executable =
         [graph compileWithDevice:nil
                             feeds:feeds

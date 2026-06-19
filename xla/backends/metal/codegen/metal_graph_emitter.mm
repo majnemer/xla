@@ -26,6 +26,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/base/call_once.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -47,6 +48,25 @@ limitations under the License.
 namespace xla {
 namespace metal {
 namespace {
+
+// MPSGraph runs its (asynchronous) compilation on the dispatch queue set on the
+// compilation descriptor. The queue MPSGraph uses by default does not wrap its
+// work items in an autorelease pool, so the bundle / shader library / Swift
+// temporaries MPSGraph creates while loading its libraries autorelease with no
+// pool in place. Route compilation onto a process-wide serial queue created
+// with a per-work-item autorelease frequency, so each compilation work item
+// drains its own temporaries.
+dispatch_queue_t MpsCompilationQueue() {
+  static absl::once_flag once;
+  static dispatch_queue_t queue;
+  absl::call_once(once, [] {
+    dispatch_queue_attr_t attr =
+        dispatch_queue_attr_make_with_autorelease_frequency(
+            DISPATCH_QUEUE_SERIAL, DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM);
+    queue = dispatch_queue_create("xla.metal.mps_graph_compile", attr);
+  });
+  return queue;
+}
 
 absl::StatusOr<MPSDataType> MpsDataTypeFor(PrimitiveType type) {
   switch (type) {
@@ -211,6 +231,7 @@ class GraphBuilder {
 
     MPSGraphCompilationDescriptor* compile_desc =
         [[MPSGraphCompilationDescriptor alloc] init];
+    compile_desc.dispatchQueue = MpsCompilationQueue();
     MPSGraphDevice* graph_device =
         device != nil ? [MPSGraphDevice deviceWithMTLDevice:device] : nil;
     MPSGraphExecutable* executable =
