@@ -35,30 +35,30 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
-#include "xla/stream_executor/fft.h"
-#include "xla/stream_executor/metal/metal_platform_id.h"
-#include "xla/stream_executor/plugin_registry.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/event.h"
-#include "xla/stream_executor/gpu/gpu_executor.h"
+#include "xla/stream_executor/event_based_timer.h"
+#include "xla/stream_executor/fft.h"
 #include "xla/stream_executor/generic_memory_allocation.h"
 #include "xla/stream_executor/generic_memory_allocator.h"
-#include "xla/stream_executor/memory_allocation.h"
-#include "xla/stream_executor/memory_allocator.h"
-#include "xla/tsl/platform/statusor.h"
-#include "xla/stream_executor/metal/metal_allocator.h"
+#include "xla/stream_executor/gpu/gpu_executor.h"
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/kernel_args_packing_spec.h"
 #include "xla/stream_executor/kernel_spec.h"
+#include "xla/stream_executor/memory_allocation.h"
+#include "xla/stream_executor/memory_allocator.h"
+#include "xla/stream_executor/metal/metal_allocator.h"
 #include "xla/stream_executor/metal/metal_compute_capability.h"
 #include "xla/stream_executor/metal/metal_event.h"
 #include "xla/stream_executor/metal/metal_kernel.h"
+#include "xla/stream_executor/metal/metal_platform_id.h"
 #include "xla/stream_executor/metal/metal_stream.h"
 #include "xla/stream_executor/metal/metal_timer.h"
-#include "xla/stream_executor/event_based_timer.h"
 #include "xla/stream_executor/platform.h"
+#include "xla/stream_executor/plugin_registry.h"
 #include "xla/stream_executor/stream.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace stream_executor {
 namespace metal {
@@ -72,11 +72,11 @@ int GetAppleFamilyGeneration(id<MTLDevice> device) {
     MTLGPUFamily family;
     int generation;
   } kFamilies[] = {
-      {MTLGPUFamilyApple9, 9},  // M3 / A17
-      {MTLGPUFamilyApple8, 8},  // M2 / A15-A16
-      {MTLGPUFamilyApple7, 7},  // M1 / A14
+      {MTLGPUFamilyApple9, 9}, // M3 / A17
+      {MTLGPUFamilyApple8, 8}, // M2 / A15-A16
+      {MTLGPUFamilyApple7, 7}, // M1 / A14
   };
-  for (const auto& f : kFamilies) {
+  for (const auto &f : kFamilies) {
     if ([device supportsFamily:f.family]) {
       return f.generation;
     }
@@ -106,8 +106,9 @@ int QueryGpuCoreCountFromIOKit(id<MTLDevice> device) {
   if (registry_id == 0) {
     return 0;
   }
-  // IORegistryEntryIDMatching returns a dictionary with a +1 reference that is
-  // consumed by IOServiceGetMatchingService, so we must not release it here.
+  // IORegistryEntryIDMatching returns a dictionary with a +1 reference that
+  // is consumed by IOServiceGetMatchingService, so we must not release it
+  // here.
   CFMutableDictionaryRef matching = IORegistryEntryIDMatching(registry_id);
   if (matching == nullptr) {
     return 0;
@@ -153,7 +154,7 @@ constexpr int64_t MiB(int64_t mib) { return mib * 1024 * 1024; }
 // here is the full-die value and a fallback only; QueryGpuCoreCountFromIOKit is
 // preferred whenever it succeeds.
 struct AppleGpuSpec {
-  const char* name_substr;
+  const char *name_substr;
   int core_count;
   double clock_ghz;
   int64_t memory_bandwidth;
@@ -184,8 +185,8 @@ const AppleGpuSpec kAppleGpuSpecs[] = {
     {"M1", 8, 1.278, GBs(68.25), MiB(8)},
 };
 
-const AppleGpuSpec* FindAppleGpuSpec(const std::string& device_name) {
-  for (const AppleGpuSpec& spec : kAppleGpuSpecs) {
+const AppleGpuSpec *FindAppleGpuSpec(const std::string &device_name) {
+  for (const AppleGpuSpec &spec : kAppleGpuSpecs) {
     if (device_name.find(spec.name_substr) != std::string::npos) {
       return &spec;
     }
@@ -196,15 +197,20 @@ const AppleGpuSpec* FindAppleGpuSpec(const std::string& device_name) {
 // Conservative per-generation fallbacks used when the device name is not in the
 // table above (e.g. an A-series GPU, or a future part).
 double FallbackClockGhz(int generation) {
-  if (generation >= 9) return 1.40;
-  if (generation == 8) return 1.398;
-  if (generation == 7) return 1.278;
+  if (generation >= 9)
+    return 1.40;
+  if (generation == 8)
+    return 1.398;
+  if (generation == 7)
+    return 1.278;
   return 1.0;
 }
 
 int64_t FallbackBandwidth(int generation) {
-  if (generation >= 8) return GBs(100);
-  if (generation == 7) return GBs(68.25);
+  if (generation >= 8)
+    return GBs(100);
+  if (generation == 7)
+    return GBs(68.25);
   return GBs(50);
 }
 
@@ -214,19 +220,19 @@ MemorySpace NormalizeMetalAllocationMemorySpace(MemorySpace type) {
   return type == MemorySpace::kCollective ? MemorySpace::kDevice : type;
 }
 
-}  // namespace
+} // namespace
 
-MetalExecutor::MetalExecutor(Platform* platform, int ordinal)
+MetalExecutor::MetalExecutor(Platform *platform, int ordinal)
     : gpu::GpuExecutor(platform, ordinal), device_(nil) {}
 
 MetalExecutor::~MetalExecutor() = default;
 
-fft::FftSupport* MetalExecutor::AsFft() {
+fft::FftSupport *MetalExecutor::AsFft() {
   absl::MutexLock lock(&mu_);
   if (fft_ != nullptr) {
     return fft_.get();
   }
-  PluginRegistry* registry = PluginRegistry::Instance();
+  PluginRegistry *registry = PluginRegistry::Instance();
   absl::StatusOr<PluginRegistry::FftFactory> factory =
       registry->GetFactory<PluginRegistry::FftFactory>(kMetalPlatformId);
   if (!factory.ok()) {
@@ -239,29 +245,28 @@ fft::FftSupport* MetalExecutor::AsFft() {
 }
 
 absl::Status MetalExecutor::Init() {
-  NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();
-  const int ordinal = device_ordinal();
-  if (devices == nil ||
-      ordinal < 0 ||
-      ordinal >= static_cast<int>([devices count])) {
-    return absl::NotFoundError(
-        absl::StrCat("Metal device ordinal ", ordinal, " is out of range; ",
-                     "system reports ",
-                     devices == nil ? 0 : static_cast<int>([devices count]),
-                     " device(s)."));
+  @autoreleasepool {
+    NSArray<id<MTLDevice>> *devices = MTLCopyAllDevices();
+    const int ordinal = device_ordinal();
+    if (devices == nil || ordinal < 0 ||
+        ordinal >= static_cast<int>([devices count])) {
+      return absl::NotFoundError(
+          absl::StrCat("Metal device ordinal ", ordinal, " is out of range; ",
+                       "system reports ",
+                       devices == nil ? 0 : static_cast<int>([devices count]),
+                       " device(s)."));
+    }
+    device_ = devices[ordinal];
+    allocator_ = std::make_unique<MetalAllocator>(device_);
+    return absl::OkStatus();
   }
-  device_ = devices[ordinal];
-  allocator_ = std::make_unique<MetalAllocator>(device_);
-  return absl::OkStatus();
 }
 
 absl::StatusOr<std::unique_ptr<DeviceDescription>>
 MetalExecutor::CreateDeviceDescription(int ordinal) {
-  std::unique_ptr<DeviceDescription> desc;
   @autoreleasepool {
-    NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();
-    if (devices == nil ||
-        ordinal < 0 ||
+    NSArray<id<MTLDevice>> *devices = MTLCopyAllDevices();
+    if (devices == nil || ordinal < 0 ||
         ordinal >= static_cast<int>([devices count])) {
       return absl::NotFoundError(
           absl::StrCat("Metal device ordinal ", ordinal, " is out of range; ",
@@ -271,8 +276,9 @@ MetalExecutor::CreateDeviceDescription(int ordinal) {
     }
     id<MTLDevice> device = devices[ordinal];
 
-    desc = std::make_unique<DeviceDescription>();
-    const char* raw_name = [[device name] UTF8String];
+    std::unique_ptr<DeviceDescription> desc =
+        std::make_unique<DeviceDescription>();
+    const char *raw_name = [[device name] UTF8String];
     const std::string device_name = raw_name != nullptr ? raw_name : "";
     desc->set_name(device_name);
     desc->set_device_vendor("Apple");
@@ -320,7 +326,7 @@ MetalExecutor::CreateDeviceDescription(int ordinal) {
     int64_t shared_memory_per_block =
         static_cast<int64_t>([device maxThreadgroupMemoryLength]);
     if (shared_memory_per_block <= 0) {
-      shared_memory_per_block = 32 * 1024;  // 32 KiB: the Apple Silicon norm.
+      shared_memory_per_block = 32 * 1024; // 32 KiB: the Apple Silicon norm.
     }
     desc->set_shared_memory_per_block(shared_memory_per_block);
     desc->set_shared_memory_per_block_optin(shared_memory_per_block);
@@ -331,7 +337,7 @@ MetalExecutor::CreateDeviceDescription(int ordinal) {
     desc->set_fpus_per_core(kAppleAlusPerCore);
 
     // --- Core count (query first, then estimate) -------------------------
-    const AppleGpuSpec* spec = FindAppleGpuSpec(device_name);
+    const AppleGpuSpec *spec = FindAppleGpuSpec(device_name);
     int core_count = QueryGpuCoreCountFromIOKit(device);
     if (core_count <= 0) {
       // IOKit lookup failed: fall back to the per-SKU table.
@@ -353,8 +359,8 @@ MetalExecutor::CreateDeviceDescription(int ordinal) {
     desc->set_memory_bandwidth(spec != nullptr ? spec->memory_bandwidth
                                                : FallbackBandwidth(generation));
     desc->set_l2_cache_size(spec != nullptr ? spec->l2_cache_size : MiB(8));
+    return desc;
   }
-  return desc;
 }
 
 absl::StatusOr<std::unique_ptr<Stream>> MetalExecutor::CreateStream(
@@ -373,9 +379,9 @@ absl::StatusOr<std::unique_ptr<Event>> MetalExecutor::CreateEvent() {
 }
 
 absl::StatusOr<std::unique_ptr<EventBasedTimer>>
-MetalExecutor::CreateEventBasedTimer(Stream* stream,
+MetalExecutor::CreateEventBasedTimer(Stream *stream,
                                      bool /*use_delay_kernel*/) {
-  auto* metal_stream = dynamic_cast<MetalStream*>(stream);
+  auto *metal_stream = dynamic_cast<MetalStream *>(stream);
   if (metal_stream == nullptr) {
     return absl::InvalidArgumentError(
         "MetalExecutor::CreateEventBasedTimer: stream is not a MetalStream.");
@@ -384,51 +390,50 @@ MetalExecutor::CreateEventBasedTimer(Stream* stream,
   return std::make_unique<MetalTimer>(std::move(timer));
 }
 
-absl::StatusOr<id<MTLLibrary>> MetalExecutor::LoadLibraryFromMsl(
-    const char* source) {
-  auto it = source_to_library_.find(source);
-  if (it != source_to_library_.end()) {
-    ++it->second.second;
-    return it->second.first;
-  }
-  id<MTLDevice> device = device_;
-  if (device == nil) {
-    return absl::FailedPreconditionError(
-        "MetalExecutor::LoadLibraryFromMsl: device is nil; was Init() "
-        "called?");
-  }
+absl::StatusOr<id<MTLLibrary>>
+MetalExecutor::LoadLibraryFromMsl(const char *source) {
   // MSL compilation autoreleases internal temporaries; bound them here.
-  id<MTLLibrary> library;
   @autoreleasepool {
-    NSString* source_ns = [[NSString alloc] initWithUTF8String:source];
+    auto it = source_to_library_.find(source);
+    if (it != source_to_library_.end()) {
+      ++it->second.second;
+      return it->second.first;
+    }
+    id<MTLDevice> device = device_;
+    if (device == nil) {
+      return absl::FailedPreconditionError(
+          "MetalExecutor::LoadLibraryFromMsl: device is nil; was Init() "
+          "called?");
+    }
+    NSString *source_ns = [[NSString alloc] initWithUTF8String:source];
     if (source_ns == nil) {
       return absl::InvalidArgumentError(
           "MetalExecutor::LoadLibraryFromMsl: MSL source is not valid UTF-8.");
     }
-    MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+    MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
     options.fastMathEnabled = NO;
-    NSError* error = nil;
-    library =
+    NSError *error = nil;
+    id<MTLLibrary> library =
         [device newLibraryWithSource:source_ns options:options error:&error];
     if (library == nil) {
-      NSString* msg = error == nil ? @"(no error info)" : [error description];
+      NSString *msg = error == nil ? @"(no error info)" : [error description];
       return absl::InternalError(
           absl::StrCat("MetalExecutor::LoadLibraryFromMsl: "
                        "newLibraryWithSource failed: ",
                        [msg UTF8String]));
     }
     source_to_library_.emplace(source, std::make_pair(library, uint64_t{1}));
+    return library;
   }
-  return library;
 }
 
-void MetalExecutor::UnloadKernel(const Kernel* kernel) {
+void MetalExecutor::UnloadKernel(const Kernel *kernel) {
   absl::MutexLock lock(in_memory_libraries_mu_);
   auto src_it = kernel_to_source_.find(kernel);
   if (src_it == kernel_to_source_.end()) {
-    return;  // Never recorded — nothing to release.
+    return; // Never recorded — nothing to release.
   }
-  const char* source = src_it->second;
+  const char *source = src_it->second;
   kernel_to_source_.erase(src_it);
   auto lib_it = source_to_library_.find(source);
   if (lib_it == source_to_library_.end()) {
@@ -439,53 +444,54 @@ void MetalExecutor::UnloadKernel(const Kernel* kernel) {
   }
 }
 
-absl::StatusOr<std::unique_ptr<Kernel>> MetalExecutor::LoadKernel(
-    const KernelLoaderSpec& spec) {
-  auto msl = spec.msl_source_in_memory();
-  if (!msl.has_value()) {
-    return absl::InvalidArgumentError(
-        "MetalExecutor::LoadKernel: spec does not contain MSL source — "
-        "Metal only supports MslSourceInMemory / OwningMslSourceInMemory.");
-  }
-  const char* source_ptr = msl->source.data();
-  id<MTLLibrary> library = nil;
-  {
-    absl::MutexLock lock(in_memory_libraries_mu_);
-    auto cached = LoadLibraryFromMsl(source_ptr);
-    if (!cached.ok()) {
-      return cached.status();
+absl::StatusOr<std::unique_ptr<Kernel>>
+MetalExecutor::LoadKernel(const KernelLoaderSpec &spec) {
+  @autoreleasepool {
+    auto msl = spec.msl_source_in_memory();
+    if (!msl.has_value()) {
+      return absl::InvalidArgumentError(
+          "MetalExecutor::LoadKernel: spec does not contain MSL source — "
+          "Metal only supports MslSourceInMemory / OwningMslSourceInMemory.");
     }
-    library = *cached;
+    const char *source_ptr = msl->source.data();
+    id<MTLLibrary> library = nil;
+    {
+      absl::MutexLock lock(in_memory_libraries_mu_);
+      auto cached = LoadLibraryFromMsl(source_ptr);
+      if (!cached.ok()) {
+        return cached.status();
+      }
+      library = *cached;
+    }
+    auto kernel = MetalKernel::Create(this, library, spec.kernel_name(),
+                                      static_cast<unsigned>(spec.arity()));
+    if (!kernel.ok()) {
+      return kernel.status();
+    }
+    (*kernel)->set_name(spec.kernel_name());
+    {
+      absl::MutexLock lock(in_memory_libraries_mu_);
+      kernel_to_source_.emplace(kernel->get(), source_ptr);
+    }
+    const auto &packing = spec.kernel_args_packing();
+    if (std::holds_alternative<KernelLoaderSpec::KernelArgsPackingFunc>(
+            packing)) {
+      (*kernel)->set_args_packing(
+          std::get<KernelLoaderSpec::KernelArgsPackingFunc>(packing));
+    } else {
+      const auto &packing_spec = std::get<KernelArgsPackingSpec>(packing);
+      (*kernel)->set_args_packing(
+          [packing_spec](const Kernel & /*kernel*/, const KernelArgs &args) {
+            const auto &mem_args = Cast<KernelArgsDeviceAddressArray>(&args);
+            return packing_spec.BuildArguments(mem_args->packed_args(),
+                                               args.number_of_shared_bytes());
+          });
+    }
+    return std::move(*kernel);
   }
-  auto kernel = MetalKernel::Create(this, library, spec.kernel_name(),
-                                    static_cast<unsigned>(spec.arity()));
-  if (!kernel.ok()) {
-    return kernel.status();
-  }
-  (*kernel)->set_name(spec.kernel_name());
-  {
-    absl::MutexLock lock(in_memory_libraries_mu_);
-    kernel_to_source_.emplace(kernel->get(), source_ptr);
-  }
-  const auto& packing = spec.kernel_args_packing();
-  if (std::holds_alternative<KernelLoaderSpec::KernelArgsPackingFunc>(
-          packing)) {
-    (*kernel)->set_args_packing(
-        std::get<KernelLoaderSpec::KernelArgsPackingFunc>(packing));
-  } else {
-    const auto& packing_spec = std::get<KernelArgsPackingSpec>(packing);
-    (*kernel)->set_args_packing(
-        [packing_spec](const Kernel& /*kernel*/, const KernelArgs& args) {
-          const auto& mem_args = Cast<KernelArgsDeviceAddressArray>(&args);
-          return packing_spec.BuildArguments(mem_args->packed_args(),
-                                             args.number_of_shared_bytes());
-        });
-  }
-  return std::move(*kernel);
 }
 
-DeviceAddressBase MetalExecutor::Allocate(uint64_t size,
-                                          int64_t memory_space) {
+DeviceAddressBase MetalExecutor::Allocate(uint64_t size, int64_t memory_space) {
   if (allocator_ == nullptr) {
     return DeviceAddressBase();
   }
@@ -498,7 +504,7 @@ DeviceAddressBase MetalExecutor::Allocate(uint64_t size,
   return DeviceAddressBase(*base, size);
 }
 
-void MetalExecutor::Deallocate(DeviceAddressBase* mem) {
+void MetalExecutor::Deallocate(DeviceAddressBase *mem) {
   if (mem == nullptr || allocator_ == nullptr) {
     return;
   }
@@ -506,19 +512,19 @@ void MetalExecutor::Deallocate(DeviceAddressBase* mem) {
   *mem = DeviceAddressBase();
 }
 
-absl::StatusOr<ModuleHandle> MetalExecutor::LoadModule(
-    const MultiModuleLoaderSpec& spec) {
+absl::StatusOr<ModuleHandle>
+MetalExecutor::LoadModule(const MultiModuleLoaderSpec &spec) {
   auto module = std::make_unique<MetalModule>();
-  for (const MultiModuleLoaderSpec::ConstantSpec& constant : spec.constants()) {
+  for (const MultiModuleLoaderSpec::ConstantSpec &constant : spec.constants()) {
     const uint64_t size = static_cast<uint64_t>(constant.initial_bytes.size());
     DeviceAddressBase addr = Allocate(size, /*memory_space=*/0);
     if (addr.opaque() == nullptr && size > 0) {
-      for (auto& [_, a] : module->symbols) {
+      for (auto &[_, a] : module->symbols) {
         Deallocate(&a);
       }
-      return absl::ResourceExhaustedError(absl::StrCat(
-          "Metal constant allocation of ", size, " bytes failed for symbol ",
-          constant.symbol_name));
+      return absl::ResourceExhaustedError(
+          absl::StrCat("Metal constant allocation of ", size,
+                       " bytes failed for symbol ", constant.symbol_name));
     }
     module->symbols.emplace(std::string(constant.symbol_name), addr);
   }
@@ -539,14 +545,15 @@ bool MetalExecutor::UnloadModule(ModuleHandle module_handle) {
     module = std::move(it->second);
     modules_.erase(it);
   }
-  for (auto& [_, addr] : module->symbols) {
+  for (auto &[_, addr] : module->symbols) {
     Deallocate(&addr);
   }
   return true;
 }
 
-absl::StatusOr<DeviceAddressBase> MetalExecutor::GetSymbol(
-    const std::string& symbol_name, ModuleHandle module_handle) {
+absl::StatusOr<DeviceAddressBase>
+MetalExecutor::GetSymbol(const std::string &symbol_name,
+                         ModuleHandle module_handle) {
   absl::MutexLock lock(&modules_mu_);
   auto it = modules_.find(module_handle);
   if (it == modules_.end()) {
@@ -568,8 +575,8 @@ namespace {
 // address and a value Stream::Memcpy can Resolve back to (MTLBuffer, offset),
 // so device and host allocations are the same physical class.
 class MetalHostMemoryAllocation : public MemoryAllocation {
- public:
-  MetalHostMemoryAllocation(MetalAllocator* allocator, void* base,
+public:
+  MetalHostMemoryAllocation(MetalAllocator *allocator, void *base,
                             uint64_t size)
       : allocator_(allocator), base_(base), size_(size) {}
 
@@ -583,13 +590,13 @@ class MetalHostMemoryAllocation : public MemoryAllocation {
     return DeviceAddressBase(base_, size_);
   }
 
- private:
-  MetalAllocator* allocator_;
-  void* base_;
+private:
+  MetalAllocator *allocator_;
+  void *base_;
   uint64_t size_;
 };
 
-}  // namespace
+} // namespace
 
 absl::StatusOr<std::unique_ptr<MemoryAllocation>>
 MetalExecutor::HostMemoryAllocate(uint64_t size) {
@@ -602,11 +609,11 @@ MetalExecutor::HostMemoryAllocate(uint64_t size) {
     return base.status();
   }
   return std::make_unique<MetalHostMemoryAllocation>(allocator_.get(), *base,
-                                                    size);
+                                                     size);
 }
 
-absl::StatusOr<MemorySpace> MetalExecutor::GetPointerMemorySpace(
-    const void* ptr) {
+absl::StatusOr<MemorySpace>
+MetalExecutor::GetPointerMemorySpace(const void *ptr) {
   if (ptr == nullptr) {
     return absl::InvalidArgumentError(
         "MetalExecutor::GetPointerMemorySpace: null pointer.");
@@ -629,24 +636,24 @@ bool MetalExecutor::SynchronizeAllActivity() {
   // DeallocateStream can't free one while we still hold its pointer. We must
   // not hold streams_mu_ across BlockHostUntilDone — a host callback may
   // create or destroy a stream (taking streams_mu_), which would deadlock.
-  std::vector<Stream*> streams;
+  std::vector<Stream *> streams;
   {
     absl::MutexLock lock(&streams_mu_);
     streams.reserve(streams_.size());
-    for (auto& [s, count] : streams_) {
+    for (auto &[s, count] : streams_) {
       streams.push_back(s);
       ++count;
     }
   }
   bool ok = true;
-  for (Stream* s : streams) {
+  for (Stream *s : streams) {
     if (!s->BlockHostUntilDone().ok()) {
       ok = false;
     }
   }
   {
     absl::MutexLock lock(&streams_mu_);
-    for (Stream* s : streams) {
+    for (Stream *s : streams) {
       auto it = streams_.find(s);
       CHECK(it != streams_.end());
       --it->second;
@@ -655,8 +662,9 @@ bool MetalExecutor::SynchronizeAllActivity() {
   return ok;
 }
 
-absl::Status MetalExecutor::SynchronousMemcpy(
-    DeviceAddressBase* device_dst, const void* host_src, uint64_t size) {
+absl::Status MetalExecutor::SynchronousMemcpy(DeviceAddressBase *device_dst,
+                                              const void *host_src,
+                                              uint64_t size) {
   if (size == 0) {
     return absl::OkStatus();
   }
@@ -679,7 +687,7 @@ absl::Status MetalExecutor::SynchronousMemcpy(
 }
 
 absl::Status MetalExecutor::SynchronousMemcpy(
-    void* host_dst, const DeviceAddressBase& device_src, uint64_t size) {
+    void *host_dst, const DeviceAddressBase &device_src, uint64_t size) {
   if (size == 0) {
     return absl::OkStatus();
   }
@@ -697,29 +705,30 @@ absl::Status MetalExecutor::SynchronousMemcpy(
   return absl::OkStatus();
 }
 
-void MetalExecutor::DeallocateStream(Stream* stream) {
-  if (stream == nullptr) return;
+void MetalExecutor::DeallocateStream(Stream *stream) {
+  if (stream == nullptr)
+    return;
   absl::MutexLock lock(&streams_mu_);
   // Block until any in-flight SynchronizeAllActivity has released its
   // references — otherwise its BlockHostUntilDone call could outlive the
   // object. The stream's own liveness holds the count at 1; a count above
   // that means a drain still references it. Erasing drops the liveness.
   const auto drained = [this, stream]()
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(streams_mu_) {
-        auto it = streams_.find(stream);
-        CHECK(it != streams_.end());
-        return it->second == 1;
-      };
+                           ABSL_EXCLUSIVE_LOCKS_REQUIRED(streams_mu_) {
+                             auto it = streams_.find(stream);
+                             CHECK(it != streams_.end());
+                             return it->second == 1;
+                           };
   streams_mu_.Await(absl::Condition(&drained));
   streams_.erase(stream);
 }
 
-absl::Status MetalExecutor::EnablePeerAccessTo(StreamExecutor* /*other*/) {
+absl::Status MetalExecutor::EnablePeerAccessTo(StreamExecutor * /*other*/) {
   return absl::UnimplementedError(
       "Metal does not support peer access between devices.");
 }
 
-bool MetalExecutor::CanEnablePeerAccessTo(StreamExecutor* /*other*/) {
+bool MetalExecutor::CanEnablePeerAccessTo(StreamExecutor * /*other*/) {
   return false;
 }
 
@@ -745,40 +754,45 @@ MetalExecutor::CreateMemoryAllocator(MemorySpace type) {
             -> absl::StatusOr<std::unique_ptr<MemoryAllocation>> {
           MemorySpace allocation_type =
               NormalizeMetalAllocationMemorySpace(type);
-          TF_ASSIGN_OR_RETURN(void* base,
+          TF_ASSIGN_OR_RETURN(void *base,
                               allocator_->Allocate(size, allocation_type));
           return std::make_unique<GenericMemoryAllocation>(
-              base, size, [this](void* ptr, uint64_t /*size*/) {
+              base, size, [this](void *ptr, uint64_t /*size*/) {
                 allocator_->Deallocate(ptr);
               });
         });
   }
-  return absl::UnimplementedError(absl::StrCat(
-      "MetalExecutor::CreateMemoryAllocator: memory space ",
-      static_cast<int>(type), " is not supported."));
+  return absl::UnimplementedError(
+      absl::StrCat("MetalExecutor::CreateMemoryAllocator: memory space ",
+                   static_cast<int>(type), " is not supported."));
 }
 
-bool MetalExecutor::DeviceMemoryUsage(int64_t* free, int64_t* total) const {
-  if (device_ == nil) {
-    return false;
+bool MetalExecutor::DeviceMemoryUsage(int64_t *free, int64_t *total) const {
+  @autoreleasepool {
+    if (device_ == nil) {
+      return false;
+    }
+    const int64_t total_bytes =
+        static_cast<int64_t>([device_ recommendedMaxWorkingSetSize]);
+    const int64_t allocated =
+        static_cast<int64_t>([device_ currentAllocatedSize]);
+    *total = total_bytes;
+    *free = std::max<int64_t>(0, total_bytes - allocated);
+    return true;
   }
-  const int64_t total_bytes =
-      static_cast<int64_t>([device_ recommendedMaxWorkingSetSize]);
-  const int64_t allocated =
-      static_cast<int64_t>([device_ currentAllocatedSize]);
-  *total = total_bytes;
-  *free = std::max<int64_t>(0, total_bytes - allocated);
-  return true;
 }
 
-void* GetMetalDeviceOpaque(StreamExecutor* stream_exec) {
-  if (stream_exec == nullptr) return nullptr;
-  auto* metal_executor = dynamic_cast<MetalExecutor*>(stream_exec);
-  if (metal_executor == nullptr) return nullptr;
+void *GetMetalDeviceOpaque(StreamExecutor *stream_exec) {
+  if (stream_exec == nullptr)
+    return nullptr;
+  auto *metal_executor = dynamic_cast<MetalExecutor *>(stream_exec);
+  if (metal_executor == nullptr)
+    return nullptr;
   id<MTLDevice> device = metal_executor->device();
-  if (device == nil) return nullptr;
-  return (__bridge void*)device;
+  if (device == nil)
+    return nullptr;
+  return (__bridge void *)device;
 }
 
-}  // namespace metal
-}  // namespace stream_executor
+} // namespace metal
+} // namespace stream_executor

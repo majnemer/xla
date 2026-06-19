@@ -32,12 +32,12 @@ namespace metal {
 
 namespace {
 
-std::string DescribeError(NSError* err, absl::string_view stage) {
-  NSString* msg = err == nil ? @"(no error info)" : [err description];
+std::string DescribeError(NSError *err, absl::string_view stage) {
+  NSString *msg = err == nil ? @"(no error info)" : [err description];
   return absl::StrCat(stage, ": ", [msg UTF8String]);
 }
 
-}  // namespace
+} // namespace
 
 PipelineStateRef::PipelineStateRef() : opaque_(nullptr) {}
 
@@ -51,13 +51,13 @@ PipelineStateRef::~PipelineStateRef() {
   }
 }
 
-PipelineStateRef::PipelineStateRef(PipelineStateRef&& other) noexcept
+PipelineStateRef::PipelineStateRef(PipelineStateRef &&other) noexcept
     : opaque_(other.opaque_) {
   other.opaque_ = nullptr;
 }
 
-PipelineStateRef& PipelineStateRef::operator=(
-    PipelineStateRef&& other) noexcept {
+PipelineStateRef &
+PipelineStateRef::operator=(PipelineStateRef &&other) noexcept {
   if (this != &other) {
     if (opaque_ != nullptr) {
       id<MTLComputePipelineState> pso =
@@ -73,50 +73,48 @@ PipelineStateRef& PipelineStateRef::operator=(
 // Helper that lets only this file construct a PipelineStateRef from a +1
 // owned id<MTLComputePipelineState>. Keeps the ARC bookkeeping local.
 class PipelineStateBuilder {
- public:
-  static std::shared_ptr<PipelineStateRef> Take(
-      id<MTLComputePipelineState> pso) {
+public:
+  static std::shared_ptr<PipelineStateRef>
+  Take(id<MTLComputePipelineState> pso) {
     auto ref = std::make_shared<PipelineStateRef>();
     // __bridge_retained: transfer ownership from ARC to opaque +1.
-    ref->opaque_ = (__bridge_retained void*)pso;
+    ref->opaque_ = (__bridge_retained void *)pso;
     return ref;
   }
 };
 
-absl::StatusOr<CompiledPipeline> CompileAndProbe(
-    void* device_opaque, absl::string_view msl, absl::string_view entry_name,
-    int64_t descriptor_thread_hint) {
-  if (device_opaque == nullptr) {
-    return absl::InvalidArgumentError("CompileAndProbe: null device handle.");
-  }
-  id<MTLDevice> device = (__bridge id<MTLDevice>)device_opaque;
-  if (descriptor_thread_hint < 1) {
-    return absl::InvalidArgumentError(absl::StrCat(
-        "CompileAndProbe: descriptor_thread_hint must be >= 1; got ",
-        descriptor_thread_hint));
-  }
-
+absl::StatusOr<CompiledPipeline>
+CompileAndProbe(void *device_opaque, absl::string_view msl,
+                absl::string_view entry_name, int64_t descriptor_thread_hint) {
   @autoreleasepool {
-    NSString* source_ns = [[NSString alloc]
-        initWithBytes:msl.data()
-               length:msl.size()
-             encoding:NSUTF8StringEncoding];
+    if (device_opaque == nullptr) {
+      return absl::InvalidArgumentError("CompileAndProbe: null device handle.");
+    }
+    id<MTLDevice> device = (__bridge id<MTLDevice>)device_opaque;
+    if (descriptor_thread_hint < 1) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "CompileAndProbe: descriptor_thread_hint must be >= 1; got ",
+          descriptor_thread_hint));
+    }
+
+    NSString *source_ns = [[NSString alloc] initWithBytes:msl.data()
+                                                   length:msl.size()
+                                                 encoding:NSUTF8StringEncoding];
     if (source_ns == nil) {
       return absl::InvalidArgumentError(
           "CompileAndProbe: MSL source is not valid UTF-8.");
     }
-    NSString* fn_ns = [[NSString alloc]
-        initWithBytes:entry_name.data()
-               length:entry_name.size()
-             encoding:NSUTF8StringEncoding];
+    NSString *fn_ns = [[NSString alloc] initWithBytes:entry_name.data()
+                                               length:entry_name.size()
+                                             encoding:NSUTF8StringEncoding];
     if (fn_ns == nil) {
       return absl::InvalidArgumentError(
           "CompileAndProbe: entry name is not valid UTF-8.");
     }
 
-    MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
+    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
     opts.fastMathEnabled = NO;
-    NSError* err = nil;
+    NSError *err = nil;
     id<MTLLibrary> library =
         [device newLibraryWithSource:source_ns options:opts error:&err];
     if (library == nil) {
@@ -126,12 +124,12 @@ absl::StatusOr<CompiledPipeline> CompileAndProbe(
 
     id<MTLFunction> fn = [library newFunctionWithName:fn_ns];
     if (fn == nil) {
-      return absl::NotFoundError(absl::StrCat(
-          "CompileAndProbe: entry point '", entry_name,
-          "' not found in compiled MSL."));
+      return absl::NotFoundError(absl::StrCat("CompileAndProbe: entry point '",
+                                              entry_name,
+                                              "' not found in compiled MSL."));
     }
 
-    MTLComputePipelineDescriptor* desc =
+    MTLComputePipelineDescriptor *desc =
         [[MTLComputePipelineDescriptor alloc] init];
     desc.computeFunction = fn;
     // Compiler hint: we won't dispatch wider than this, so the register
@@ -142,11 +140,11 @@ absl::StatusOr<CompiledPipeline> CompileAndProbe(
         static_cast<NSUInteger>(descriptor_thread_hint);
 
     err = nil;
-    id<MTLComputePipelineState> pso = [device
-        newComputePipelineStateWithDescriptor:desc
-                                      options:MTLPipelineOptionNone
-                                   reflection:nil
-                                        error:&err];
+    id<MTLComputePipelineState> pso =
+        [device newComputePipelineStateWithDescriptor:desc
+                                              options:MTLPipelineOptionNone
+                                           reflection:nil
+                                                error:&err];
     if (pso == nil) {
       return absl::InternalError(
           DescribeError(err, "CompileAndProbe: newComputePipelineState"));
@@ -160,5 +158,5 @@ absl::StatusOr<CompiledPipeline> CompileAndProbe(
   }
 }
 
-}  // namespace metal
-}  // namespace stream_executor
+} // namespace metal
+} // namespace stream_executor

@@ -51,23 +51,26 @@ MetalEvent::~MetalEvent() = default;
 
 absl::StatusOr<std::unique_ptr<MetalEvent>>
 MetalEvent::Create(MetalExecutor *executor, bool allow_timing) {
-  if (executor == nullptr) {
-    return absl::InvalidArgumentError("MetalEvent::Create: executor is null.");
+  @autoreleasepool {
+    if (executor == nullptr) {
+      return absl::InvalidArgumentError(
+          "MetalEvent::Create: executor is null.");
+    }
+    id<MTLDevice> device = executor->device();
+    if (device == nil) {
+      return absl::FailedPreconditionError(
+          "MetalEvent::Create: executor has no MTLDevice; was Init() called?");
+    }
+    id<MTLSharedEvent> shared_event = [device newSharedEvent];
+    if (shared_event == nil) {
+      return absl::ResourceExhaustedError(
+          "MetalEvent::Create: [MTLDevice newSharedEvent] returned nil.");
+    }
+    // 0 means "never recorded" in this backend.
+    shared_event.signaledValue = 0;
+    return std::unique_ptr<MetalEvent>(
+        new MetalEvent(shared_event, allow_timing));
   }
-  id<MTLDevice> device = executor->device();
-  if (device == nil) {
-    return absl::FailedPreconditionError(
-        "MetalEvent::Create: executor has no MTLDevice; was Init() called?");
-  }
-  id<MTLSharedEvent> shared_event = [device newSharedEvent];
-  if (shared_event == nil) {
-    return absl::ResourceExhaustedError(
-        "MetalEvent::Create: [MTLDevice newSharedEvent] returned nil.");
-  }
-  // 0 means "never recorded" in this backend.
-  shared_event.signaledValue = 0;
-  return std::unique_ptr<MetalEvent>(
-      new MetalEvent(shared_event, allow_timing));
 }
 
 void MetalEvent::PublishRecordedValue(uint64_t value,
@@ -123,32 +126,32 @@ absl::Status CommandBufferStatusToStatus(id<MTLCommandBuffer> cmd_buf,
 
 absl::StatusOr<absl::Duration>
 MetalEvent::ElapsedDurationSince(const MetalEvent &start) const {
-  TF_ASSIGN_OR_RETURN(RecordedCommandBuffer start_record,
-                      start.GetTimingRecord());
-  TF_ASSIGN_OR_RETURN(RecordedCommandBuffer stop_record, GetTimingRecord());
-
   @autoreleasepool {
+    TF_ASSIGN_OR_RETURN(RecordedCommandBuffer start_record,
+                        start.GetTimingRecord());
+    TF_ASSIGN_OR_RETURN(RecordedCommandBuffer stop_record, GetTimingRecord());
+
     [start_record.command_buffer waitUntilCompleted];
     [stop_record.command_buffer waitUntilCompleted];
     TF_RETURN_IF_ERROR(CommandBufferStatusToStatus(
         start_record.command_buffer, "MetalEvent::Elapsed start"));
     TF_RETURN_IF_ERROR(CommandBufferStatusToStatus(stop_record.command_buffer,
                                                    "MetalEvent::Elapsed stop"));
-  }
 
-  // Each event-record cmd_buf has only a single encodeSignalEvent; GPUEndTime
-  // of the start cmd_buf marks when the start signal fired, GPUStartTime of
-  // the stop cmd_buf marks when the stop signal is about to fire. The
-  // interval between those two is the elapsed GPU time.
-  CFTimeInterval start_time = start_record.command_buffer.GPUEndTime;
-  CFTimeInterval stop_time = stop_record.command_buffer.GPUStartTime;
-  if (start_time == 0 || stop_time == 0 || stop_time < start_time) {
-    return absl::InternalError(
-        absl::StrCat("MetalEvent::ElapsedDurationSince: invalid GPU timestamps "
-                     "(start_GPUEndTime=",
-                     start_time, ", stop_GPUStartTime=", stop_time, ")."));
+    // Each event-record cmd_buf has only a single encodeSignalEvent; GPUEndTime
+    // of the start cmd_buf marks when the start signal fired, GPUStartTime of
+    // the stop cmd_buf marks when the stop signal is about to fire. The
+    // interval between those two is the elapsed GPU time.
+    CFTimeInterval start_time = start_record.command_buffer.GPUEndTime;
+    CFTimeInterval stop_time = stop_record.command_buffer.GPUStartTime;
+    if (start_time == 0 || stop_time == 0 || stop_time < start_time) {
+      return absl::InternalError(absl::StrCat(
+          "MetalEvent::ElapsedDurationSince: invalid GPU timestamps "
+          "(start_GPUEndTime=",
+          start_time, ", stop_GPUStartTime=", stop_time, ")."));
+    }
+    return absl::Seconds(stop_time - start_time);
   }
-  return absl::Seconds(stop_time - start_time);
 }
 
 void MetalEvent::MarkSignalErrorForValue(

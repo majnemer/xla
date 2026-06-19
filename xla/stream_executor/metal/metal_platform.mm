@@ -39,14 +39,16 @@ MetalPlatform::MetalPlatform() : name_(kMetalPlatformId->ToName()) {}
 
 PlatformId MetalPlatform::id() const { return kMetalPlatformId; }
 
-const std::string& MetalPlatform::Name() const { return name_; }
+const std::string &MetalPlatform::Name() const { return name_; }
 
 int MetalPlatform::VisibleDeviceCount() const {
-  NSArray* devices = MTLCopyAllDevices();
-  if (devices == nil) {
-    return 0;
+  @autoreleasepool {
+    NSArray *devices = MTLCopyAllDevices();
+    if (devices == nil) {
+      return 0;
+    }
+    return static_cast<int>([devices count]);
   }
-  return static_cast<int>([devices count]);
 }
 
 absl::StatusOr<std::unique_ptr<DeviceDescription>>
@@ -54,7 +56,7 @@ MetalPlatform::DescriptionForDevice(int ordinal) const {
   return MetalExecutor::CreateDeviceDescription(ordinal);
 }
 
-absl::StatusOr<StreamExecutor*> MetalPlatform::ExecutorForDevice(int ordinal) {
+absl::StatusOr<StreamExecutor *> MetalPlatform::ExecutorForDevice(int ordinal) {
   return executor_cache_.GetOrCreate(
       ordinal,
       [this, ordinal]() -> absl::StatusOr<std::unique_ptr<StreamExecutor>> {
@@ -64,11 +66,11 @@ absl::StatusOr<StreamExecutor*> MetalPlatform::ExecutorForDevice(int ordinal) {
       });
 }
 
-absl::StatusOr<StreamExecutor*> MetalPlatform::FindExisting(int ordinal) {
+absl::StatusOr<StreamExecutor *> MetalPlatform::FindExisting(int ordinal) {
   return executor_cache_.Get(ordinal);
 }
 
-}  // namespace metal
+} // namespace metal
 
 static void InitializeMetalPlatform() {
   auto status = PlatformManager::PlatformWithName("METAL");
@@ -78,7 +80,7 @@ static void InitializeMetalPlatform() {
   }
 }
 
-}  // namespace stream_executor
+} // namespace stream_executor
 
 STREAM_EXECUTOR_REGISTER_MODULE_INITIALIZER(
     metal_platform, stream_executor::InitializeMetalPlatform());

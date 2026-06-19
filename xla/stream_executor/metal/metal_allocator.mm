@@ -31,31 +31,32 @@ namespace metal {
 
 MetalAllocator::MetalAllocator(id<MTLDevice> device) : device_(device) {}
 
-absl::StatusOr<void*> MetalAllocator::Allocate(uint64_t size,
-                                               MemorySpace memory_space) {
-  if (size == 0) {
-    return nullptr;
+absl::StatusOr<void *> MetalAllocator::Allocate(uint64_t size,
+                                                MemorySpace memory_space) {
+  @autoreleasepool {
+    if (size == 0) {
+      return nullptr;
+    }
+    id<MTLBuffer> buffer =
+        [device_ newBufferWithLength:size options:MTLResourceStorageModeShared];
+    if (buffer == nil) {
+      return absl::ResourceExhaustedError(
+          absl::StrCat("MetalAllocator::Allocate: [newBufferWithLength:", size,
+                       "] returned nil."));
+    }
+    void *base = [buffer contents];
+    if (base == nullptr) {
+      return absl::InternalError(
+          "MetalAllocator::Allocate: MTLBuffer.contents was nullptr; "
+          "Shared-mode buffer should always expose a CPU pointer.");
+    }
+    absl::MutexLock lock(&mu_);
+    buffers_.emplace(base, Allocation{buffer, memory_space});
+    return base;
   }
-  id<MTLBuffer> buffer =
-      [device_ newBufferWithLength:size
-                           options:MTLResourceStorageModeShared];
-  if (buffer == nil) {
-    return absl::ResourceExhaustedError(absl::StrCat(
-        "MetalAllocator::Allocate: [newBufferWithLength:", size,
-        "] returned nil."));
-  }
-  void* base = [buffer contents];
-  if (base == nullptr) {
-    return absl::InternalError(
-        "MetalAllocator::Allocate: MTLBuffer.contents was nullptr; "
-        "Shared-mode buffer should always expose a CPU pointer.");
-  }
-  absl::MutexLock lock(&mu_);
-  buffers_.emplace(base, Allocation{buffer, memory_space});
-  return base;
 }
 
-void MetalAllocator::Deallocate(void* base) {
+void MetalAllocator::Deallocate(void *base) {
   if (base == nullptr) {
     return;
   }
@@ -65,29 +66,31 @@ void MetalAllocator::Deallocate(void* base) {
   // dropped.
 }
 
-std::optional<MetalAllocator::Resolved> MetalAllocator::Resolve(
-    const void* ptr) const {
-  if (ptr == nullptr) {
-    return std::nullopt;
+std::optional<MetalAllocator::Resolved>
+MetalAllocator::Resolve(const void *ptr) const {
+  @autoreleasepool {
+    if (ptr == nullptr) {
+      return std::nullopt;
+    }
+    absl::MutexLock lock(&mu_);
+    // upper_bound returns the first entry whose key is strictly greater than
+    // ptr; the predecessor is the candidate that may contain ptr.
+    auto it = buffers_.upper_bound(const_cast<void *>(ptr));
+    if (it == buffers_.begin()) {
+      return std::nullopt;
+    }
+    --it;
+    void *base = it->first;
+    id<MTLBuffer> buffer = it->second.buffer;
+    uint64_t length = static_cast<uint64_t>([buffer length]);
+    auto offset = static_cast<uint64_t>(reinterpret_cast<const char *>(ptr) -
+                                        reinterpret_cast<char *>(base));
+    if (offset >= length) {
+      return std::nullopt;
+    }
+    return Resolved{buffer, offset, it->second.memory_space};
   }
-  absl::MutexLock lock(&mu_);
-  // upper_bound returns the first entry whose key is strictly greater than
-  // ptr; the predecessor is the candidate that may contain ptr.
-  auto it = buffers_.upper_bound(const_cast<void*>(ptr));
-  if (it == buffers_.begin()) {
-    return std::nullopt;
-  }
-  --it;
-  void* base = it->first;
-  id<MTLBuffer> buffer = it->second.buffer;
-  uint64_t length = static_cast<uint64_t>([buffer length]);
-  auto offset = static_cast<uint64_t>(
-      reinterpret_cast<const char*>(ptr) - reinterpret_cast<char*>(base));
-  if (offset >= length) {
-    return std::nullopt;
-  }
-  return Resolved{buffer, offset, it->second.memory_space};
 }
 
-}  // namespace metal
-}  // namespace stream_executor
+} // namespace metal
+} // namespace stream_executor

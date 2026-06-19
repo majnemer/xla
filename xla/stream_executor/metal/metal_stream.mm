@@ -78,8 +78,8 @@ void StoreFirstAsyncError(
 // poisoning: once a stream has hit an async failure, every subsequent
 // peek (and every new submission, gated below) keeps seeing the same
 // error until the stream is destroyed.
-std::optional<absl::Status> PeekFirstAsyncError(
-    const std::shared_ptr<MetalStreamAsyncErrorState> &state) {
+std::optional<absl::Status>
+PeekFirstAsyncError(const std::shared_ptr<MetalStreamAsyncErrorState> &state) {
   absl::MutexLock lock(&state->mu);
   return state->first_error;
 }
@@ -88,8 +88,8 @@ std::optional<absl::Status> PeekFirstAsyncError(
 // is poisoned, otherwise OK. Used at the top of every entry point that
 // would otherwise commit a new command buffer onto a stream the CUDA
 // driver would have rejected outright.
-absl::Status PoisonStatusOrOk(
-    const std::shared_ptr<MetalStreamAsyncErrorState> &state) {
+absl::Status
+PoisonStatusOrOk(const std::shared_ptr<MetalStreamAsyncErrorState> &state) {
   if (auto err = PeekFirstAsyncError(state); err.has_value()) {
     return *std::move(err);
   }
@@ -118,53 +118,56 @@ MetalStream::~MetalStream() {
 
 void MetalStream::TrackCommandBufferErrors(id<MTLCommandBuffer> cmd_buf,
                                            absl::string_view op_name) {
-  std::shared_ptr<MetalStreamAsyncErrorState> state = async_error_state_;
-  std::string op_name_copy(op_name);
-  [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> completed) {
-    if (completed.status == MTLCommandBufferStatusError) {
-      StoreFirstAsyncError(state,
-                           CommandBufferErrorToStatus(completed, op_name_copy));
-    }
-  }];
+  @autoreleasepool {
+    std::shared_ptr<MetalStreamAsyncErrorState> state = async_error_state_;
+    std::string op_name_copy(op_name);
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+      if (completed.status == MTLCommandBufferStatusError) {
+        StoreFirstAsyncError(
+            state, CommandBufferErrorToStatus(completed, op_name_copy));
+      }
+    }];
+  }
 }
 
 absl::StatusOr<std::unique_ptr<MetalStream>>
 MetalStream::Create(MetalExecutor *executor,
                     std::optional<std::variant<StreamPriority, int>> priority) {
-  id<MTLDevice> device = executor->device();
-  if (device == nil) {
-    return absl::FailedPreconditionError(
-        "MetalStream::Create: executor has no MTLDevice; was Init() called?");
+  @autoreleasepool {
+    id<MTLDevice> device = executor->device();
+    if (device == nil) {
+      return absl::FailedPreconditionError(
+          "MetalStream::Create: executor has no MTLDevice; was Init() called?");
+    }
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    if (queue == nil) {
+      return absl::ResourceExhaustedError(
+          "MetalStream::Create: [MTLDevice newCommandQueue] returned nil.");
+    }
+    TF_ASSIGN_OR_RETURN(auto completed_event, MetalEvent::Create(executor));
+    return std::unique_ptr<MetalStream>(
+        new MetalStream(executor, queue, priority, std::move(completed_event)));
   }
-  id<MTLCommandQueue> queue = [device newCommandQueue];
-  if (queue == nil) {
-    return absl::ResourceExhaustedError(
-        "MetalStream::Create: [MTLDevice newCommandQueue] returned nil.");
-  }
-  TF_ASSIGN_OR_RETURN(auto completed_event, MetalEvent::Create(executor));
-  return std::unique_ptr<MetalStream>(
-      new MetalStream(executor, queue, priority, std::move(completed_event)));
 }
 
 absl::StatusOr<uint64_t>
 MetalStream::RecordEventAndReturnValue(MetalEvent *metal_event) {
-  if (metal_event == nullptr) {
-    return absl::InvalidArgumentError(
-        "MetalStream::RecordEventAndReturnValue: null event.");
-  }
-  TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
-  // Reserve under submit_mu_ so value allocation matches commit order;
-  // otherwise a waiter could be satisfied by a later signal that's already
-  // passed while its own signal cmd_buf has not yet executed.
-  uint64_t value;
   @autoreleasepool {
+    if (metal_event == nullptr) {
+      return absl::InvalidArgumentError(
+          "MetalStream::RecordEventAndReturnValue: null event.");
+    }
+    TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
+    // Reserve under submit_mu_ so value allocation matches commit order;
+    // otherwise a waiter could be satisfied by a later signal that's already
+    // passed while its own signal cmd_buf has not yet executed.
     absl::MutexLock lock(&submit_mu_);
     id<MTLCommandBuffer> cmd_buf = [command_queue_ commandBuffer];
     if (cmd_buf == nil) {
       return absl::ResourceExhaustedError(
           "MetalStream::RecordEvent: commandBuffer returned nil.");
     }
-    value = metal_event->ReserveNextRecordedValue();
+    uint64_t value = metal_event->ReserveNextRecordedValue();
     [cmd_buf encodeSignalEvent:metal_event->shared_event() value:value];
     // Custom completion handler so we can route the error to the event (so
     // waiters/pollers can detect that the signal never arrived) AND to the
@@ -188,8 +191,8 @@ MetalStream::RecordEventAndReturnValue(MetalEvent *metal_event) {
     // capture the cmd_buf here so MetalTimer can read GPUStart/EndTime after
     // completion.
     metal_event->PublishRecordedValue(value, cmd_buf);
+    return value;
   }
-  return value;
 }
 
 absl::StatusOr<uint64_t> MetalStream::RecordCompletedEventValue() {
@@ -211,14 +214,14 @@ absl::Status MetalStream::RecordEvent(Event *event) {
 
 absl::Status MetalStream::WaitForEventValue(MetalEvent *metal_event,
                                             uint64_t value) {
-  if (metal_event == nullptr) {
-    return absl::InvalidArgumentError(
-        "MetalStream::WaitForEventValue: null event.");
-  }
-  if (value == 0)
-    return absl::OkStatus();
-  TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
   @autoreleasepool {
+    if (metal_event == nullptr) {
+      return absl::InvalidArgumentError(
+          "MetalStream::WaitForEventValue: null event.");
+    }
+    if (value == 0)
+      return absl::OkStatus();
+    TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
     absl::MutexLock lock(&submit_mu_);
     id<MTLCommandBuffer> cmd_buf = [command_queue_ commandBuffer];
     if (cmd_buf == nil) {
@@ -253,42 +256,43 @@ absl::Status MetalStream::WaitFor(Stream *other) {
 
 absl::Status MetalStream::Memcpy(DeviceAddressBase *gpu_dst,
                                  const void *host_src, uint64_t size) {
-  if (size == 0)
-    return absl::OkStatus();
-
-  if (gpu_dst == nullptr || gpu_dst->opaque() == nullptr ||
-      host_src == nullptr) {
-    return absl::InvalidArgumentError(
-        "MetalStream::Memcpy (H2D): null pointer.");
-  }
-
-  auto resolved = executor_->allocator()->Resolve(gpu_dst->opaque());
-  if (!resolved.has_value()) {
-    return absl::InvalidArgumentError(
-        "MetalStream::Memcpy (H2D): destination not owned by this allocator.");
-  }
-
-  id<MTLBuffer> dst_buffer = resolved->buffer;
-  const NSUInteger dst_offset = static_cast<NSUInteger>(resolved->offset);
-
-  if (dst_buffer.storageMode != MTLStorageModeShared) {
-    return absl::FailedPreconditionError(
-        "MetalStream::Memcpy(H2D): async host-copy path requires Shared "
-        "storage on Apple Silicon.");
-  }
-
-  TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
-
-  id<MTLSharedEvent> copy_done = [executor_->device() newSharedEvent];
-  if (copy_done == nil) {
-    return absl::ResourceExhaustedError(
-        "MetalStream::Memcpy(H2D): newSharedEvent returned nil.");
-  }
-
-  constexpr uint64_t kCopyDoneValue = 1;
-  std::shared_ptr<MetalStreamAsyncErrorState> state = async_error_state_;
-
   @autoreleasepool {
+    if (size == 0)
+      return absl::OkStatus();
+
+    if (gpu_dst == nullptr || gpu_dst->opaque() == nullptr ||
+        host_src == nullptr) {
+      return absl::InvalidArgumentError(
+          "MetalStream::Memcpy (H2D): null pointer.");
+    }
+
+    auto resolved = executor_->allocator()->Resolve(gpu_dst->opaque());
+    if (!resolved.has_value()) {
+      return absl::InvalidArgumentError(
+          "MetalStream::Memcpy (H2D): destination not owned by this "
+          "allocator.");
+    }
+
+    id<MTLBuffer> dst_buffer = resolved->buffer;
+    const NSUInteger dst_offset = static_cast<NSUInteger>(resolved->offset);
+
+    if (dst_buffer.storageMode != MTLStorageModeShared) {
+      return absl::FailedPreconditionError(
+          "MetalStream::Memcpy(H2D): async host-copy path requires Shared "
+          "storage on Apple Silicon.");
+    }
+
+    TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
+
+    id<MTLSharedEvent> copy_done = [executor_->device() newSharedEvent];
+    if (copy_done == nil) {
+      return absl::ResourceExhaustedError(
+          "MetalStream::Memcpy(H2D): newSharedEvent returned nil.");
+    }
+
+    constexpr uint64_t kCopyDoneValue = 1;
+    std::shared_ptr<MetalStreamAsyncErrorState> state = async_error_state_;
+
     absl::MutexLock lock(&submit_mu_);
     id<MTLCommandBuffer> copy_cmd = [command_queue_ commandBuffer];
     if (copy_cmd == nil) {
@@ -324,41 +328,41 @@ absl::Status MetalStream::Memcpy(DeviceAddressBase *gpu_dst,
     [wait_cmd commit];
 
     tail_buffer_ = wait_cmd;
+    return absl::OkStatus();
   }
-  return absl::OkStatus();
 }
 
 absl::Status MetalStream::Memcpy(void *host_dst,
                                  const DeviceAddressBase &gpu_src,
                                  uint64_t size) {
-  if (size == 0)
-    return absl::OkStatus();
-  if (host_dst == nullptr || gpu_src.opaque() == nullptr) {
-    return absl::InvalidArgumentError(
-        "MetalStream::Memcpy (D2H): null pointer.");
-  }
-  auto resolved = executor_->allocator()->Resolve(gpu_src.opaque());
-  if (!resolved.has_value()) {
-    return absl::InvalidArgumentError(
-        "MetalStream::Memcpy (D2H): source not owned by this allocator.");
-  }
-  TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
-  id<MTLBuffer> staging =
-      [executor_->device() newBufferWithLength:size
-                                       options:MTLResourceStorageModeShared];
-  if (staging == nil) {
-    return absl::ResourceExhaustedError(
-        "MetalStream::Memcpy (D2H): staging allocation failed.");
-  }
-  // Two-cmd_buf pattern: completion-handler memcpy + GPU-side wait, so
-  // subsequent cmd_bufs see the host write (not just the blit completion).
-  id<MTLSharedEvent> copy_done = [executor_->device() newSharedEvent];
-  if (copy_done == nil) {
-    return absl::ResourceExhaustedError(
-        "MetalStream::Memcpy (D2H): newSharedEvent returned nil.");
-  }
-  constexpr uint64_t kCopyDoneValue = 1;
   @autoreleasepool {
+    if (size == 0)
+      return absl::OkStatus();
+    if (host_dst == nullptr || gpu_src.opaque() == nullptr) {
+      return absl::InvalidArgumentError(
+          "MetalStream::Memcpy (D2H): null pointer.");
+    }
+    auto resolved = executor_->allocator()->Resolve(gpu_src.opaque());
+    if (!resolved.has_value()) {
+      return absl::InvalidArgumentError(
+          "MetalStream::Memcpy (D2H): source not owned by this allocator.");
+    }
+    TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
+    id<MTLBuffer> staging =
+        [executor_->device() newBufferWithLength:size
+                                         options:MTLResourceStorageModeShared];
+    if (staging == nil) {
+      return absl::ResourceExhaustedError(
+          "MetalStream::Memcpy (D2H): staging allocation failed.");
+    }
+    // Two-cmd_buf pattern: completion-handler memcpy + GPU-side wait, so
+    // subsequent cmd_bufs see the host write (not just the blit completion).
+    id<MTLSharedEvent> copy_done = [executor_->device() newSharedEvent];
+    if (copy_done == nil) {
+      return absl::ResourceExhaustedError(
+          "MetalStream::Memcpy (D2H): newSharedEvent returned nil.");
+    }
+    constexpr uint64_t kCopyDoneValue = 1;
     absl::MutexLock lock(&submit_mu_);
     id<MTLCommandBuffer> copy_cmd = [command_queue_ commandBuffer];
     if (copy_cmd == nil) {
@@ -398,29 +402,29 @@ absl::Status MetalStream::Memcpy(void *host_dst,
     // and so a later submission under submit_mu_ is FIFO-ordered after the
     // host write has happened.
     tail_buffer_ = wait_cmd;
+    return absl::OkStatus();
   }
-  return absl::OkStatus();
 }
 
 absl::Status MetalStream::Memcpy(DeviceAddressBase *gpu_dst,
                                  const DeviceAddressBase &gpu_src,
                                  uint64_t size) {
-  if (size == 0)
-    return absl::OkStatus();
-  if (gpu_dst == nullptr || gpu_dst->opaque() == nullptr ||
-      gpu_src.opaque() == nullptr) {
-    return absl::InvalidArgumentError(
-        "MetalStream::Memcpy (D2D): null pointer.");
-  }
-  MetalAllocator *allocator = executor_->allocator();
-  auto src_resolved = allocator->Resolve(gpu_src.opaque());
-  auto dst_resolved = allocator->Resolve(gpu_dst->opaque());
-  if (!src_resolved.has_value() || !dst_resolved.has_value()) {
-    return absl::InvalidArgumentError(
-        "MetalStream::Memcpy (D2D): endpoint not owned by this allocator.");
-  }
-  TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
   @autoreleasepool {
+    if (size == 0)
+      return absl::OkStatus();
+    if (gpu_dst == nullptr || gpu_dst->opaque() == nullptr ||
+        gpu_src.opaque() == nullptr) {
+      return absl::InvalidArgumentError(
+          "MetalStream::Memcpy (D2D): null pointer.");
+    }
+    MetalAllocator *allocator = executor_->allocator();
+    auto src_resolved = allocator->Resolve(gpu_src.opaque());
+    auto dst_resolved = allocator->Resolve(gpu_dst->opaque());
+    if (!src_resolved.has_value() || !dst_resolved.has_value()) {
+      return absl::InvalidArgumentError(
+          "MetalStream::Memcpy (D2D): endpoint not owned by this allocator.");
+    }
+    TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
     absl::MutexLock lock(&submit_mu_);
     id<MTLCommandBuffer> cmd_buf = [command_queue_ commandBuffer];
     if (cmd_buf == nil) {
@@ -441,8 +445,8 @@ absl::Status MetalStream::Memcpy(DeviceAddressBase *gpu_dst,
     TrackCommandBufferErrors(cmd_buf, "MetalStream::Memcpy(D2D)");
     [cmd_buf commit];
     tail_buffer_ = cmd_buf;
+    return absl::OkStatus();
   }
-  return absl::OkStatus();
 }
 
 namespace {
@@ -471,20 +475,24 @@ absl::StatusOr<void *> DrainAndResolveForHostWrite(MetalStream *stream,
                              resolved->offset);
 }
 
-}  // namespace
+} // namespace
 
 absl::Status MetalStream::MemZero(DeviceAddressBase *location, uint64_t size) {
-  if (size == 0) return absl::OkStatus();
-  TF_ASSIGN_OR_RETURN(void *dst,
-                      DrainAndResolveForHostWrite(this, executor_, location,
-                                                  "MetalStream::MemZero"));
-  std::memset(dst, 0, size);
-  return absl::OkStatus();
+  @autoreleasepool {
+    if (size == 0)
+      return absl::OkStatus();
+    TF_ASSIGN_OR_RETURN(void *dst,
+                        DrainAndResolveForHostWrite(this, executor_, location,
+                                                    "MetalStream::MemZero"));
+    std::memset(dst, 0, size);
+    return absl::OkStatus();
+  }
 }
 
 absl::Status MetalStream::Memset32(DeviceAddressBase *location,
                                    uint32_t pattern, uint64_t size) {
-  if (size == 0) return absl::OkStatus();
+  if (size == 0)
+    return absl::OkStatus();
   if (size % sizeof(uint32_t) != 0) {
     return absl::InvalidArgumentError(
         "MetalStream::Memset32: size must be a multiple of 4 bytes.");
@@ -498,22 +506,23 @@ absl::Status MetalStream::Memset32(DeviceAddressBase *location,
 
 absl::Status MetalStream::DoHostCallbackWithStatus(
     absl::AnyInvocable<absl::Status() &&> callback) {
-  // Two-cmd_buf design: callback_cmd's completion handler runs the host
-  // callback and signals callback_done; wait_cmd encodes a GPU wait on
-  // it. submit_mu_ keeps later cmd_bufs FIFO-ordered after wait_cmd.
-  TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
-  auto *heap_cb =
-      new absl::AnyInvocable<absl::Status() &&>(std::move(callback));
-  id<MTLSharedEvent> callback_done = [executor_->device() newSharedEvent];
-  if (callback_done == nil) {
-    delete heap_cb;
-    return absl::ResourceExhaustedError(
-        "MetalStream::DoHostCallbackWithStatus: newSharedEvent returned nil.");
-  }
-  constexpr uint64_t kCallbackDoneValue = 1;
-  std::shared_ptr<MetalStreamAsyncErrorState> state = async_error_state_;
-
   @autoreleasepool {
+    // Two-cmd_buf design: callback_cmd's completion handler runs the host
+    // callback and signals callback_done; wait_cmd encodes a GPU wait on
+    // it. submit_mu_ keeps later cmd_bufs FIFO-ordered after wait_cmd.
+    TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
+    auto *heap_cb =
+        new absl::AnyInvocable<absl::Status() &&>(std::move(callback));
+    id<MTLSharedEvent> callback_done = [executor_->device() newSharedEvent];
+    if (callback_done == nil) {
+      delete heap_cb;
+      return absl::ResourceExhaustedError(
+          "MetalStream::DoHostCallbackWithStatus: newSharedEvent returned "
+          "nil.");
+    }
+    constexpr uint64_t kCallbackDoneValue = 1;
+    std::shared_ptr<MetalStreamAsyncErrorState> state = async_error_state_;
+
     absl::MutexLock lock(&submit_mu_);
     id<MTLCommandBuffer> callback_cmd = [command_queue_ commandBuffer];
     if (callback_cmd == nil) {
@@ -563,7 +572,8 @@ MetalStream::LaunchKernel(const ThreadDim &thread_dims,
   }
   auto *kernel = static_cast<MetalKernel *>(function);
   if (kernel == nullptr) {
-    return absl::InvalidArgumentError("MetalStream::LaunchKernel: null kernel.");
+    return absl::InvalidArgumentError(
+        "MetalStream::LaunchKernel: null kernel.");
   }
   return LaunchKernelPacked(
       thread_dims, block_dims, kernel, name,
@@ -571,28 +581,31 @@ MetalStream::LaunchKernel(const ThreadDim &thread_dims,
       /*arg_sizes=*/{}, shmem_bytes);
 }
 
-absl::Status MetalStream::LaunchKernelPacked(
-    const ThreadDim &thread_dims, const BlockDim &block_dims,
-    MetalKernel *kernel, absl::string_view name,
-    absl::Span<const void *const> args, absl::Span<const size_t> arg_sizes,
-    int64_t shmem_bytes) {
-  if (kernel == nullptr || kernel->pipeline_state() == nil) {
-    return absl::InvalidArgumentError(
-        "MetalStream::LaunchKernel: null kernel or pipeline state.");
-  }
-
-  const int64_t total_threads = thread_dims.x * thread_dims.y * thread_dims.z;
-  const int64_t pso_limit =
-      static_cast<int64_t>([kernel->pipeline_state() maxTotalThreadsPerThreadgroup]);
-  if (total_threads > pso_limit) {
-    return absl::FailedPreconditionError(absl::StrCat(
-        "MetalStream::LaunchKernel: kernel ", name, " block size ",
-        total_threads, " exceeds pipeline state maxTotalThreadsPerThreadgroup ",
-        pso_limit, "."));
-  }
-
-  TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
+absl::Status MetalStream::LaunchKernelPacked(const ThreadDim &thread_dims,
+                                             const BlockDim &block_dims,
+                                             MetalKernel *kernel,
+                                             absl::string_view name,
+                                             absl::Span<const void *const> args,
+                                             absl::Span<const size_t> arg_sizes,
+                                             int64_t shmem_bytes) {
   @autoreleasepool {
+    if (kernel == nullptr || kernel->pipeline_state() == nil) {
+      return absl::InvalidArgumentError(
+          "MetalStream::LaunchKernel: null kernel or pipeline state.");
+    }
+
+    const int64_t total_threads = thread_dims.x * thread_dims.y * thread_dims.z;
+    const int64_t pso_limit = static_cast<int64_t>(
+        [kernel->pipeline_state() maxTotalThreadsPerThreadgroup]);
+    if (total_threads > pso_limit) {
+      return absl::FailedPreconditionError(
+          absl::StrCat("MetalStream::LaunchKernel: kernel ", name,
+                       " block size ", total_threads,
+                       " exceeds pipeline state maxTotalThreadsPerThreadgroup ",
+                       pso_limit, "."));
+    }
+
+    TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
     absl::MutexLock lock(&submit_mu_);
     id<MTLCommandBuffer> cmd_buf = [command_queue_ commandBuffer];
     if (cmd_buf == nil) {
@@ -613,8 +626,7 @@ absl::Status MetalStream::LaunchKernelPacked(
     MetalAllocator *allocator = executor_->allocator();
     const unsigned arity = kernel->Arity();
     for (unsigned i = 0; i < arity; ++i) {
-      const size_t arg_size =
-          arg_sizes.empty() ? sizeof(void *) : arg_sizes[i];
+      const size_t arg_size = arg_sizes.empty() ? sizeof(void *) : arg_sizes[i];
       bool bound = false;
       if (arg_size == sizeof(void *)) {
         void *arg_ptr = *static_cast<void *const *>(args[i]);
@@ -657,23 +669,24 @@ absl::Status MetalStream::LaunchKernelPacked(
     TrackCommandBufferErrors(cmd_buf, "MetalStream::LaunchKernel");
     [cmd_buf commit];
     tail_buffer_ = cmd_buf;
+    return absl::OkStatus();
   }
-  return absl::OkStatus();
 }
 
 absl::StatusOr<id<MTLCommandBuffer>> MetalStream::EncodeWithCommandBuffer(
     absl::string_view label, absl::string_view op_name,
-    absl::FunctionRef<absl::StatusOr<id<MTLCommandBuffer>>(
-        id<MTLCommandBuffer> cmd_buf)>
+    absl::FunctionRef<
+        absl::StatusOr<id<MTLCommandBuffer>>(id<MTLCommandBuffer> cmd_buf)>
         encode) {
-  TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
   @autoreleasepool {
+    TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
     absl::MutexLock lock(&submit_mu_);
     id<MTLCommandBuffer> cmd_buf = [command_queue_ commandBuffer];
     if (cmd_buf == nil) {
       return absl::ResourceExhaustedError(absl::StrCat(
           "MetalStream::EncodeWithCommandBuffer: commandBuffer returned nil "
-          "for '", op_name, "'."));
+          "for '",
+          op_name, "'."));
     }
     if (!label.empty()) {
       cmd_buf.label = [[NSString alloc] initWithBytes:label.data()
@@ -684,7 +697,8 @@ absl::StatusOr<id<MTLCommandBuffer>> MetalStream::EncodeWithCommandBuffer(
     if (tail == nil) {
       return absl::InternalError(absl::StrCat(
           "MetalStream::EncodeWithCommandBuffer: encode callback returned nil "
-          "tail for '", op_name, "'."));
+          "tail for '",
+          op_name, "'."));
     }
     TrackCommandBufferErrors(tail, op_name);
     [tail commit];
@@ -694,26 +708,29 @@ absl::StatusOr<id<MTLCommandBuffer>> MetalStream::EncodeWithCommandBuffer(
 }
 
 absl::Status MetalStream::BlockHostUntilDone() {
-  id<MTLCommandBuffer> tail = nil;
-  {
-    absl::MutexLock lock(&submit_mu_);
-    tail = tail_buffer_;
+  @autoreleasepool {
+    id<MTLCommandBuffer> tail = nil;
+    {
+      absl::MutexLock lock(&submit_mu_);
+      tail = tail_buffer_;
+    }
+    if (tail != nil) {
+      [tail waitUntilCompleted];
+    }
+    // Return the first async error seen anywhere on this stream, not just on
+    // the current tail. Sticky: future calls keep returning the same error.
+    if (auto async_error = PeekFirstAsyncError(async_error_state_);
+        async_error.has_value()) {
+      return *std::move(async_error);
+    }
+    // Fallback for the case where a completion handler did not get to record
+    // before waitUntilCompleted returned.
+    if (tail != nil && tail.status == MTLCommandBufferStatusError) {
+      return CommandBufferErrorToStatus(tail,
+                                        "MetalStream::BlockHostUntilDone");
+    }
+    return absl::OkStatus();
   }
-  if (tail != nil) {
-    [tail waitUntilCompleted];
-  }
-  // Return the first async error seen anywhere on this stream, not just on
-  // the current tail. Sticky: future calls keep returning the same error.
-  if (auto async_error = PeekFirstAsyncError(async_error_state_);
-      async_error.has_value()) {
-    return *std::move(async_error);
-  }
-  // Fallback for the case where a completion handler did not get to record
-  // before waitUntilCompleted returned.
-  if (tail != nil && tail.status == MTLCommandBufferStatusError) {
-    return CommandBufferErrorToStatus(tail, "MetalStream::BlockHostUntilDone");
-  }
-  return absl::OkStatus();
 }
 
 } // namespace metal

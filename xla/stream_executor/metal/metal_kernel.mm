@@ -41,16 +41,16 @@ namespace {
 
 // Returns the localized description of an NSError as a UTF-8 std::string,
 // or a fallback if the error pointer is nil.
-std::string ErrorMessage(NSError* error) {
+std::string ErrorMessage(NSError *error) {
   if (error == nil || [error localizedDescription] == nil) {
     return "(no error description)";
   }
   return [[error localizedDescription] UTF8String];
 }
 
-absl::StatusOr<NSString*> MakeNSString(absl::string_view sv,
-                                       absl::string_view what) {
-  NSString* s = [[NSString alloc] initWithBytes:sv.data()
+absl::StatusOr<NSString *> MakeNSString(absl::string_view sv,
+                                        absl::string_view what) {
+  NSString *s = [[NSString alloc] initWithBytes:sv.data()
                                          length:sv.size()
                                        encoding:NSUTF8StringEncoding];
   if (s == nil) {
@@ -60,14 +60,12 @@ absl::StatusOr<NSString*> MakeNSString(absl::string_view sv,
   return s;
 }
 
-}  // namespace
+} // namespace
 
-MetalKernel::MetalKernel(MetalExecutor* executor,
+MetalKernel::MetalKernel(MetalExecutor *executor,
                          id<MTLComputePipelineState> pso,
                          id<MTLFunction> function, unsigned arity)
-    : executor_(executor),
-      pipeline_state_(pso),
-      function_(function),
+    : executor_(executor), pipeline_state_(pso), function_(function),
       arity_(arity) {}
 
 MetalKernel::~MetalKernel() {
@@ -76,35 +74,33 @@ MetalKernel::~MetalKernel() {
   }
 }
 
-absl::StatusOr<std::unique_ptr<MetalKernel>> MetalKernel::Create(
-    MetalExecutor* executor, id<MTLLibrary> library,
-    absl::string_view entry_point, unsigned arity) {
-  id<MTLDevice> device = executor->device();
-  if (device == nil) {
-    return absl::FailedPreconditionError(
-        "MetalKernel::Create: executor has no MTLDevice; was Init() called?");
-  }
-  if (library == nil) {
-    return absl::InvalidArgumentError(
-        "MetalKernel::Create: library is nil.");
-  }
-  // PSO compilation autoreleases internal temporaries; bound them here.
-  // function / pso are +1 owned (new*), so they survive the pool drain.
-  id<MTLFunction> function;
-  id<MTLComputePipelineState> pso;
+absl::StatusOr<std::unique_ptr<MetalKernel>>
+MetalKernel::Create(MetalExecutor *executor, id<MTLLibrary> library,
+                    absl::string_view entry_point, unsigned arity) {
   @autoreleasepool {
+    id<MTLDevice> device = executor->device();
+    if (device == nil) {
+      return absl::FailedPreconditionError(
+          "MetalKernel::Create: executor has no MTLDevice; was Init() called?");
+    }
+    if (library == nil) {
+      return absl::InvalidArgumentError("MetalKernel::Create: library is nil.");
+    }
+    // PSO compilation autoreleases internal temporaries; bound them here.
+    // function / pso are +1 owned (new*), so they survive the pool drain.
     auto entry_ns = MakeNSString(entry_point, "entry point");
     if (!entry_ns.ok()) {
       return entry_ns.status();
     }
-    function = [library newFunctionWithName:*entry_ns];
+    id<MTLFunction> function = [library newFunctionWithName:*entry_ns];
     if (function == nil) {
       return absl::NotFoundError(
           absl::StrCat("MetalKernel::Create: entry point '", entry_point,
                        "' not found in library."));
     }
-    NSError* error = nil;
-    pso = [device newComputePipelineStateWithFunction:function error:&error];
+    NSError *error = nil;
+    id<MTLComputePipelineState> pso =
+        [device newComputePipelineStateWithFunction:function error:&error];
     if (pso == nil) {
       return absl::InternalError(absl::StrCat(
           "MetalKernel::Create: newComputePipelineStateWithFunction failed: ",
@@ -121,32 +117,35 @@ absl::StatusOr<std::unique_ptr<MetalKernel>> MetalKernel::Create(
           ") differs from DeviceDescription threads_per_warp (", expected_simd,
           ") for entry point '", entry_point, "'."));
     }
+    return std::unique_ptr<MetalKernel>(
+        new MetalKernel(executor, pso, function, arity));
   }
-  return std::unique_ptr<MetalKernel>(
-      new MetalKernel(executor, pso, function, arity));
 }
 
-absl::StatusOr<std::unique_ptr<MetalKernel>> MetalKernel::CreateFromPSO(
-    MetalExecutor* executor, id<MTLComputePipelineState> pso, unsigned arity) {
-  if (executor == nullptr) {
-    return absl::InvalidArgumentError(
-        "MetalKernel::CreateFromPSO: executor is null.");
+absl::StatusOr<std::unique_ptr<MetalKernel>>
+MetalKernel::CreateFromPSO(MetalExecutor *executor,
+                           id<MTLComputePipelineState> pso, unsigned arity) {
+  @autoreleasepool {
+    if (executor == nullptr) {
+      return absl::InvalidArgumentError(
+          "MetalKernel::CreateFromPSO: executor is null.");
+    }
+    if (pso == nil) {
+      return absl::InvalidArgumentError(
+          "MetalKernel::CreateFromPSO: pso is nil.");
+    }
+    const auto pso_simd = static_cast<int64_t>([pso threadExecutionWidth]);
+    const int64_t expected_simd =
+        executor->GetDeviceDescription().threads_per_warp();
+    if (pso_simd != expected_simd) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "MetalKernel::CreateFromPSO: PSO threadExecutionWidth (", pso_simd,
+          ") differs from DeviceDescription threads_per_warp (", expected_simd,
+          ")."));
+    }
+    return std::unique_ptr<MetalKernel>(
+        new MetalKernel(executor, pso, /*function=*/nil, arity));
   }
-  if (pso == nil) {
-    return absl::InvalidArgumentError(
-        "MetalKernel::CreateFromPSO: pso is nil.");
-  }
-  const auto pso_simd = static_cast<int64_t>([pso threadExecutionWidth]);
-  const int64_t expected_simd =
-      executor->GetDeviceDescription().threads_per_warp();
-  if (pso_simd != expected_simd) {
-    return absl::FailedPreconditionError(absl::StrCat(
-        "MetalKernel::CreateFromPSO: PSO threadExecutionWidth (", pso_simd,
-        ") differs from DeviceDescription threads_per_warp (", expected_simd,
-        ")."));
-  }
-  return std::unique_ptr<MetalKernel>(
-      new MetalKernel(executor, pso, /*function=*/nil, arity));
 }
 
 absl::StatusOr<int32_t> MetalKernel::GetMaxOccupiedBlocksPerCore(
@@ -156,14 +155,13 @@ absl::StatusOr<int32_t> MetalKernel::GetMaxOccupiedBlocksPerCore(
   return 1;
 }
 
-absl::Status MetalKernel::Launch(const ThreadDim& thread_dims,
-                                 const BlockDim& block_dims,
-                                 const std::optional<ClusterDim>& cluster_dims,
-                                 Stream* stream, const KernelArgs& args) {
+absl::Status MetalKernel::Launch(const ThreadDim &thread_dims,
+                                 const BlockDim &block_dims,
+                                 const std::optional<ClusterDim> &cluster_dims,
+                                 Stream *stream, const KernelArgs &args) {
   // Pack args unless already flat. Mirrors CudaKernel::Launch.
-  auto launch =
-      [this, stream, &cluster_dims, &thread_dims,
-       &block_dims](const KernelArgsPackedArrayBase& packed) -> absl::Status {
+  auto launch = [this, stream, &cluster_dims, &thread_dims, &block_dims](
+                    const KernelArgsPackedArrayBase &packed) -> absl::Status {
     const size_t expected =
         Arity() + (packed.number_of_shared_bytes() > 0 ? 1 : 0);
     if (packed.number_of_arguments() != expected) {
@@ -178,7 +176,7 @@ absl::Status MetalKernel::Launch(const ThreadDim& thread_dims,
           "MetalKernel::Launch: cluster dimensions are not supported on "
           "Metal.");
     }
-    auto* metal_stream = dynamic_cast<MetalStream*>(stream);
+    auto *metal_stream = dynamic_cast<MetalStream *>(stream);
     if (metal_stream == nullptr) {
       return absl::InvalidArgumentError(
           "MetalKernel::Launch: stream is not a MetalStream.");
@@ -191,11 +189,11 @@ absl::Status MetalKernel::Launch(const ThreadDim& thread_dims,
         static_cast<int64_t>(packed.number_of_shared_bytes()));
   };
 
-  if (auto* packed = DynCast<KernelArgsPackedArrayBase>(&args)) {
+  if (auto *packed = DynCast<KernelArgsPackedArrayBase>(&args)) {
     return launch(*packed);
   }
-  if (auto* device_mem = DynCast<KernelArgsDeviceAddressArray>(&args)) {
-    const auto& pack = args_packing();
+  if (auto *device_mem = DynCast<KernelArgsDeviceAddressArray>(&args)) {
+    const auto &pack = args_packing();
     if (!pack) {
       return absl::InternalError(
           "MetalKernel::Launch: kernel is missing a custom args packing for "
@@ -208,5 +206,5 @@ absl::Status MetalKernel::Launch(const ThreadDim& thread_dims,
       "MetalKernel::Launch: unsupported KernelArgs type.");
 }
 
-}  // namespace metal
-}  // namespace stream_executor
+} // namespace metal
+} // namespace stream_executor
