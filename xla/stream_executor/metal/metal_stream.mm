@@ -459,59 +459,131 @@ absl::Status MetalStream::Memcpy(DeviceAddressBase *gpu_dst,
   }
 }
 
-namespace {
-
-// Drains the stream and resolves `location` to a host-writable pointer
-// (shared storage on unified memory). The drain makes a subsequent direct
-// host write stream-ordered.
-absl::StatusOr<void *> DrainAndResolveForHostWrite(MetalStream *stream,
-                                                   MetalExecutor *executor,
-                                                   DeviceAddressBase *location,
-                                                   absl::string_view op) {
-  if (location == nullptr || location->opaque() == nullptr) {
-    return absl::InvalidArgumentError(absl::StrCat(op, ": null pointer."));
-  }
-  auto resolved = executor->allocator()->Resolve(location->opaque());
-  if (!resolved.has_value()) {
-    return absl::InvalidArgumentError(
-        absl::StrCat(op, ": destination not owned by this allocator."));
-  }
-  if (resolved->buffer.storageMode != MTLStorageModeShared) {
-    return absl::FailedPreconditionError(
-        absl::StrCat(op, ": requires Shared storage on Apple Silicon."));
-  }
-  TF_RETURN_IF_ERROR(stream->BlockHostUntilDone());
-  return static_cast<void *>(static_cast<char *>(resolved->buffer.contents) +
-                             resolved->offset);
-}
-
-} // namespace
-
 absl::Status MetalStream::MemZero(DeviceAddressBase *location, uint64_t size) {
   @autoreleasepool {
     if (size == 0)
       return absl::OkStatus();
-    TF_ASSIGN_OR_RETURN(void *dst,
-                        DrainAndResolveForHostWrite(this, executor_, location,
-                                                    "MetalStream::MemZero"));
-    std::memset(dst, 0, size);
+    if (location == nullptr || location->opaque() == nullptr) {
+      return absl::InvalidArgumentError("MetalStream::MemZero: null pointer.");
+    }
+    auto resolved = executor_->allocator()->Resolve(location->opaque());
+    if (!resolved.has_value()) {
+      return absl::InvalidArgumentError(
+          "MetalStream::MemZero: destination not owned by this allocator.");
+    }
+    TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
+    // Native GPU fill: stream-ordered like any other blit, no host stall.
+    absl::MutexLock lock(&submit_mu_);
+    id<MTLCommandBuffer> cmd_buf = [command_queue_ commandBuffer];
+    if (cmd_buf == nil) {
+      return absl::ResourceExhaustedError(
+          "MetalStream::MemZero: commandBuffer returned nil.");
+    }
+    id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
+    if (blit == nil) {
+      return absl::ResourceExhaustedError(
+          "MetalStream::MemZero: blitCommandEncoder returned nil.");
+    }
+    [blit fillBuffer:resolved->buffer
+               range:NSMakeRange(static_cast<NSUInteger>(resolved->offset),
+                                 static_cast<NSUInteger>(size))
+               value:0];
+    [blit endEncoding];
+    TrackCommandBufferErrors(cmd_buf, "MetalStream::MemZero");
+    [cmd_buf commit];
+    tail_buffer_ = cmd_buf;
     return absl::OkStatus();
   }
 }
 
 absl::Status MetalStream::Memset32(DeviceAddressBase *location,
                                    uint32_t pattern, uint64_t size) {
-  if (size == 0)
+  @autoreleasepool {
+    if (size == 0)
+      return absl::OkStatus();
+    if (size % sizeof(uint32_t) != 0) {
+      return absl::InvalidArgumentError(
+          "MetalStream::Memset32: size must be a multiple of 4 bytes.");
+    }
+    if (location == nullptr || location->opaque() == nullptr) {
+      return absl::InvalidArgumentError("MetalStream::Memset32: null pointer.");
+    }
+    auto resolved = executor_->allocator()->Resolve(location->opaque());
+    if (!resolved.has_value()) {
+      return absl::InvalidArgumentError(
+          "MetalStream::Memset32: destination not owned by this allocator.");
+    }
+    TF_RETURN_IF_ERROR(PoisonStatusOrOk(async_error_state_));
+
+    absl::MutexLock lock(&submit_mu_);
+    // A uint32 pattern with four equal bytes is a byte fill, which the blit
+    // encoder does natively on the GPU, fully stream-ordered.
+    const uint8_t byte = static_cast<uint8_t>(pattern & 0xFFu);
+    if (pattern == byte * 0x01010101u) {
+      id<MTLCommandBuffer> cmd_buf = [command_queue_ commandBuffer];
+      if (cmd_buf == nil) {
+        return absl::ResourceExhaustedError(
+            "MetalStream::Memset32: commandBuffer returned nil.");
+      }
+      id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
+      if (blit == nil) {
+        return absl::ResourceExhaustedError(
+            "MetalStream::Memset32: blitCommandEncoder returned nil.");
+      }
+      [blit fillBuffer:resolved->buffer
+                 range:NSMakeRange(static_cast<NSUInteger>(resolved->offset),
+                                   static_cast<NSUInteger>(size))
+                 value:byte];
+      [blit endEncoding];
+      TrackCommandBufferErrors(cmd_buf, "MetalStream::Memset32");
+      [cmd_buf commit];
+      tail_buffer_ = cmd_buf;
+      return absl::OkStatus();
+    }
+
+    // No native 32-bit GPU fill: write the pattern host-side from an empty
+    // command buffer's completion handler and gate followers on a shared event
+    // (the H2D Memcpy path). Shared storage keeps the host write coherent.
+    if (resolved->buffer.storageMode != MTLStorageModeShared) {
+      return absl::FailedPreconditionError(
+          "MetalStream::Memset32: non-uniform pattern requires Shared storage.");
+    }
+    id<MTLSharedEvent> fill_done = [executor_->device() newSharedEvent];
+    if (fill_done == nil) {
+      return absl::ResourceExhaustedError(
+          "MetalStream::Memset32: newSharedEvent returned nil.");
+    }
+    constexpr uint64_t kFillDoneValue = 1;
+    id<MTLBuffer> dst_buffer = resolved->buffer;
+    const NSUInteger dst_offset = static_cast<NSUInteger>(resolved->offset);
+    id<MTLCommandBuffer> fill_cmd = [command_queue_ commandBuffer];
+    if (fill_cmd == nil) {
+      return absl::ResourceExhaustedError(
+          "MetalStream::Memset32: fill commandBuffer returned nil.");
+    }
+    id<MTLCommandBuffer> wait_cmd = [command_queue_ commandBuffer];
+    if (wait_cmd == nil) {
+      return absl::ResourceExhaustedError(
+          "MetalStream::Memset32: wait commandBuffer returned nil.");
+    }
+    TrackCommandBufferErrors(fill_cmd, "MetalStream::Memset32(fill)");
+    TrackCommandBufferErrors(wait_cmd, "MetalStream::Memset32(wait)");
+    [fill_cmd addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+      @autoreleasepool {
+        if (completed.status == MTLCommandBufferStatusCompleted) {
+          memset_pattern4(
+              static_cast<char *>([dst_buffer contents]) + dst_offset, &pattern,
+              size);
+        }
+        fill_done.signaledValue = kFillDoneValue;
+      }
+    }];
+    [wait_cmd encodeWaitForEvent:fill_done value:kFillDoneValue];
+    [fill_cmd commit];
+    [wait_cmd commit];
+    tail_buffer_ = wait_cmd;
     return absl::OkStatus();
-  if (size % sizeof(uint32_t) != 0) {
-    return absl::InvalidArgumentError(
-        "MetalStream::Memset32: size must be a multiple of 4 bytes.");
   }
-  TF_ASSIGN_OR_RETURN(void *dst,
-                      DrainAndResolveForHostWrite(this, executor_, location,
-                                                  "MetalStream::Memset32"));
-  memset_pattern4(dst, &pattern, size);
-  return absl::OkStatus();
 }
 
 absl::Status MetalStream::DoHostCallbackWithStatus(
