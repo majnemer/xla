@@ -37,6 +37,15 @@ absl::StatusOr<void *> MetalAllocator::Allocate(uint64_t size,
     if (size == 0) {
       return nullptr;
     }
+    // A single MTLBuffer cannot exceed maxBufferLength; -newBufferWithLength:
+    // returns nil past it. Reject up front so the caller backs off, since the
+    // Metal validation layer turns that nil into a hard abort.
+    uint64_t max_buffer_length = [device_ maxBufferLength];
+    if (size > max_buffer_length) {
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "MetalAllocator::Allocate: requested ", size,
+          " bytes exceeds device maxBufferLength ", max_buffer_length, "."));
+    }
     id<MTLBuffer> buffer =
         [device_ newBufferWithLength:size options:MTLResourceStorageModeShared];
     if (buffer == nil) {
