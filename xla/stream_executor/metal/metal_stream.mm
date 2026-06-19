@@ -122,9 +122,13 @@ void MetalStream::TrackCommandBufferErrors(id<MTLCommandBuffer> cmd_buf,
     std::shared_ptr<MetalStreamAsyncErrorState> state = async_error_state_;
     std::string op_name_copy(op_name);
     [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> completed) {
-      if (completed.status == MTLCommandBufferStatusError) {
-        StoreFirstAsyncError(
-            state, CommandBufferErrorToStatus(completed, op_name_copy));
+      // Completion handlers run on a Metal callback thread with no autorelease
+      // pool; bound the ObjC temporaries the error path creates.
+      @autoreleasepool {
+        if (completed.status == MTLCommandBufferStatusError) {
+          StoreFirstAsyncError(
+              state, CommandBufferErrorToStatus(completed, op_name_copy));
+        }
       }
     }];
   }
@@ -177,11 +181,13 @@ MetalStream::RecordEventAndReturnValue(MetalEvent *metal_event) {
     std::shared_ptr<MetalStreamAsyncErrorState> stream_error_state =
         async_error_state_;
     [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> completed) {
-      if (completed.status == MTLCommandBufferStatusError) {
-        absl::Status status =
-            CommandBufferErrorToStatus(completed, "MetalStream::RecordEvent");
-        MetalEvent::MarkSignalErrorForValue(event_error_state, value, status);
-        StoreFirstAsyncError(stream_error_state, std::move(status));
+      @autoreleasepool {
+        if (completed.status == MTLCommandBufferStatusError) {
+          absl::Status status =
+              CommandBufferErrorToStatus(completed, "MetalStream::RecordEvent");
+          MetalEvent::MarkSignalErrorForValue(event_error_state, value, status);
+          StoreFirstAsyncError(stream_error_state, std::move(status));
+        }
       }
     }];
     [cmd_buf commit];
@@ -310,16 +316,18 @@ absl::Status MetalStream::Memcpy(DeviceAddressBase *gpu_dst,
     TrackCommandBufferErrors(wait_cmd, "MetalStream::Memcpy(H2D wait)");
 
     [copy_cmd addCompletedHandler:^(id<MTLCommandBuffer> completed) {
-      if (completed.status == MTLCommandBufferStatusCompleted) {
-        void *dst = static_cast<char *>([dst_buffer contents]) + dst_offset;
-        std::memcpy(dst, host_src, size);
-      }
+      @autoreleasepool {
+        if (completed.status == MTLCommandBufferStatusCompleted) {
+          void *dst = static_cast<char *>([dst_buffer contents]) + dst_offset;
+          std::memcpy(dst, host_src, size);
+        }
 
-      // Always signal so the stream cannot deadlock. Errors are surfaced
-      // through TrackCommandBufferErrors / BlockHostUntilDone. The signal
-      // publishes the memcpy to the GPU's event wait; Shared storage keeps it
-      // coherent.
-      copy_done.signaledValue = kCopyDoneValue;
+        // Always signal so the stream cannot deadlock. Errors are surfaced
+        // through TrackCommandBufferErrors / BlockHostUntilDone. The signal
+        // publishes the memcpy to the GPU's event wait; Shared storage keeps it
+        // coherent.
+        copy_done.signaledValue = kCopyDoneValue;
+      }
     }];
 
     [wait_cmd encodeWaitForEvent:copy_done value:kCopyDoneValue];
@@ -388,12 +396,14 @@ absl::Status MetalStream::Memcpy(void *host_dst,
     TrackCommandBufferErrors(copy_cmd, "MetalStream::Memcpy(D2H)(copy)");
     TrackCommandBufferErrors(wait_cmd, "MetalStream::Memcpy(D2H)(wait)");
     [copy_cmd addCompletedHandler:^(id<MTLCommandBuffer> completed) {
-      if (completed.status == MTLCommandBufferStatusCompleted) {
-        std::memcpy(host_dst, [staging contents], size);
+      @autoreleasepool {
+        if (completed.status == MTLCommandBufferStatusCompleted) {
+          std::memcpy(host_dst, [staging contents], size);
+        }
+        // Always signal so the wait cmd_buf cannot deadlock if the blit
+        // errored before completing.
+        copy_done.signaledValue = kCopyDoneValue;
       }
-      // Always signal so the wait cmd_buf cannot deadlock if the blit
-      // errored before completing.
-      copy_done.signaledValue = kCopyDoneValue;
     }];
     [wait_cmd encodeWaitForEvent:copy_done value:kCopyDoneValue];
     [copy_cmd commit];
@@ -543,12 +553,16 @@ absl::Status MetalStream::DoHostCallbackWithStatus(
     TrackCommandBufferErrors(wait_cmd,
                              "MetalStream::DoHostCallbackWithStatus(wait)");
     [callback_cmd addCompletedHandler:^(id<MTLCommandBuffer> /*completed*/) {
-      // Always signal callback_done, even if the callback returns an error,
-      // so subsequent waiters cannot deadlock.
-      absl::Status callback_status = std::move(*heap_cb)();
-      delete heap_cb;
-      StoreFirstAsyncError(state, std::move(callback_status));
-      callback_done.signaledValue = kCallbackDoneValue;
+      // The user callback runs on a Metal callback thread with no autorelease
+      // pool and may create ObjC temporaries; bound them here.
+      @autoreleasepool {
+        // Always signal callback_done, even if the callback returns an error,
+        // so subsequent waiters cannot deadlock.
+        absl::Status callback_status = std::move(*heap_cb)();
+        delete heap_cb;
+        StoreFirstAsyncError(state, std::move(callback_status));
+        callback_done.signaledValue = kCallbackDoneValue;
+      }
     }];
     [wait_cmd encodeWaitForEvent:callback_done value:kCallbackDoneValue];
     [callback_cmd commit];
