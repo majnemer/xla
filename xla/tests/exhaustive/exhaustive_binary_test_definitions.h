@@ -17,12 +17,12 @@ limitations under the License.
 #define XLA_TESTS_EXHAUSTIVE_EXHAUSTIVE_BINARY_TEST_DEFINITIONS_H_
 
 #include <array>    // IWYU pragma: keep, exhaustive_binary_test_definitions.inc
-#include <bit>      // IWYU pragma: keep, exhaustive_binary_test_definitions.inc
 #include <cstdint>  // IWYU pragma: keep, exhaustive_binary_test_definitions.inc
 #include <ios>      // IWYU pragma: keep, exhaustive_binary_test_definitions.inc
 #include <tuple>    // IWYU pragma: keep, exhaustive_binary_test_definitions.inc
 #include <utility>  // IWYU pragma: keep, exhaustive_binary_test_definitions.inc
 
+#include "absl/base/casts.h" // IWYU pragma: keep, exhaustive_binary_test_definitions.inc
 #include "absl/log/check.h"  // IWYU pragma: keep, exhaustive_binary_test_definitions.inc
 #include "absl/log/log.h"  // IWYU pragma: keep, exhaustive_binary_test_definitions.inc
 #include "absl/types/span.h"  // IWYU pragma: keep, exhaustive_binary_test_definitions.inc

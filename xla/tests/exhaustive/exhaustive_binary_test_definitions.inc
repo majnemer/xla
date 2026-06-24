@@ -47,15 +47,15 @@ class Exhaustive8BitBinaryTest
     if (VLOG_IS_ON(2)) {
       uint8_t left_begin, left_end, right_begin, right_end;
       if constexpr (kLeftToRightPacking) {
-        left_begin = std::bit_cast<uint8_t>(static_cast<int8_t>(begin >> 8));
-        left_end = std::bit_cast<uint8_t>(static_cast<int8_t>(end >> 8));
-        right_begin = std::bit_cast<uint8_t>(static_cast<int8_t>(begin));
-        right_end = std::bit_cast<uint8_t>(static_cast<int8_t>(end));
+        left_begin = absl::bit_cast<uint8_t>(static_cast<int8_t>(begin >> 8));
+        left_end = absl::bit_cast<uint8_t>(static_cast<int8_t>(end >> 8));
+        right_begin = absl::bit_cast<uint8_t>(static_cast<int8_t>(begin));
+        right_end = absl::bit_cast<uint8_t>(static_cast<int8_t>(end));
       } else {
-        left_begin = std::bit_cast<uint8_t>(static_cast<int8_t>(begin));
-        left_end = std::bit_cast<uint8_t>(static_cast<int8_t>(end));
-        right_begin = std::bit_cast<uint8_t>(static_cast<int8_t>(begin >> 8));
-        right_end = std::bit_cast<uint8_t>(static_cast<int8_t>(end >> 8));
+        left_begin = absl::bit_cast<uint8_t>(static_cast<int8_t>(begin));
+        left_end = absl::bit_cast<uint8_t>(static_cast<int8_t>(end));
+        right_begin = absl::bit_cast<uint8_t>(static_cast<int8_t>(begin >> 8));
+        right_end = absl::bit_cast<uint8_t>(static_cast<int8_t>(end >> 8));
       }
 
       LOG(INFO) << this->SuiteName() << this->TestName() << " Range:";
@@ -64,15 +64,15 @@ class Exhaustive8BitBinaryTest
                 << static_cast<uint32_t>(right_begin) << "); hex=(" << std::hex
                 << static_cast<uint32_t>(left_begin) << ", "
                 << static_cast<uint32_t>(right_begin) << "); float=("
-                << std::bit_cast<tsl::float8_e5m2>(left_begin) << ", "
-                << std::bit_cast<tsl::float8_e5m2>(right_begin)
+                << absl::bit_cast<tsl::float8_e5m2>(left_begin) << ", "
+                << absl::bit_cast<tsl::float8_e5m2>(right_begin)
                 << ") (inclusive)";
       LOG(INFO) << "\tto=(" << static_cast<uint32_t>(left_end) << ", "
                 << static_cast<uint32_t>(right_end) << "); hex=(" << std::hex
                 << static_cast<uint32_t>(left_end) << ", "
                 << static_cast<uint32_t>(right_end) << "); float=("
-                << std::bit_cast<tsl::float8_e5m2>(left_end) << ", "
-                << std::bit_cast<tsl::float8_e5m2>(right_end)
+                << absl::bit_cast<tsl::float8_e5m2>(left_end) << ", "
+                << absl::bit_cast<tsl::float8_e5m2>(right_end)
                 << ") (exclusive)";
       LOG(INFO) << "\ttotal values to test=" << (end - begin);
     }
@@ -134,16 +134,16 @@ class Exhaustive16BitBinaryTest
     if (VLOG_IS_ON(2)) {
       uint16_t left_begin, left_end, right_begin, right_end;
       if constexpr (kLeftToRightPacking) {
-        left_begin = std::bit_cast<uint16_t>(static_cast<int16_t>(begin >> 16));
-        left_end = std::bit_cast<uint16_t>(static_cast<int16_t>(end >> 16));
-        right_begin = std::bit_cast<uint16_t>(static_cast<int16_t>(begin));
-        right_end = std::bit_cast<uint16_t>(static_cast<int16_t>(end));
+        left_begin = absl::bit_cast<uint16_t>(static_cast<int16_t>(begin >> 16));
+        left_end = absl::bit_cast<uint16_t>(static_cast<int16_t>(end >> 16));
+        right_begin = absl::bit_cast<uint16_t>(static_cast<int16_t>(begin));
+        right_end = absl::bit_cast<uint16_t>(static_cast<int16_t>(end));
       } else {
-        left_begin = std::bit_cast<uint16_t>(static_cast<int16_t>(begin));
-        left_end = std::bit_cast<uint16_t>(static_cast<int16_t>(end));
+        left_begin = absl::bit_cast<uint16_t>(static_cast<int16_t>(begin));
+        left_end = absl::bit_cast<uint16_t>(static_cast<int16_t>(end));
         right_begin =
-            std::bit_cast<uint16_t>(static_cast<int16_t>(begin >> 16));
-        right_end = std::bit_cast<uint16_t>(static_cast<int16_t>(end >> 16));
+            absl::bit_cast<uint16_t>(static_cast<int16_t>(begin >> 16));
+        right_end = absl::bit_cast<uint16_t>(static_cast<int16_t>(end >> 16));
       }
 
       // N.B.: Use INFO directly instead of doing another thread-safe VLOG
