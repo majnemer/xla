@@ -923,6 +923,9 @@ bool HloRunner::HasProperty(const HloRunnerPropertyTag::Type tag) const {
   if (tag == HloRunnerPropertyTag::kUsingGpuOneAPI) {
     return pjrt_client_->platform_name() == OneapiName();
   }
+  if (tag == HloRunnerPropertyTag::kUsingGpuMetal) {
+    return pjrt_client_->platform_name() == MetalName();
+  }
   return false;
 }
 

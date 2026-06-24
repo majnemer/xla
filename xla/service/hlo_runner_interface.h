@@ -82,6 +82,8 @@ class HloRunnerPropertyTag final {
   static constexpr Type kUsingGpuCuda = 3;
   // Indicates that this is a oneAPI (sycl) runner.
   static constexpr Type kUsingGpuOneAPI = 4;
+  // Indicates that this is a Metal runner.
+  static constexpr Type kUsingGpuMetal = 5;
 
  private:
   HloRunnerPropertyTag() = default;
