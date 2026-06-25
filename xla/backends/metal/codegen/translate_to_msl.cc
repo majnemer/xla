@@ -619,6 +619,9 @@ class MslEmitter {
     if (mlir::isa<mlir::math::PowFOp>(op)) {
       return EmitMathCall(op, "metal::pow");
     }
+    if (mlir::isa<mlir::math::CbrtOp>(op)) {
+      return EmitMathCbrt(op);
+    }
     if (mlir::isa<mlir::math::RsqrtOp>(op)) {
       return EmitMathCall(op, "metal::rsqrt");
     }
@@ -634,11 +637,18 @@ class MslEmitter {
     if (mlir::isa<mlir::math::SinOp>(op)) {
       return EmitMathCall(op, "metal::sin");
     }
+    if (mlir::isa<mlir::math::TanOp>(op)) {
+      return EmitMathCall(op, "metal::tan");
+    }
     if (mlir::isa<mlir::math::TanhOp>(op)) {
       return EmitMathCall(op, "metal::tanh");
     }
     if (mlir::isa<mlir::math::RoundOp>(op)) {
       return EmitMathCall(op, "metal::round");
+    }
+    if (mlir::isa<mlir::math::RoundEvenOp>(op)) {
+      // metal::rint rounds halfway cases to even, matching roundTiesToEven.
+      return EmitMathCall(op, "metal::rint");
     }
     if (auto clz = mlir::dyn_cast<mlir::math::CountLeadingZerosOp>(op)) {
       return EmitMathCtlz(clz);
@@ -902,6 +912,17 @@ class MslEmitter {
     std::string name = BindValueName(op->getResult(0));
     os_ << ty << " " << name << " = (static_cast<" << u_ty << ">(" << a
         << ") >> " << b << ");\n";
+    return absl::OkStatus();
+  }
+
+  // MSL has no cbrt. Expand to copysign(pow(|x|, 1/3), x), matching
+  // ElementalIrEmitter::EmitCbrt.
+  absl::Status EmitMathCbrt(mlir::Operation* op) {
+    TF_ASSIGN_OR_RETURN(std::string ty, TypeToMSL(op->getResult(0).getType()));
+    TF_ASSIGN_OR_RETURN(std::string src, GetName(op->getOperand(0)));
+    std::string name = BindValueName(op->getResult(0));
+    os_ << ty << " " << name << " = metal::copysign(metal::pow(metal::abs("
+        << src << "), " << ty << "(1.0 / 3.0)), " << src << ");\n";
     return absl::OkStatus();
   }
 

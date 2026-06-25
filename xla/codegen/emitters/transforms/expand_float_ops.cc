@@ -59,13 +59,15 @@ namespace {
 
 using Val = ImplicitArithOpBuilder;
 
-struct RewriteErf32Pattern : public mlir::OpRewritePattern<mlir::math::ErfOp> {
+struct RewriteErfPattern : public mlir::OpRewritePattern<mlir::math::ErfOp> {
   using OpRewritePattern::OpRewritePattern;
 
   mlir::LogicalResult matchAndRewrite(
       mlir::math::ErfOp op, mlir::PatternRewriter& rewriter) const override {
-    if (!op.getType().isF32()) {
-      return rewriter.notifyMatchFailure(op, "not an f32 erf");
+    mlir::Type result_type = op.getType();
+    if (!result_type.isF16() && !result_type.isBF16() &&
+        !result_type.isF32()) {
+      return rewriter.notifyMatchFailure(op, "not an f16/bf16/f32 erf");
     }
 
     static const std::array<float, 5> kAlpha{
@@ -98,7 +100,11 @@ struct RewriteErf32Pattern : public mlir::OpRewritePattern<mlir::math::ErfOp> {
       return r;
     };
 
+    // erf is evaluated in f32; narrower types are widened then truncated back.
     Value original_x = op.getOperand();
+    if (!result_type.isF32()) {
+      original_x = ma::ExtFOp::create(b, rewriter.getF32Type(), original_x);
+    }
     // For |x| >= kErfInvOneMinusHalfULP, erf(x) rounds to ±1 in f32, so
     // return copysign(1, x) instead of evaluating the polynomial on the
     // clamped input. Without this the polynomial evaluated at the clamp
@@ -115,8 +121,12 @@ struct RewriteErf32Pattern : public mlir::OpRewritePattern<mlir::math::ErfOp> {
     Value poly_result = ma::DivFOp::create(
         b, ma::MulFOp::create(b, x, poly(x2, kAlpha)), poly(x2, kBeta));
 
-    rewriter.replaceOpWithNewOp<SelectOp>(op, saturates, saturated_value,
-                                          poly_result);
+    Value result =
+        SelectOp::create(b, saturates, saturated_value, poly_result);
+    if (!result_type.isF32()) {
+      result = ma::TruncFOp::create(b, result_type, result);
+    }
+    rewriter.replaceOp(op, result);
 
     return mlir::success();
   }
@@ -683,7 +693,7 @@ class ExpandFloatOpsPass
     if (approximate_tanh_) {
       mlir::populatePolynomialApproximateTanhPattern(patterns);
     }
-    patterns.add<RewriteErf32Pattern>(&getContext());
+    patterns.add<RewriteErfPattern>(&getContext());
     if (mlir::failed(
             mlir::applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       signalPassFailure();
