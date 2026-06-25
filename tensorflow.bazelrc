@@ -315,6 +315,9 @@ common:icpx_clang --copt=-fclang-abi-compat=17
 common:sycl_hermetic --config=sycl
 common:sycl_hermetic --repo_env=SYCL_BUILD_HERMETIC=1
 
+# This config option is used for Metal as GPU backend.
+common:metal --repo_env=TF_NEED_METAL=1
+
 # Options to disable default on features
 common:nonccl --define=no_nccl_support=true
 

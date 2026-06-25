@@ -446,6 +446,7 @@ class XLAConfigOptions:
     elif self.backend == Backend.METAL:
       if self.os != OS.DARWIN:
         raise NotImplementedError("METAL backend is only supported on macOS.")
+      rc.append("build --config=metal")
       build_and_test_tag_filters.append("-cuda-only")
       build_and_test_tag_filters.append("-rocm-only")
       build_and_test_tag_filters.append("-oneapi-only")

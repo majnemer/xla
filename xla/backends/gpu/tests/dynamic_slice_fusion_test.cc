@@ -33,6 +33,8 @@ namespace {
 static constexpr char kPlatform[] = "CUDA";
 #elif TENSORFLOW_USE_ROCM
 static constexpr char kPlatform[] = "ROCM";
+#elif XLA_USE_METAL
+static constexpr char kPlatform[] = "METAL";
 #endif
 
 class DynamicSliceFusionTest : public HloPjRtTestBase {};

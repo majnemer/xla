@@ -54,6 +54,10 @@ _DEFAULT_TF_ROCM_RBE_MULTI_GPU_POOL = "linux_x64_multigpu"
 # rocm/tensorflow-build:latest-jammy-python3.11-rocm7.0.2
 _DEFAULT_TF_ROCM_RBE_DOCKER_IMAGE = "rocm/tensorflow-build@sha256:a2672ff2510b369b4a5f034272a518dc93c2e492894e3befaeef19649632ccaa"
 
+def enable_metal(repository_ctx):
+    """Returns whether to build with Metal support."""
+    return int(get_host_environ(repository_ctx, "TF_NEED_METAL", False))
+
 def auto_configure_fail(msg):
     """Output failure message when rocm configuration fails."""
     red = "\033[0;31m"
@@ -258,7 +262,7 @@ def _create_dummy_repository(repository_ctx):
         "rocm:build_defs.bzl",
         {
             "%{rocm_is_configured}": "False",
-            "%{gpu_is_configured}": "if_true" if enable_cuda(repository_ctx) or enable_sycl(repository_ctx) else "if_false",
+            "%{gpu_is_configured}": "if_true" if enable_cuda(repository_ctx) or enable_sycl(repository_ctx) or enable_metal(repository_ctx) else "if_false",
             "%{cuda_or_rocm}": "if_true" if enable_cuda(repository_ctx) else "if_false",
             "%{rocm_gpu_architectures}": "[]",
             "%{rocm_version_number}": "0",
@@ -517,6 +521,7 @@ def _rocm_autoconf_impl(repository_ctx):
 _ENVIRONS = [
     "TF_NEED_ROCM",
     "TF_NEED_CUDA",  # Needed by the `if_gpu_is_configured` macro
+    "TF_NEED_METAL",
     _TF_ROCM_AMDGPU_TARGETS,
     _TF_ROCM_RBE_DOCKER_IMAGE,
     _TF_ROCM_RBE_POOL,

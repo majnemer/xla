@@ -1621,8 +1621,6 @@ cc_library(
         ":gpu_plugin_without_collectives",
     ] + if_gpu_is_configured([
         "//xla/backends/gpu/runtime:thunk_runtime_dependencies",
-    ]) + if_metal([
-        "//xla/backends/gpu/runtime:thunk_runtime_dependencies",
     ]),
 )
 
@@ -1643,14 +1641,8 @@ cc_library(
     ]) + if_sycl_is_configured([
         "//xla/service/gpu:intel_gpu_compiler",
     ]) + if_metal([
-        # On macOS, if_gpu_is_configured is false (CUDA/ROCm/SYCL aren't
-        # configured), so the shared GPU deps that are normally pulled by
-        # that branch must come in here.
-        ":service",
         "//xla/backends/metal:collectives_registration",
         "//xla/backends/metal:compiler",
-        "//xla/service/gpu:gpu_compiler",
-        "//xla/service/gpu:gpu_transfer_manager",
         "//xla/stream_executor/metal:metal_platform",
     ]),
 )
