@@ -126,6 +126,14 @@ class ExhaustiveOpTestBase
   // XLA:GPU preserves denormal signs, but other backends don't.
   virtual bool RelaxedDenormalSigns() const = 0;
 
+  // If true, the platform flushes subnormal results to zero (FTZ). Results in
+  // the subnormal range are then unspecified: a subnormal may be flushed to a
+  // zero of either sign, an underflowing computation the reference evaluates
+  // exactly may come back as a nearby subnormal (or vice versa), and a min/max
+  // of two flushed operands may return either of them. IsClose() therefore
+  // treats any two subnormal-or-zero values as equivalent on such hardware.
+  virtual bool FlushesDenormalsToZero() const { return false; }
+
   // Enable debug logging for the invocation of the lambda.
   //
   // This is intended to be used to wrap a call to `Run`, which will then

@@ -119,6 +119,15 @@ class TestOp {
     return std::move(*this);
   }
 
+  TestOp& GpuMetalError(Traits::ErrorSpecGen error_spec_gen) & {
+    gpu_metal_error_spec_gen_ = error_spec_gen;
+    return *this;
+  }
+  TestOp&& GpuMetalError(Traits::ErrorSpecGen error_spec_gen) && {
+    gpu_metal_error_spec_gen_ = std::move(error_spec_gen);
+    return std::move(*this);
+  }
+
   TestOp& GpuNvidiaError(Traits::ErrorSpecGen error_spec_gen) & {
     gpu_nv_error_spec_gen_ = error_spec_gen;
     return *this;
@@ -203,6 +212,9 @@ class TestOp {
           error_spec_gen = PickFirstErrorSpecGenPresent<Traits>(
               {gpu_nv_error_spec_gen_, gpu_error_spec_gen_, error_spec_gen_});
         }
+      } else if (test_->Platform().IsMetal()) {
+        error_spec_gen = PickFirstErrorSpecGenPresent<Traits>(
+            {gpu_metal_error_spec_gen_, gpu_error_spec_gen_, error_spec_gen_});
       } else {
         error_spec_gen = PickFirstErrorSpecGenPresent<Traits>(
             {gpu_error_spec_gen_, error_spec_gen_});
@@ -221,6 +233,7 @@ class TestOp {
   Traits::ErrorSpecGen cpu_x86_error_spec_gen_ = nullptr;
   Traits::ErrorSpecGen cpu_arm_error_spec_gen_ = nullptr;
   Traits::ErrorSpecGen gpu_error_spec_gen_ = nullptr;
+  Traits::ErrorSpecGen gpu_metal_error_spec_gen_ = nullptr;
   Traits::ErrorSpecGen gpu_nv_error_spec_gen_ = nullptr;
   Traits::ErrorSpecGen gpu_nv_p100_error_spec_gen_ = nullptr;
   Traits::ErrorSpecGen gpu_nv_v100_error_spec_gen_ = nullptr;

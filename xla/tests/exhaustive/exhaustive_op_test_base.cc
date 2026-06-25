@@ -499,6 +499,17 @@ bool ExhaustiveOpTestBase<T, N>::IsClose(NativeRefT expected, NativeRefT actual,
   // the same value, so the values are just set to 0.
   RemoveCorrespondingNaNs(&expected, &actual);
 
+  // On hardware that flushes subnormals to zero, results in the subnormal range
+  // are unspecified: a subnormal may be flushed to zero of either sign, an
+  // underflowing computation the reference evaluates exactly may be returned as
+  // a nearby subnormal (or vice versa), and a min/max of two flushed operands
+  // may return either of them. When both the expected and actual values lie in
+  // the subnormal-or-zero range, accept them as equivalent.
+  if (FlushesDenormalsToZero() && IsSubnormalOrZero(expected) &&
+      IsSubnormalOrZero(actual)) {
+    return true;
+  }
+
   if (spec.strict_signed_zeros) {
     if (CheckSignedZeroError(expected, actual)) {
       return false;

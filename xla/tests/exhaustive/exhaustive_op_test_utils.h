@@ -345,6 +345,21 @@ bool IsSubnormalOrMinNormal(NativeT value) {
   return IsSubnormal(value) || IsMinNormal(value);
 }
 
+// Determines if the NativeT is subnormal or zero, i.e. its magnitude is below
+// the smallest normal floating point value.
+//
+// For complex numbers, this requires *both* components to be subnormal or zero
+// (so that the whole value lies in the flushed-to-zero regime).
+template <typename NativeT>
+bool IsSubnormalOrZero(NativeT value) {
+  if constexpr (std::is_same_v<NativeT, xla::complex64> ||
+                std::is_same_v<NativeT, xla::complex128>) {
+    return IsSubnormalOrZero(value.real()) && IsSubnormalOrZero(value.imag());
+  } else {
+    return std::abs(value) < std::numeric_limits<NativeT>::min();
+  }
+}
+
 // Represents a set of 64 bit chunks by representing the starting bit chunk,
 // the last bit chunk, and the spacing between two adjacent bit chunks, without
 // actually storing all the bit chunks being generated. The bit chunk iterator

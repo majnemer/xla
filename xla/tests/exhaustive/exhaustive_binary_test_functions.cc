@@ -332,6 +332,14 @@ BINARY_TEST(Pow, {
             .skip_comparison(PowCpuGpuF16Skip(left, right))
             .build();
       })
+      .GpuMetalError(+[](NativeT left, NativeT right) {
+        // Metal's pow is a touch less precise near 1.0 than other GPUs.
+        return ErrorSpec::Builder()
+            .distance_err(2)
+            .strict_signed_zeros()
+            .skip_comparison(PowCpuGpuF16Skip(left, right))
+            .build();
+      })
       .Run();
 })
 

@@ -46,6 +46,8 @@ class ExhaustiveOpTest : public ExhaustiveOpTestBase<T, N> {
     return !platform_.IsNvidiaGpu();
   }
 
+  bool FlushesDenormalsToZero() const override { return platform_.IsMetal(); }
+
   const Platform& Platform() { return platform_; }
 
   // DEPRECATED: Only kept until exhaustive_unary_complex_test is merged into
