@@ -26,7 +26,7 @@ limitations under the License.
 #include "xla/types.h"
 
 #ifdef __FAST_MATH__
-#error("Can't be compiled with fast math on");
+#error ("Can't be compiled with fast math on");
 #endif
 
 namespace xla {
@@ -429,6 +429,16 @@ BINARY_TEST(Atan2, {
               .build();
         }
         return ErrorSpec::Builder().strict_signed_zeros().build();
+      })
+      .GpuMetalError(+[](NativeT, NativeT) {
+        if constexpr (std::is_same_v<NativeT, float>) {
+          return ErrorSpec::Builder()
+              .distance_err(4)
+              .strict_signed_zeros()
+              .build();
+        } else {
+          return ErrorSpec::Builder().strict_signed_zeros().build();
+        }
       })
       .Run();
 })
