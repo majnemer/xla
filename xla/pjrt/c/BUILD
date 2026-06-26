@@ -727,13 +727,19 @@ xla_cc_binary(
     additional_linker_inputs = [
         ":pjrt_c_api_gpu_version_script.lds",
     ],
-    linkopts = [
-        "-Wl,--version-script,$(location :pjrt_c_api_gpu_version_script.lds)",
-        "-Wl,--no-undefined",
-    ],
+    linkopts = if_macos(
+        [
+            "-Wl,-exported_symbol,_GetPjrtApi",
+            "-Wl,-install_name,@rpath/pjrt_c_api_gpu_plugin.dylib",
+            "-Wl,-undefined,error",
+        ],
+        [
+            "-Wl,--version-script,$(location :pjrt_c_api_gpu_version_script.lds)",
+            "-Wl,--no-undefined",
+        ],
+    ),
     linkshared = True,
     tags = [
-        "no_mac",  # No GPU on mac.
         "noasan",
         "nomsan",
         "notsan",
